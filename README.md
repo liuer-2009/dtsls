@@ -14,6 +14,9 @@ cargo build --release
 ## Capabilities (M0)
 
 - Incremental text sync (`textDocument/didChange`, full reparse avoided)
+- Syntax error diagnostics (`textDocument/publishDiagnostics`) — tree-sitter
+  ERROR nodes and missing tokens (`missing '>'`, `missing '}'`, ...), republished
+  on every change, cleared on close
 - `textDocument/documentSymbol` — node tree with full paths, property value kinds
 - `textDocument/semanticTokens/full` — labels, node names, properties, numbers,
   strings, comments, preprocessor directives, dts keywords (`/dts-v1/`, `/delete-node/`, ...)
@@ -21,9 +24,10 @@ cargo build --release
 ## Test
 
 ```sh
-cargo test                          # unit tests
+cargo test                          # unit tests (incl. testdata fixtures)
 cargo test -- --ignored             # parses a real kernel dtsi (path baked in test)
 python3 scripts/smoke_test.py       # end-to-end LSP session over stdio
+python3 scripts/diagnostics_test.py # broken/valid fixtures -> publishDiagnostics
 python3 scripts/bench_real.py /path/to/soc.dtsi   # real-world timing
 ```
 

@@ -7,7 +7,7 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{info, warn};
 
 use crate::document::Document;
-use crate::{semantic_tokens, symbols};
+use crate::{diagnostics, semantic_tokens, symbols};
 
 pub struct Backend {
     client: Client,
@@ -74,19 +74,37 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let td = params.text_document;
         info!(uri = %td.uri, version = td.version, bytes = td.text.len(), "did_open");
-        self.documents
-            .write()
-            .unwrap()
-            .insert(td.uri, Document::open(&td.text, td.version));
+        let (diags, version) = {
+            let mut docs = self.documents.write().unwrap();
+            docs.insert(td.uri.clone(), Document::open(&td.text, td.version));
+            match docs.get(&td.uri) {
+                Some(doc) => (diagnostics::compute(doc), doc.version),
+                None => return,
+            }
+        };
+        self.client
+            .publish_diagnostics(td.uri, diags, Some(version))
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
-        let mut docs = self.documents.write().unwrap();
-        match docs.get_mut(&uri) {
-            Some(doc) => doc.apply_changes(&params.content_changes, params.text_document.version),
-            None => warn!(uri = %uri, "did_change for unknown document"),
-        }
+        let (diags, version) = {
+            let mut docs = self.documents.write().unwrap();
+            match docs.get_mut(&uri) {
+                Some(doc) => {
+                    doc.apply_changes(&params.content_changes, params.text_document.version);
+                    (diagnostics::compute(doc), doc.version)
+                }
+                None => {
+                    warn!(uri = %uri, "did_change for unknown document");
+                    return;
+                }
+            }
+        };
+        self.client
+            .publish_diagnostics(uri, diags, Some(version))
+            .await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -94,6 +112,9 @@ impl LanguageServer for Backend {
             .write()
             .unwrap()
             .remove(&params.text_document.uri);
+        self.client
+            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+            .await;
     }
 
     async fn document_symbol(

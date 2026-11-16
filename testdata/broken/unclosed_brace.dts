@@ -1,0 +1,6 @@
+/dts-v1/;
+
+/ {
+    uart@1000 {
+        compatible = "ns16550";
+};

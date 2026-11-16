@@ -1,0 +1,21 @@
+/dts-v1/;
+
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+
+    intc: interrupt-controller@1000 {
+        compatible = "arm,gic";
+        interrupt-controller;
+        #interrupt-cells = <3>;
+    };
+
+    uart: serial@2000 {
+        compatible = "ns16550";
+        reg = <0x2000 0x100>;
+        interrupts = <0 32 4>, <0 33 4>;
+        interrupt-names = "rx", "tx";
+        clocks = <&clk 0>, <&clk 1>;
+        status = "okay";
+    };
+};

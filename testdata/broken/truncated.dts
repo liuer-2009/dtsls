@@ -1,0 +1,10 @@
+/dts-v1/;
+
+/ {
+    soc {
+        uart@1000 {
+            clock-frequency = <48000000>;
+        };
+
+        serial@2000 {
+            cloc
