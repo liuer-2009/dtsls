@@ -1,0 +1,13 @@
+[package]
+name = "dtsls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ropey = "1.6.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "io-std", "io-util", "macros", "sync"] }
+tower-lsp = "0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tree-sitter = "0.25"
+tree-sitter-devicetree = "0.15.0"
