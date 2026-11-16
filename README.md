@@ -33,12 +33,17 @@ cargo build --release
     properties removed by `/delete-property/`, and — for same-file overlays —
     base properties overridden by `&label { }` / `&{/path} { }` extensions
     (last definition wins, matching dtc merge order)
-- Cross-file overlay resolution (`&label` pointing into included .dtsi) needs
-  the include graph — planned for M1
-- **M1 (in progress): `&label` completion** — trigger on `&`, items from the
+- **M1: `&label` completion** — trigger on `&`, items from the
   current file plus a background-built index of quoted `#include`s (own labels
   preferred, cross-file items show `path — file`). Steady state reads a
   prebuilt index: sub-millisecond, no tree walk on the request path
+- **M1: workspace index** — on initialize, all `.dts/.dtsi/.dtso` under the
+  workspace roots are parsed in parallel into per-file contribution tables
+  (label defs with spans, `&label` usages, include edges). Open buffers are
+  re-indexed on every change with version-guarded insertion
+- **M1: goto definition / find references** — resolves `&label` through the
+  translation unit (own file → transitive includes) with a workspace-wide
+  fallback; references search every indexed file. Both are pure index lookups
 
 ## Test
 
