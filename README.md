@@ -44,6 +44,11 @@ cargo build --release
 - **M1: goto definition / find references** — resolves `&label` through the
   translation unit (own file → transitive includes) with a workspace-wide
   fallback; references search every indexed file. Both are pure index lookups
+- **M1: macro completion** — object-like `#define`s (no function-like macros)
+  from the file, its `#include`s and the workspace; `<dt-bindings/...>` angle
+  includes resolve against auto-detected kernel include dirs (walks up for
+  `include/dt-bindings`) or `initializationOptions.includePaths`. Triggers:
+  `&` for labels, ALL-CAPS words / `<` for macros; lowercase never pops
 
 ## Test
 
