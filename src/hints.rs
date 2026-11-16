@@ -28,39 +28,37 @@ struct Unit {
 /// phandle target's `#*-cells` when resolvable, else from dividing the units
 /// evenly among the names.
 pub fn inlay_hints(doc: &Document, uri: &Url, index: &Index, range: &Range) -> Vec<InlayHint> {
-    let range_start = util::position_to_byte(&doc.rope, range.start);
-    let range_end = util::position_to_byte(&doc.rope, range.end);
-    let mut out = Vec::new();
-    collect(
-        doc.tree.root_node(),
+    let ctx = HintCtx {
         doc,
         uri,
         index,
         range,
-        range_start,
-        range_end,
-        &mut out,
-    );
+        range_start: util::position_to_byte(&doc.rope, range.start),
+        range_end: util::position_to_byte(&doc.rope, range.end),
+    };
+    let mut out = Vec::new();
+    collect(doc.tree.root_node(), &ctx, &mut out);
     out
 }
 
-fn collect(
-    node: Node,
-    doc: &Document,
-    uri: &Url,
-    index: &Index,
-    range: &Range,
+struct HintCtx<'a> {
+    doc: &'a Document,
+    uri: &'a Url,
+    index: &'a Index,
+    range: &'a Range,
     range_start: usize,
     range_end: usize,
-    out: &mut Vec<InlayHint>,
-) {
+}
+
+fn collect(node: Node, ctx: &HintCtx, out: &mut Vec<InlayHint>) {
     if out.len() >= MAX_HINTS {
         return;
     }
     // prune subtrees that cannot contribute hints inside the range
-    if node.end_byte() < range_start || node.start_byte() > range_end {
+    if node.end_byte() < ctx.range_start || node.start_byte() > ctx.range_end {
         return;
     }
+    let (doc, uri, index, range) = (ctx.doc, ctx.uri, ctx.index, ctx.range);
     if node.kind() == "node_def" {
         let mut props: HashMap<String, Node> = HashMap::new();
         for i in 0..node.child_count() {
@@ -90,7 +88,7 @@ fn collect(
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect(child, doc, uri, index, range, range_start, range_end, out);
+            collect(child, ctx, out);
         }
     }
 }
