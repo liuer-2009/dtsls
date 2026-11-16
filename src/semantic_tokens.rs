@@ -142,8 +142,8 @@ fn directive(
     }
 }
 
-/// Emit a `name@address` token as two tokens: the name part and the hex
-/// unit address (including the `@`) as a number.
+/// Emit a `name@address` token as two tokens: the name part and the hex unit
+/// address as a number. The `@` itself stays uncolored.
 fn push_name_and_address(
     out: &mut Vec<RawToken>,
     doc: &Document,
@@ -159,7 +159,7 @@ fn push_name_and_address(
             push_span(
                 out,
                 doc,
-                at_byte,
+                at_byte + 1,
                 name.end_byte(),
                 NUMBER,
                 token_modifiers,
@@ -422,9 +422,10 @@ mod tests {
         let line_tokens: Vec<_> = tokens.iter().filter(|t| t.0 == node_line).collect();
         let class = line_tokens.iter().find(|t| t.3 == CLASS).expect("no class token");
         let number = line_tokens.iter().find(|t| t.3 == NUMBER).expect("no number token");
-        // The class token must stop before the '@', the number token covers it.
-        assert_eq!(class.1 + class.2, number.1);
-        assert_eq!(number.2, "@1000".len() as u32);
+        // The class token must stop before the '@', the number token starts
+        // after it, leaving the '@' uncolored.
+        assert_eq!(class.1 + class.2, number.1 - 1);
+        assert_eq!(number.2, "1000".len() as u32);
     }
 
     #[test]
