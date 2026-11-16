@@ -1,18 +1,24 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use tree_sitter::Node;
 
 use crate::document::Document;
-use crate::util;
+use crate::{index, util};
 
 const SOURCE: &str = "dtsls";
 const MAX_DIAGNOSTICS: usize = 100;
 
 /// Syntax errors plus semantic errors, sorted by position.
-pub fn all(doc: &Document) -> Vec<Diagnostic> {
+pub fn all(
+    doc: &Document,
+    file_path: Option<&Path>,
+    include_dirs: &[PathBuf],
+) -> Vec<Diagnostic> {
     let mut out = compute(doc);
     out.extend(semantic(doc));
+    out.extend(unresolved_includes(doc, file_path, include_dirs));
     out.sort_by_key(|d| (d.range.start, d.range.end));
     out
 }
@@ -29,6 +35,69 @@ pub fn semantic(doc: &Document) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     check_duplicates(doc.tree.root_node(), doc, &mut out);
     out
+}
+
+/// `#include`s that resolve to no existing file. This is how a missing
+/// include dir (no kernel tree detection, no includePaths) becomes visible:
+/// every dt-bindings include lights up until the configuration is fixed.
+pub fn unresolved_includes(
+    doc: &Document,
+    file_path: Option<&Path>,
+    include_dirs: &[PathBuf],
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    check_includes(doc.tree.root_node(), doc, file_path, include_dirs, &mut out);
+    out
+}
+
+fn check_includes(
+    node: Node,
+    doc: &Document,
+    file_path: Option<&Path>,
+    include_dirs: &[PathBuf],
+    out: &mut Vec<Diagnostic>,
+) {
+    if out.len() >= MAX_DIAGNOSTICS {
+        return;
+    }
+    if node.kind() == "preproc_include"
+        && let Some(path_node) = node.child_by_field_name("path") {
+            let raw = util::node_text(doc, path_node);
+            let (target, quoted) = match path_node.kind() {
+                "preproc_string_literal" => (raw.trim_matches('"'), true),
+                "system_lib_string" => (raw.trim_matches(|c| c == '<' || c == '>'), false),
+                // `#include SOME_MACRO` — statically unresolvable, skip.
+                _ => return,
+            };
+            let resolved = index::resolve_include(
+                file_path.and_then(Path::parent),
+                target,
+                quoted,
+                include_dirs,
+            );
+            if resolved.is_none() {
+                out.push(Diagnostic {
+                    range: Range {
+                        start: util::byte_to_position(&doc.rope, node.start_byte()),
+                        end: util::byte_to_position(&doc.rope, node.end_byte()),
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some(SOURCE.to_string()),
+                    message: format!(
+                        "unresolved #include \"{target}\" — no include dir matches; \
+                         open the workspace at the kernel root or set \
+                         initializationOptions.includePaths"
+                    ),
+                    ..Default::default()
+                });
+            }
+            return;
+        }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            check_includes(child, doc, file_path, include_dirs, out);
+        }
+    }
 }
 
 /// Flag sibling nodes that define the same name (dtc would silently merge
@@ -404,7 +473,7 @@ mod tests {
         assert!(!valid.is_empty(), "no valid fixtures found");
         for path in broken {
             let text = std::fs::read_to_string(&path).unwrap();
-            let diags = all(&Document::open(&text, 0));
+            let diags = all(&Document::open(&text, 0), None, &[]);
             assert!(!diags.is_empty(), "broken fixture not detected: {path}");
             assert!(
                 diags
@@ -415,7 +484,7 @@ mod tests {
         }
         for path in warning {
             let text = std::fs::read_to_string(&path).unwrap();
-            let diags = all(&Document::open(&text, 0));
+            let diags = all(&Document::open(&text, 0), None, &[]);
             assert!(!diags.is_empty(), "warning fixture not detected: {path}");
             assert!(
                 diags
@@ -427,7 +496,7 @@ mod tests {
         for path in valid {
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(
-                all(&Document::open(&text, 0)).is_empty(),
+                all(&Document::open(&text, 0), None, &[]).is_empty(),
                 "valid fixture has errors: {path}"
             );
         }
@@ -492,5 +561,36 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+
+    #[test]
+    fn unresolved_include_is_reported() {
+        let text = "/dts-v1/;\n\n#include <dt-bindings/nope.h>\n\n/ {\n    a;\n};\n";
+        let doc = Document::open(text, 0);
+        let diags = unresolved_includes(&doc, None, &[]);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(diags[0].message.contains("unresolved #include"));
+    }
+
+    #[test]
+    fn quoted_include_resolves_relative_to_the_file() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/includes");
+        let file = dir.join("board.dts");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let doc = Document::open(&text, 0);
+        assert!(unresolved_includes(&doc, Some(&file), &[]).is_empty());
+    }
+
+    #[test]
+    fn angle_include_resolves_via_include_dirs() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/includes");
+        let text = "/dts-v1/;\n\n#include <soc.dtsi>\n\n/ {\n    a;\n};\n";
+        let doc = Document::open(text, 0);
+        // no dirs -> error
+        assert_eq!(unresolved_includes(&doc, None, &[]).len(), 1);
+        // with the fixture dir as include dir -> clean
+        assert!(unresolved_includes(&doc, None, &[dir]).is_empty());
     }
 }

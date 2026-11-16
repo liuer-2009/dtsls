@@ -32,6 +32,12 @@ impl Backend {
         }
     }
 
+    /// Include dirs for diagnostics (file-relative resolution is separate).
+    fn include_dirs(&self) -> Vec<PathBuf> {
+        self.root_dirs.read().unwrap().clone()
+    }
+
+
     /// Rebuild one document's contribution table off the main loop.
     fn schedule_file_index(&self, uri: Url, text: String, version: i32) {
         let index = Arc::clone(&self.index);
@@ -133,7 +139,10 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.write().unwrap();
             docs.insert(td.uri.clone(), Document::open(&td.text, td.version));
             match docs.get(&td.uri) {
-                Some(doc) => (diagnostics::all(doc), doc.version),
+                Some(doc) => (
+                    diagnostics::all(doc, td.uri.to_file_path().ok().as_deref(), &self.include_dirs()),
+                    doc.version,
+                ),
                 None => return,
             }
         };
@@ -150,7 +159,11 @@ impl LanguageServer for Backend {
             match docs.get_mut(&uri) {
                 Some(doc) => {
                     doc.apply_changes(&params.content_changes, params.text_document.version);
-                    (diagnostics::all(doc), doc.version, doc.text.clone())
+                    (
+                        diagnostics::all(doc, uri.to_file_path().ok().as_deref(), &self.include_dirs()),
+                        doc.version,
+                        doc.text.clone(),
+                    )
                 }
                 None => {
                     warn!(uri = %uri, "did_change for unknown document");

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use tower_lsp::lsp_types::{Range, Url};
@@ -152,19 +152,18 @@ fn build_recursive(
         let file_dir = uri
             .to_file_path()
             .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_default();
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
         for (relative, quoted) in &raw_includes {
             // Quoted includes resolve relative to the including file, then the
             // configured roots; `<dt-bindings/...>` only against the roots
             // (which include auto-detected kernel include dirs).
-            let bases: Vec<PathBuf> = if *quoted {
-                std::iter::once(file_dir.clone()).chain(roots.iter().cloned()).collect()
-            } else {
-                roots.to_vec()
+            let Some(candidate) = resolve_include(file_dir.as_deref(), relative, *quoted, roots)
+            else {
+                // Unresolved includes surface as diagnostics from the request
+                // path; here they just don't contribute.
+                continue;
             };
-            for base in bases {
-                let candidate = base.join(relative);
+            {
                 let Ok(child_text) = std::fs::read_to_string(&candidate) else {
                     continue;
                 };
@@ -199,7 +198,6 @@ fn build_recursive(
                     }
                 });
                 includes.push(child_uri);
-                break;
             }
         }
     }
@@ -334,6 +332,31 @@ fn byte_range(doc: &Document, node: tree_sitter::Node) -> Range {
         start: util::byte_to_position(&doc.rope, node.start_byte()),
         end: util::byte_to_position(&doc.rope, node.end_byte()),
     }
+}
+
+/// Resolve an include target to an existing file. Quoted includes try the
+/// including file's directory first, then the include dirs; angle-bracket
+/// includes only use the include dirs.
+pub fn resolve_include(
+    file_dir: Option<&Path>,
+    target: &str,
+    quoted: bool,
+    include_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    if quoted
+        && let Some(dir) = file_dir {
+            let candidate = dir.join(target);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    for dir in include_dirs {
+        let candidate = dir.join(target);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Directories never worth walking for dts sources (kernel tree hygiene —
