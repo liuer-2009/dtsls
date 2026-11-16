@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -7,8 +7,9 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, info, warn};
 
-use crate::completion::{self, LabelMap};
+use crate::completion;
 use crate::document::Document;
+use crate::index::{self, Index};
 use crate::util;
 use crate::{diagnostics, semantic_tokens, symbols};
 
@@ -16,9 +17,9 @@ pub struct Backend {
     client: Client,
     documents: RwLock<HashMap<Url, Document>>,
     root_dirs: RwLock<Vec<PathBuf>>,
-    /// Background-built label index per document (its own file plus quoted
-    /// `#include`s), tagged with the document version it was built from.
-    include_labels: Arc<RwLock<HashMap<Url, (i32, LabelMap)>>>,
+    /// Workspace-wide contribution tables (labels, refs, includes), built in
+    /// background; requests read finished entries only.
+    index: Arc<Index>,
 }
 
 impl Backend {
@@ -27,28 +28,16 @@ impl Backend {
             client,
             documents: RwLock::new(HashMap::new()),
             root_dirs: RwLock::new(Vec::new()),
-            include_labels: Arc::new(RwLock::new(HashMap::new())),
+            index: Arc::new(Index::default()),
         }
     }
 
-    /// Rebuild the include-graph label index for one document off the main
-    /// loop. The completion handler only reads the finished map, so popups
-    /// never wait on file IO.
-    fn schedule_label_index(&self, uri: Url, text: String, version: i32) {
-        let index = Arc::clone(&self.include_labels);
+    /// Rebuild one document's contribution table off the main loop.
+    fn schedule_file_index(&self, uri: Url, text: String, version: i32) {
+        let index = Arc::clone(&self.index);
         let roots = self.root_dirs.read().unwrap().clone();
-        let file_path = uri.to_file_path().ok();
         tokio::task::spawn_blocking(move || {
-            let Some(file_path) = file_path else { return };
-            let mut visited = std::collections::HashSet::new();
-            let labels = completion::build_file_labels(&file_path, &text, &roots, &mut visited, 0);
-            let mut guard = index.write().unwrap();
-            match guard.get(&uri) {
-                Some((built_version, _)) if *built_version > version => {}
-                _ => {
-                    guard.insert(uri, (version, labels));
-                }
-            }
+            index::build_and_insert(&index, &uri, &text, version, &roots, 0);
         });
     }
 }
@@ -69,6 +58,12 @@ impl LanguageServer for Backend {
             }
         }
         *self.root_dirs.write().unwrap() = roots;
+        // Background workspace scan: index every dts file under the roots so
+        // goto definition / references work for files never opened.
+        let index = Arc::clone(&self.index);
+        let scan_roots = self.root_dirs.read().unwrap().clone();
+        let open: HashSet<Url> = self.documents.read().unwrap().keys().cloned().collect();
+        tokio::task::spawn_blocking(move || index::scan_workspace(&index, &scan_roots, &open));
         let capabilities = ServerCapabilities {
             position_encoding: Some(PositionEncodingKind::UTF16),
             text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -79,6 +74,8 @@ impl LanguageServer for Backend {
                 resolve_provider: Some(false),
                 ..Default::default()
             }),
+            definition_provider: Some(OneOf::Left(true)),
+            references_provider: Some(OneOf::Left(true)),
             document_symbol_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                 SemanticTokensOptions {
@@ -129,7 +126,7 @@ impl LanguageServer for Backend {
                 None => return,
             }
         };
-        self.schedule_label_index(td.uri.clone(), td.text, version);
+        self.schedule_file_index(td.uri.clone(), td.text, version);
         self.client
             .publish_diagnostics(td.uri, diags, Some(version))
             .await;
@@ -150,7 +147,7 @@ impl LanguageServer for Backend {
                 }
             }
         };
-        self.schedule_label_index(uri.clone(), text, version);
+        self.schedule_file_index(uri.clone(), text, version);
         self.client
             .publish_diagnostics(uri, diags, Some(version))
             .await;
@@ -161,10 +158,8 @@ impl LanguageServer for Backend {
             .write()
             .unwrap()
             .remove(&params.text_document.uri);
-        self.include_labels
-            .write()
-            .unwrap()
-            .remove(&params.text_document.uri);
+        // The index entry is intentionally kept (stale until the next scan):
+        // goto definition into a closed file must keep working.
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
             .await;
@@ -186,9 +181,12 @@ impl LanguageServer for Backend {
             };
             // Read-only, in-memory, no awaits: steady state reads the
             // prebuilt index (no tree walk) and stays well under 1 ms.
-            let index = self.include_labels.read().unwrap();
-            match index.get(&uri) {
-                Some((_, labels)) => completion::items_from_index(labels, &prefix),
+            let index = &self.index;
+            
+            match index.with_file(&uri, |fi| {
+                fi.map(|f| completion::items_from_index(&f.completion_labels, &prefix))
+            }) {
+                Some(items) => items,
                 None => completion::same_file_items(doc)
                     .into_iter()
                     .filter(|item| item.label.starts_with(&prefix))
@@ -199,6 +197,64 @@ impl LanguageServer for Backend {
         Ok(Some(CompletionResponse::List(completion::completion_list(
             items,
         ))))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let label = {
+            let docs = self.documents.read().unwrap();
+            let Some(doc) = docs.get(&uri) else {
+                return Ok(None);
+            };
+            completion::label_at_cursor(doc, util::position_to_byte(&doc.rope, position))
+        };
+        let Some(label) = label else {
+            return Ok(None);
+        };
+        Ok(index::resolve_label(&self.index, &uri, &label).map(|(target_uri, def)| {
+            GotoDefinitionResponse::Scalar(Location {
+                uri: target_uri,
+                range: def.range,
+            })
+        }))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let label = {
+            let docs = self.documents.read().unwrap();
+            let Some(doc) = docs.get(&uri) else {
+                return Ok(None);
+            };
+            completion::label_at_cursor(doc, util::position_to_byte(&doc.rope, position))
+        };
+        let Some(label) = label else {
+            return Ok(None);
+        };
+        let mut locations = Vec::new();
+        if params.context.include_declaration {
+            for (def_uri, def) in self.index.all_label_defs(&label) {
+                locations.push(Location {
+                    uri: def_uri,
+                    range: def.range,
+                });
+                if locations.len() >= 500 {
+                    return Ok(Some(locations));
+                }
+            }
+        }
+        for (ref_uri, range) in self.index.label_references(&label, 500) {
+            locations.push(Location {
+                uri: ref_uri,
+                range,
+            });
+        }
+        Ok(Some(locations))
     }
 
     async fn document_symbol(

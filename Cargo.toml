@@ -11,3 +11,4 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tree-sitter = "0.26"
 tree-sitter-devicetree2 = "0.1.0"
+walkdir = "2.5.0"

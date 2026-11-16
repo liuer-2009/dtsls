@@ -1,12 +1,9 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionList};
-use tree_sitter::Node;
 
 use crate::analysis;
 use crate::document::Document;
-use crate::util;
 
 /// label -> (node path, defining file name). An empty file name means the
 /// label is defined in the file the index entry belongs to.
@@ -61,6 +58,43 @@ pub fn same_file_items(doc: &Document) -> Vec<CompletionItem> {
     items
 }
 
+/// Where is the cursor relative to a label? Reference context (`&label`)
+/// or definition context (`label:`) both resolve to the label name.
+pub fn label_at_cursor(doc: &Document, cursor: usize) -> Option<String> {
+    let cursor = cursor.min(doc.rope.len_bytes());
+    let line = doc.rope.byte_to_line(cursor);
+    let line_start = doc.rope.line_to_byte(line);
+    let mut start = cursor;
+    while start > line_start {
+        let b = doc.rope.byte(start - 1);
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = cursor;
+    while end < doc.rope.len_bytes() {
+        let b = doc.rope.byte(end);
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if start == end {
+        return None;
+    }
+    let word = doc.slice(start..end).to_string();
+    if start > 0 && doc.rope.byte(start - 1) == b'&' {
+        return Some(word);
+    }
+    if doc.slice(end..(end + 1).min(doc.rope.len_bytes())) == ":" {
+        return Some(word);
+    }
+    None
+}
+
 fn detail(path: &str, file: &str) -> String {
     if file.is_empty() {
         path.to_string()
@@ -82,80 +116,6 @@ pub fn completion_list(items: Vec<CompletionItem>) -> CompletionList {
     CompletionList {
         is_incomplete: false,
         items,
-    }
-}
-
-/// Recursively collect `label -> (node path, file name)` for a file and its
-/// quoted `#include`s. Runs on a worker thread; the completion handler only
-/// ever reads the finished map.
-pub fn build_file_labels(
-    path: &Path,
-    text: &str,
-    roots: &[PathBuf],
-    visited: &mut HashSet<PathBuf>,
-    depth: usize,
-) -> LabelMap {
-    let mut out = HashMap::new();
-    if depth > 8 || !visited.insert(path.to_path_buf()) {
-        return out;
-    }
-    let doc = Document::open(text, 0);
-
-    // Labels defined in this file: empty file name marks them as "own".
-    let analysis = analysis::analyze(&doc);
-    for (label, node_path) in &analysis.labels {
-        out.entry(label.clone())
-            .or_insert_with(|| (node_path.clone(), String::new()));
-    }
-
-    collect_includes(doc.tree.root_node(), &doc, path, roots, visited, depth, &mut out);
-    out
-}
-
-fn collect_includes<'a>(
-    node: Node<'a>,
-    doc: &'a Document,
-    file_path: &Path,
-    roots: &[PathBuf],
-    visited: &mut HashSet<PathBuf>,
-    depth: usize,
-    out: &mut LabelMap,
-) {
-    if node.kind() == "preproc_include"
-        && let Some(path) = node.child_by_field_name("path")
-        && path.kind() == "preproc_string_literal"
-    {
-        // Only quoted includes are resolvable without knowing the compiler's
-        // include dirs; `<...>` ones are skipped for now.
-        let raw = util::node_text(doc, path);
-        let relative = raw.trim_matches('"');
-        let dir = file_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        for base in std::iter::once(dir).chain(roots.iter().cloned()) {
-            let candidate = base.join(relative);
-            let Ok(included) = std::fs::read_to_string(&candidate) else {
-                continue;
-            };
-            let included_file = candidate
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let labels = build_file_labels(&candidate, &included, roots, visited, depth + 1);
-            for (label, (node_path, file)) in labels {
-                // Tag the include's own labels with its file name.
-                let file = if file.is_empty() {
-                    included_file.clone()
-                } else {
-                    file
-                };
-                out.entry(label).or_insert((node_path, file));
-            }
-            break;
-        }
-    }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            collect_includes(child, doc, file_path, roots, visited, depth, out);
-        }
     }
 }
 
@@ -215,20 +175,4 @@ mod tests {
         assert!(all[0].detail.as_deref().unwrap().contains("soc.dtsi"));
     }
 
-    #[test]
-    fn include_graph_is_walked_for_labels() {
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let board = Path::new(&manifest).join("testdata/includes/board.dts");
-        let text = std::fs::read_to_string(&board).unwrap();
-        let mut visited = HashSet::new();
-        let labels = build_file_labels(&board, &text, &[], &mut visited, 0);
-        assert_eq!(
-            labels.get("board_label").map(|(path, file)| (path.as_str(), file.as_str())),
-            Some(("/node", ""))
-        );
-        assert_eq!(
-            labels.get("uart0").map(|(path, file)| (path.as_str(), file.as_str())),
-            Some(("/soc/serial@1000", "soc.dtsi"))
-        );
-    }
 }

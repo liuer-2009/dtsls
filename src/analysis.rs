@@ -71,7 +71,7 @@ pub fn analyze(doc: &Document) -> Analysis {
 
 /// Full path of a node (`/soc/serial@1000`), walking subnode ancestors up to
 /// the root devicetree.
-fn node_path(doc: &Document, mut node: Node) -> String {
+pub(crate) fn node_path(doc: &Document, mut node: Node) -> String {
     let mut parts: Vec<String> = Vec::new();
     loop {
         match node.kind() {
