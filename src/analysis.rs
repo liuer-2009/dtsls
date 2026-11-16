@@ -14,6 +14,8 @@ use crate::util;
 pub struct Analysis {
     /// Node ids of property syntax nodes whose value is dead.
     pub dead_properties: HashSet<usize>,
+    /// Node labels with the full path of the labeled node, sorted by label.
+    pub labels: Vec<(String, String)>,
 }
 
 /// (owner node id, property name) -> definitions in file order as (start byte, property node id).
@@ -40,6 +42,8 @@ pub fn analyze(doc: &Document) -> Analysis {
     walk(root, &mut ctx);
 
     let Ctx {
+        doc,
+        labels,
         dead,
         contributions,
         ..
@@ -54,7 +58,47 @@ pub fn analyze(doc: &Document) -> Analysis {
             dead.insert(*id);
         }
     }
-    Analysis { dead_properties: dead }
+    let mut label_list: Vec<(String, String)> = labels
+        .into_iter()
+        .map(|(label, node)| (label, node_path(doc, node)))
+        .collect();
+    label_list.sort();
+    Analysis {
+        dead_properties: dead,
+        labels: label_list,
+    }
+}
+
+/// Full path of a node (`/soc/serial@1000`), walking subnode ancestors up to
+/// the root devicetree.
+fn node_path(doc: &Document, mut node: Node) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    loop {
+        match node.kind() {
+            "subnode" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    parts.push(util::node_text(doc, name).to_string());
+                }
+            }
+            "devicetree" => {
+                if let Some(reference) = util::find_child(node, "reference") {
+                    parts.push(util::node_text(doc, reference).to_string());
+                }
+                break;
+            }
+            _ => {}
+        }
+        match node.parent() {
+            Some(parent) => node = parent,
+            None => break,
+        }
+    }
+    parts.reverse();
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
 }
 
 fn find_root_devicetree(root: Node<'_>) -> Option<Node<'_>> {

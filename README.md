@@ -35,6 +35,10 @@ cargo build --release
     (last definition wins, matching dtc merge order)
 - Cross-file overlay resolution (`&label` pointing into included .dtsi) needs
   the include graph — planned for M1
+- **M1 (in progress): `&label` completion** — trigger on `&`, items from the
+  current file plus a background-built index of quoted `#include`s (own labels
+  preferred, cross-file items show `path — file`). Steady state reads a
+  prebuilt index: sub-millisecond, no tree walk on the request path
 
 ## Test
 

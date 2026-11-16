@@ -1,17 +1,24 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::completion::{self, LabelMap};
 use crate::document::Document;
+use crate::util;
 use crate::{diagnostics, semantic_tokens, symbols};
 
 pub struct Backend {
     client: Client,
     documents: RwLock<HashMap<Url, Document>>,
+    root_dirs: RwLock<Vec<PathBuf>>,
+    /// Background-built label index per document (its own file plus quoted
+    /// `#include`s), tagged with the document version it was built from.
+    include_labels: Arc<RwLock<HashMap<Url, (i32, LabelMap)>>>,
 }
 
 impl Backend {
@@ -19,7 +26,30 @@ impl Backend {
         Self {
             client,
             documents: RwLock::new(HashMap::new()),
+            root_dirs: RwLock::new(Vec::new()),
+            include_labels: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Rebuild the include-graph label index for one document off the main
+    /// loop. The completion handler only reads the finished map, so popups
+    /// never wait on file IO.
+    fn schedule_label_index(&self, uri: Url, text: String, version: i32) {
+        let index = Arc::clone(&self.include_labels);
+        let roots = self.root_dirs.read().unwrap().clone();
+        let file_path = uri.to_file_path().ok();
+        tokio::task::spawn_blocking(move || {
+            let Some(file_path) = file_path else { return };
+            let mut visited = std::collections::HashSet::new();
+            let labels = completion::build_file_labels(&file_path, &text, &roots, &mut visited, 0);
+            let mut guard = index.write().unwrap();
+            match guard.get(&uri) {
+                Some((built_version, _)) if *built_version > version => {}
+                _ => {
+                    guard.insert(uri, (version, labels));
+                }
+            }
+        });
     }
 }
 
@@ -27,11 +57,28 @@ impl Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         info!(root = ?params.root_uri, client = ?params.client_info, "initialize");
+        let mut roots = Vec::new();
+        if let Some(root) = params.root_uri.as_ref().and_then(|u| u.to_file_path().ok()) {
+            roots.push(root);
+        }
+        if let Some(folders) = params.workspace_folders.as_ref() {
+            for folder in folders {
+                if let Ok(path) = folder.uri.to_file_path() {
+                    roots.push(path);
+                }
+            }
+        }
+        *self.root_dirs.write().unwrap() = roots;
         let capabilities = ServerCapabilities {
             position_encoding: Some(PositionEncodingKind::UTF16),
             text_document_sync: Some(TextDocumentSyncCapability::Kind(
                 TextDocumentSyncKind::INCREMENTAL,
             )),
+            completion_provider: Some(CompletionOptions {
+                trigger_characters: Some(vec!["&".to_string()]),
+                resolve_provider: Some(false),
+                ..Default::default()
+            }),
             document_symbol_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                 SemanticTokensOptions {
@@ -82,6 +129,7 @@ impl LanguageServer for Backend {
                 None => return,
             }
         };
+        self.schedule_label_index(td.uri.clone(), td.text, version);
         self.client
             .publish_diagnostics(td.uri, diags, Some(version))
             .await;
@@ -89,12 +137,12 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
-        let (diags, version) = {
+        let (diags, version, text) = {
             let mut docs = self.documents.write().unwrap();
             match docs.get_mut(&uri) {
                 Some(doc) => {
                     doc.apply_changes(&params.content_changes, params.text_document.version);
-                    (diagnostics::all(doc), doc.version)
+                    (diagnostics::all(doc), doc.version, doc.text.clone())
                 }
                 None => {
                     warn!(uri = %uri, "did_change for unknown document");
@@ -102,6 +150,7 @@ impl LanguageServer for Backend {
                 }
             }
         };
+        self.schedule_label_index(uri.clone(), text, version);
         self.client
             .publish_diagnostics(uri, diags, Some(version))
             .await;
@@ -112,9 +161,44 @@ impl LanguageServer for Backend {
             .write()
             .unwrap()
             .remove(&params.text_document.uri);
+        self.include_labels
+            .write()
+            .unwrap()
+            .remove(&params.text_document.uri);
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
             .await;
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let started = std::time::Instant::now();
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let items = {
+            let docs = self.documents.read().unwrap();
+            let Some(doc) = docs.get(&uri) else {
+                return Ok(None);
+            };
+            let Some(prefix) =
+                completion::label_prefix(doc, util::position_to_byte(&doc.rope, position))
+            else {
+                return Ok(None);
+            };
+            // Read-only, in-memory, no awaits: steady state reads the
+            // prebuilt index (no tree walk) and stays well under 1 ms.
+            let index = self.include_labels.read().unwrap();
+            match index.get(&uri) {
+                Some((_, labels)) => completion::items_from_index(labels, &prefix),
+                None => completion::same_file_items(doc)
+                    .into_iter()
+                    .filter(|item| item.label.starts_with(&prefix))
+                    .collect(),
+            }
+        };
+        debug!(count = items.len(), elapsed_us = started.elapsed().as_micros() as u64, "completion");
+        Ok(Some(CompletionResponse::List(completion::completion_list(
+            items,
+        ))))
     }
 
     async fn document_symbol(

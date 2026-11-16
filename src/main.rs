@@ -1,5 +1,6 @@
 mod analysis;
 mod backend;
+mod completion;
 mod diagnostics;
 mod document;
 mod semantic_tokens;
