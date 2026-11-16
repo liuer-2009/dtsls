@@ -142,6 +142,40 @@ fn directive(
     }
 }
 
+/// Emit a `name@address` token as two tokens: the name part and the hex
+/// unit address (including the `@`) as a number.
+fn push_name_and_address(
+    out: &mut Vec<RawToken>,
+    doc: &Document,
+    name: Node,
+    token_type: u32,
+    token_modifiers: u32,
+) {
+    let text = util::node_text(doc, name);
+    match text.find('@') {
+        Some(at) => {
+            let at_byte = name.start_byte() + at;
+            push_span(out, doc, name.start_byte(), at_byte, token_type, token_modifiers);
+            push_span(
+                out,
+                doc,
+                at_byte,
+                name.end_byte(),
+                NUMBER,
+                token_modifiers,
+            );
+        }
+        None => push_span(
+            out,
+            doc,
+            name.start_byte(),
+            name.end_byte(),
+            token_type,
+            token_modifiers,
+        ),
+    }
+}
+
 fn recurse(
     node: Node,
     doc: &Document,
@@ -235,14 +269,14 @@ fn walk(node: Node, doc: &Document, analysis: &Analysis, out: &mut Vec<RawToken>
         }
         "subnode" => {
             if let Some(name) = node.child_by_field_name("name") {
-                push_span(out, doc, name.start_byte(), name.end_byte(), CLASS, 0);
+                push_name_and_address(out, doc, name, CLASS, 0);
             }
             recurse(node, doc, analysis, out, None);
         }
         "delete_node" => {
             directive(out, doc, node, DECORATOR, DEPRECATED);
             if let Some(name) = node.child_by_field_name("name") {
-                push_span(out, doc, name.start_byte(), name.end_byte(), CLASS, DEPRECATED);
+                push_name_and_address(out, doc, name, CLASS, DEPRECATED);
             }
         }
         "delete_node_ref" => {
@@ -378,5 +412,28 @@ mod tests {
         let doc = Document::open("/dts-v1/;\n\n/ {\n    a = <1>;\n};\n", 0);
         let tokens = decoded(&doc);
         assert!(tokens.iter().any(|t| t.3 == DECORATOR));
+    }
+
+    #[test]
+    fn unit_address_is_highlighted_as_number() {
+        let doc = Document::open(OVERLAY, 0);
+        let node_line = line_of(&doc, "interrupt-controller@1000") as u32;
+        let tokens = decoded(&doc);
+        let line_tokens: Vec<_> = tokens.iter().filter(|t| t.0 == node_line).collect();
+        let class = line_tokens.iter().find(|t| t.3 == CLASS).expect("no class token");
+        let number = line_tokens.iter().find(|t| t.3 == NUMBER).expect("no number token");
+        // The class token must stop before the '@', the number token covers it.
+        assert_eq!(class.1 + class.2, number.1);
+        assert_eq!(number.2, "@1000".len() as u32);
+    }
+
+    #[test]
+    fn references_are_emitted_as_enum_member_tokens() {
+        let doc = Document::open(
+            "/dts-v1/;\n\n/ {\n    a {\n        clocks = <&clk 0>;\n    };\n};\n",
+            0,
+        );
+        let tokens = decoded(&doc);
+        assert!(tokens.iter().any(|t| t.3 == ENUM_MEMBER));
     }
 }
