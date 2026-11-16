@@ -57,6 +57,17 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        // `<dt-bindings/...>` resolution: auto-detect a kernel tree by walking
+        // up for `include/dt-bindings`, plus client-supplied includePaths.
+        roots.extend(index::detect_include_dirs(&roots));
+        if let Some(options) = params.initialization_options
+            && let Some(paths) = options.get("includePaths").and_then(|v| v.as_array()) {
+                for path in paths {
+                    if let Some(p) = path.as_str() {
+                        roots.push(PathBuf::from(p));
+                    }
+                }
+            }
         *self.root_dirs.write().unwrap() = roots;
         // Background workspace scan: index every dts file under the roots so
         // goto definition / references work for files never opened.
@@ -70,7 +81,7 @@ impl LanguageServer for Backend {
                 TextDocumentSyncKind::INCREMENTAL,
             )),
             completion_provider: Some(CompletionOptions {
-                trigger_characters: Some(vec!["&".to_string()]),
+                trigger_characters: Some(vec!["&".to_string(), "<".to_string()]),
                 resolve_provider: Some(false),
                 ..Default::default()
             }),
@@ -174,23 +185,29 @@ impl LanguageServer for Backend {
             let Some(doc) = docs.get(&uri) else {
                 return Ok(None);
             };
-            let Some(prefix) =
-                completion::label_prefix(doc, util::position_to_byte(&doc.rope, position))
+            let Some(context) =
+                completion::completion_context(doc, util::position_to_byte(&doc.rope, position))
             else {
                 return Ok(None);
             };
             // Read-only, in-memory, no awaits: steady state reads the
             // prebuilt index (no tree walk) and stays well under 1 ms.
             let index = &self.index;
-            
-            match index.with_file(&uri, |fi| {
-                fi.map(|f| completion::items_from_index(&f.completion_labels, &prefix))
-            }) {
-                Some(items) => items,
-                None => completion::same_file_items(doc)
-                    .into_iter()
-                    .filter(|item| item.label.starts_with(&prefix))
-                    .collect(),
+            match context {
+                completion::Context::Labels(prefix) => match index.with_file(&uri, |fi| {
+                    fi.map(|f| completion::items_from_index(&f.completion_labels, &prefix))
+                }) {
+                    Some(items) => items,
+                    None => completion::same_file_items(doc)
+                        .into_iter()
+                        .filter(|item| item.label.starts_with(&prefix))
+                        .collect(),
+                },
+                completion::Context::Defines(prefix) => index
+                    .with_file(&uri, |fi| {
+                        fi.map(|f| completion::items_from_defines(&f.defines, &prefix))
+                    })
+                    .unwrap_or_default(),
             }
         };
         debug!(count = items.len(), elapsed_us = started.elapsed().as_micros() as u64, "completion");

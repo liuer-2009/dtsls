@@ -34,11 +34,17 @@ pub struct FileIndex {
     pub labels: HashMap<String, LabelDef>,
     /// every `&label` usage in this file
     pub refs: Vec<LabelRef>,
-    /// resolved quoted `#include` targets
+    /// resolved `#include` targets (quoted + `<dt-bindings/...>`)
     pub includes: Vec<Url>,
     /// label -> (node path, file name) for completion (own + includes merged)
     pub completion_labels: LabelMap,
+    /// macro name -> (value snippet, file name) for completion
+    /// (own + includes merged, object-like macros only)
+    pub defines: DefineMap,
 }
+
+/// macro name -> (value snippet, defining file name)
+pub type DefineMap = HashMap<String, (String, String)>;
 
 #[derive(Default)]
 pub struct Index {
@@ -131,7 +137,15 @@ fn build_recursive(
     let mut refs = Vec::new();
     let mut raw_includes = Vec::new();
     let mut completion = LabelMap::new();
-    walk_file(&doc, &mut labels, &mut refs, &mut raw_includes, &mut completion);
+    let mut defines = DefineMap::new();
+    walk_file(
+        &doc,
+        &mut labels,
+        &mut refs,
+        &mut raw_includes,
+        &mut completion,
+        &mut defines,
+    );
 
     let mut includes = Vec::new();
     if depth <= 8 {
@@ -140,8 +154,16 @@ fn build_recursive(
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .unwrap_or_default();
-        for relative in &raw_includes {
-            for base in std::iter::once(&file_dir).chain(roots.iter()) {
+        for (relative, quoted) in &raw_includes {
+            // Quoted includes resolve relative to the including file, then the
+            // configured roots; `<dt-bindings/...>` only against the roots
+            // (which include auto-detected kernel include dirs).
+            let bases: Vec<PathBuf> = if *quoted {
+                std::iter::once(file_dir.clone()).chain(roots.iter().cloned()).collect()
+            } else {
+                roots.to_vec()
+            };
+            for base in bases {
                 let candidate = base.join(relative);
                 let Ok(child_text) = std::fs::read_to_string(&candidate) else {
                     continue;
@@ -150,20 +172,29 @@ fn build_recursive(
                     continue;
                 };
                 build_recursive(index, &child_uri, &child_text, 0, roots, visited, depth + 1);
-                // Merge the include's labels into completion; tag the include's
-                // own labels (empty file name) with its file name.
+                // Merge the include's labels and defines into completion; tag
+                // the include's own entries (empty file name) with its name.
                 index.with_file(&child_uri, |fi| {
                     if let Some(fi) = fi {
+                        let child_file = candidate
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
                         for (label, (path, file)) in &fi.completion_labels {
                             let file = if file.is_empty() {
-                                candidate
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default()
+                                child_file.clone()
                             } else {
                                 file.clone()
                             };
                             completion.entry(label.clone()).or_insert((path.clone(), file));
+                        }
+                        for (name, (value, file)) in &fi.defines {
+                            let file = if file.is_empty() {
+                                child_file.clone()
+                            } else {
+                                file.clone()
+                            };
+                            defines.entry(name.clone()).or_insert((value.clone(), file));
                         }
                     }
                 });
@@ -181,6 +212,7 @@ fn build_recursive(
             refs,
             includes,
             completion_labels: completion,
+            defines,
         },
     );
 }
@@ -189,10 +221,19 @@ fn walk_file(
     doc: &Document,
     labels: &mut HashMap<String, LabelDef>,
     refs: &mut Vec<LabelRef>,
-    raw_includes: &mut Vec<String>,
+    raw_includes: &mut Vec<(String, bool)>,
     completion: &mut LabelMap,
+    defines: &mut DefineMap,
 ) {
-    walk_node(doc, doc.tree.root_node(), labels, refs, raw_includes, completion);
+    walk_node(
+        doc,
+        doc.tree.root_node(),
+        labels,
+        refs,
+        raw_includes,
+        completion,
+        defines,
+    );
 }
 
 fn walk_node(
@@ -200,8 +241,9 @@ fn walk_node(
     node: tree_sitter::Node,
     labels: &mut HashMap<String, LabelDef>,
     refs: &mut Vec<LabelRef>,
-    raw_includes: &mut Vec<String>,
+    raw_includes: &mut Vec<(String, bool)>,
     completion: &mut LabelMap,
+    defines: &mut DefineMap,
 ) {
     match node.kind() {
         "subnode" => {
@@ -222,6 +264,25 @@ fn walk_node(
                 }
             }
         }
+        // Object-like macros only (`#define NAME value`); function-like ones
+        // (`preproc_function_def`) are deliberately not offered.
+        "preproc_def" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let name = util::node_text(doc, name).to_string();
+                let value = node
+                    .child_by_field_name("value")
+                    .map(|v| summarize_value(util::node_text(doc, v)))
+                    .unwrap_or_default();
+                defines.insert(name, (value, String::new()));
+            }
+            return;
+        }
+        "preproc_undef" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                defines.remove(&util::node_text(doc, name).to_string());
+            }
+            return;
+        }
         "reference" => {
             if let Some(label_ref) = util::find_child(node, "label_ref") {
                 let label = util::node_text(doc, label_ref)
@@ -239,20 +300,33 @@ fn walk_node(
             return;
         }
         "preproc_include" => {
-            if let Some(path) = node.child_by_field_name("path")
-                && path.kind() == "preproc_string_literal"
-            {
-                raw_includes
-                    .push(util::node_text(doc, path).trim_matches('"').to_string());
+            if let Some(path) = node.child_by_field_name("path") {
+                let raw = util::node_text(doc, path);
+                if path.kind() == "preproc_string_literal" {
+                    raw_includes.push((raw.trim_matches('"').to_string(), true));
+                } else if path.kind() == "system_lib_string" {
+                    raw_includes
+                        .push((raw.trim_matches(|c| c == '<' || c == '>').to_string(), false));
+                }
             }
         }
         _ => {}
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            walk_node(doc, child, labels, refs, raw_includes, completion);
+            walk_node(doc, child, labels, refs, raw_includes, completion, defines);
         }
     }
+}
+
+/// First line of a macro body, whitespace-collapsed, capped for popup detail.
+fn summarize_value(value: &str) -> String {
+    let collapsed: String = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = collapsed.chars().take(48).collect();
+    if collapsed.chars().count() > 48 {
+        out.push('…');
+    }
+    out
 }
 
 fn byte_range(doc: &Document, node: tree_sitter::Node) -> Range {
@@ -262,13 +336,31 @@ fn byte_range(doc: &Document, node: tree_sitter::Node) -> Range {
     }
 }
 
+/// Directories never worth walking for dts sources (kernel tree hygiene —
+/// dt-bindings headers are pulled in through the include graph instead).
+const PRUNED_DIRS: &[&str] = &[
+    ".git",
+    "Documentation",
+    "tools",
+    "samples",
+    "include",
+    "scripts",
+    "rust",
+    "certs",
+    "virt",
+];
+
 /// One-shot background scan of the workspace roots. Skips open buffers and
 /// already-indexed files; entries built here carry version 0.
 pub fn scan_workspace(index: &Index, roots: &[PathBuf], skip: &HashSet<Url>) {
     let started = std::time::Instant::now();
     let mut targets: Vec<(Url, PathBuf)> = Vec::new();
     for root in roots {
-        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|e| e.depth() == 0 || !PRUNED_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -313,6 +405,31 @@ pub fn scan_workspace(index: &Index, roots: &[PathBuf], skip: &HashSet<Url>) {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "workspace index scan"
     );
+}
+
+/// Auto-detect kernel-tree include dirs for `<dt-bindings/...>` resolution:
+/// walk up from each root looking for `include/dt-bindings`.
+pub fn detect_include_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in roots {
+        let mut dir = Some(root.as_path());
+        for _ in 0..6 {
+            let Some(d) = dir else { break };
+            if d.join("include/dt-bindings").is_dir() {
+                let include = d.join("include");
+                if !out.contains(&include) {
+                    out.push(include);
+                }
+                let prefixes = d.join("scripts/dtc/include-prefixes");
+                if prefixes.is_dir() && !out.contains(&prefixes) {
+                    out.push(prefixes);
+                }
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+    out
 }
 
 /// Resolve a label from `from`'s point of view: own file first, then the
