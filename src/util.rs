@@ -24,6 +24,19 @@ pub fn node_def_of<'a>(node: Node<'a>) -> Option<Node<'a>> {
     find_child(node, "node_def")
 }
 
+/// The subnode (or root devicetree) that directly contains this property.
+pub fn owning_node(prop: Node) -> Option<Node> {
+    let mut cur = prop.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "subnode" | "devicetree" => return Some(n),
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    None
+}
+
 /// Convert an LSP position (UTF-16 line/character) to a byte offset in the rope.
 pub fn position_to_byte(rope: &Rope, pos: Position) -> usize {
     let line_idx = (pos.line as usize).min(rope.len_lines().saturating_sub(1));

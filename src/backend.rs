@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::completion;
 use crate::document::Document;
+use crate::hints;
 use crate::index::{self, Index};
 use crate::util;
 use crate::{diagnostics, semantic_tokens, symbols};
@@ -93,6 +94,7 @@ impl LanguageServer for Backend {
             }),
             definition_provider: Some(OneOf::Left(true)),
             references_provider: Some(OneOf::Left(true)),
+            inlay_hint_provider: Some(OneOf::Left(true)),
             document_symbol_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                 SemanticTokensOptions {
@@ -285,6 +287,16 @@ impl LanguageServer for Backend {
             });
         }
         Ok(Some(locations))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let docs = self.documents.read().unwrap();
+        let Some(doc) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let hints = hints::inlay_hints(doc, &uri, &self.index, &params.range);
+        Ok((!hints.is_empty()).then_some(hints))
     }
 
     async fn document_symbol(

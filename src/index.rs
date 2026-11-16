@@ -41,6 +41,16 @@ pub struct FileIndex {
     /// macro name -> (value snippet, file name) for completion
     /// (own + includes merged, object-like macros only)
     pub defines: DefineMap,
+    /// every `#*-cells` property: (owning node path, prop name, value)
+    pub cells: Vec<CellsProp>,
+}
+
+/// `#address-cells`-style metadata used to derive `X-names` strides.
+#[derive(Clone, Debug)]
+pub struct CellsProp {
+    pub path: String,
+    pub name: String,
+    pub value: u32,
 }
 
 /// macro name -> (value snippet, defining file name)
@@ -75,6 +85,17 @@ impl Index {
 
     pub fn includes_of(&self, uri: &Url) -> Vec<Url> {
         self.with_file(uri, |fi| fi.map(|f| f.includes.clone()).unwrap_or_default())
+    }
+
+    pub fn cells_at(&self, uri: &Url, path: &str, name: &str) -> Option<u32> {
+        self.with_file(uri, |fi| {
+            fi.and_then(|f| {
+                f.cells
+                    .iter()
+                    .find(|c| c.path == path && c.name == name)
+                    .map(|c| c.value)
+            })
+        })
     }
 
     pub fn all_label_defs(&self, label: &str) -> Vec<(Url, LabelDef)> {
@@ -138,6 +159,7 @@ fn build_recursive(
     let mut raw_includes = Vec::new();
     let mut completion = LabelMap::new();
     let mut defines = DefineMap::new();
+    let mut cells = Vec::new();
     walk_file(
         &doc,
         &mut labels,
@@ -145,6 +167,7 @@ fn build_recursive(
         &mut raw_includes,
         &mut completion,
         &mut defines,
+        &mut cells,
     );
 
     let mut includes = Vec::new();
@@ -211,10 +234,12 @@ fn build_recursive(
             includes,
             completion_labels: completion,
             defines,
+            cells,
         },
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_file(
     doc: &Document,
     labels: &mut HashMap<String, LabelDef>,
@@ -222,6 +247,7 @@ fn walk_file(
     raw_includes: &mut Vec<(String, bool)>,
     completion: &mut LabelMap,
     defines: &mut DefineMap,
+    cells: &mut Vec<CellsProp>,
 ) {
     walk_node(
         doc,
@@ -231,9 +257,11 @@ fn walk_file(
         raw_includes,
         completion,
         defines,
+        cells,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_node(
     doc: &Document,
     node: tree_sitter::Node,
@@ -242,6 +270,7 @@ fn walk_node(
     raw_includes: &mut Vec<(String, bool)>,
     completion: &mut LabelMap,
     defines: &mut DefineMap,
+    cells: &mut Vec<CellsProp>,
 ) {
     match node.kind() {
         "subnode" => {
@@ -260,6 +289,33 @@ fn walk_node(
                         });
                     completion.entry(label).or_insert_with(|| (path, String::new()));
                 }
+            }
+        }
+        "property" => {
+            let Some(name) = node.child_by_field_name("name") else { return };
+            let name_text = util::node_text(doc, name);
+            if name_text.starts_with('#') && name_text.ends_with("-cells") {
+                let value = (0..node.child_count()).find_map(|i| {
+                    let data = node.child(i as u32)?;
+                    if data.kind() != "prop_data" {
+                        return None;
+                    }
+                    let text = match util::find_child(data, "array") {
+                        Some(array) => util::node_text(doc, array)
+                            .trim_matches(|c| c == '<' || c == '>')
+                            .to_string(),
+                        None => util::node_text(doc, data).to_string(),
+                    };
+                    parse_int(&text)
+                });
+                if let Some(value) = value
+                    && let Some(owner) = util::owning_node(node) {
+                        cells.push(CellsProp {
+                            path: analysis::node_path(doc, owner),
+                            name: name_text.to_string(),
+                            value,
+                        });
+                    }
             }
         }
         // Object-like macros only (`#define NAME value`); function-like ones
@@ -312,7 +368,7 @@ fn walk_node(
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            walk_node(doc, child, labels, refs, raw_includes, completion, defines);
+            walk_node(doc, child, labels, refs, raw_includes, completion, defines, cells);
         }
     }
 }
@@ -325,6 +381,14 @@ fn summarize_value(value: &str) -> String {
         out.push('…');
     }
     out
+}
+
+fn parse_int(text: &str) -> Option<u32> {
+    let text = text.trim();
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    text.parse::<u32>().ok()
 }
 
 fn byte_range(doc: &Document, node: tree_sitter::Node) -> Range {

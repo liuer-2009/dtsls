@@ -3,6 +3,7 @@ mod backend;
 mod completion;
 mod diagnostics;
 mod document;
+mod hints;
 mod index;
 mod semantic_tokens;
 mod symbols;
