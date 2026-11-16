@@ -7,7 +7,9 @@ use crate::document::Document;
 use crate::index::{self, Index};
 use crate::util;
 
-const MAX_HINTS: usize = 1000;
+// Range pruning bounds the work per request; this is only a pathological-
+// input guard.
+const MAX_HINTS: usize = 10_000;
 const DEFAULT_ADDRESS_CELLS: u32 = 2;
 const DEFAULT_SIZE_CELLS: u32 = 2;
 
