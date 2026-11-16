@@ -1,5 +1,28 @@
 use ropey::Rope;
 use tower_lsp::lsp_types::Position;
+use tree_sitter::Node;
+
+use crate::document::Document;
+
+/// Text of a syntax node.
+pub fn node_text<'a>(doc: &'a Document, node: Node) -> &'a str {
+    doc.slice(node.start_byte()..node.end_byte())
+}
+
+pub fn find_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32)
+            && child.kind() == kind {
+                return Some(child);
+            }
+    }
+    None
+}
+
+/// The `{ ... }` body of a `subnode` or `devicetree`.
+pub fn node_def_of<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    find_child(node, "node_def")
+}
 
 /// Convert an LSP position (UTF-16 line/character) to a byte offset in the rope.
 pub fn position_to_byte(rope: &Rope, pos: Position) -> usize {

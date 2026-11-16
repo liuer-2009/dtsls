@@ -1,0 +1,13 @@
+/dts-v1/;
+
+/ {
+    intc: interrupt-controller@1000 {
+        compatible = "arm,gic";
+        reg = <0x1000 0x100>;
+    };
+};
+
+&intc {
+    reg = <0x1000 0x200>;
+    status = "okay";
+};

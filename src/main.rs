@@ -1,3 +1,4 @@
+mod analysis;
 mod backend;
 mod diagnostics;
 mod document;

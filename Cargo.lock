@@ -101,7 +101,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
- "tree-sitter-devicetree",
+ "tree-sitter-devicetree2",
 ]
 
 [[package]]
@@ -859,9 +859,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.25.10"
+version = "0.26.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78f873475d258561b06f1c595d93308a7ed124d9977cb26b148c2084a4a3cc87"
+checksum = "17ebdd3a5a7e28a1890b876fdbd0c3c0fe0a6336cffaa104f11b9f720c9daa29"
 dependencies = [
  "cc",
  "regex",
@@ -872,10 +872,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-devicetree"
-version = "0.15.0"
+name = "tree-sitter-devicetree2"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6264316c288e1d4fed3002fb6c2d7a8e90d65d519e2ecf64a60c5abd0ee35481"
+checksum = "77665f91a49fe55828c9218a16c032aefa14a8f0f46b626537cb541b858948b7"
 dependencies = [
  "cc",
  "tree-sitter-language",

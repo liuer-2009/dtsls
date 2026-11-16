@@ -78,7 +78,7 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.write().unwrap();
             docs.insert(td.uri.clone(), Document::open(&td.text, td.version));
             match docs.get(&td.uri) {
-                Some(doc) => (diagnostics::compute(doc), doc.version),
+                Some(doc) => (diagnostics::all(doc), doc.version),
                 None => return,
             }
         };
@@ -94,7 +94,7 @@ impl LanguageServer for Backend {
             match docs.get_mut(&uri) {
                 Some(doc) => {
                     doc.apply_changes(&params.content_changes, params.text_document.version);
-                    (diagnostics::compute(doc), doc.version)
+                    (diagnostics::all(doc), doc.version)
                 }
                 None => {
                     warn!(uri = %uri, "did_change for unknown document");

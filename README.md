@@ -2,8 +2,9 @@
 
 Fast LSP server for Device Tree Source (DTS), written in Rust. Linux only.
 
-Built on `tower-lsp` + `tree-sitter` with the `tree-sitter-devicetree` grammar
-(the dtc-derived one that parses the whole Linux kernel tree).
+Built on `tower-lsp` + `tree-sitter` with the `tree-sitter-devicetree2` grammar
+(whame's dtc-derived grammar, built to parse every DTS file in the Linux
+kernel tree — GPL-3.0, which makes this binary GPL-3.0 too).
 
 ## Build
 
@@ -17,9 +18,23 @@ cargo build --release
 - Syntax error diagnostics (`textDocument/publishDiagnostics`) — tree-sitter
   ERROR nodes and missing tokens (`missing '>'`, `missing '}'`, ...), republished
   on every change, cleared on close
+- Semantic diagnostics — duplicate node names under one parent (error; dtc
+  silently merges them), same unit address shared by different nodes (warning;
+  legitimate on e.g. Qualcomm GENI serial engines)
 - `textDocument/documentSymbol` — node tree with full paths, property value kinds
-- `textDocument/semanticTokens/full` — labels, node names, properties, numbers,
-  strings, comments, preprocessor directives, dts keywords (`/dts-v1/`, `/delete-node/`, ...)
+- `textDocument/semanticTokens/full`:
+  - labels (`declaration`), node names, properties, numbers, strings, comments,
+    `#include`/`#define` macros
+  - slash directives (`/dts-v1/`, `/memreserve/`, `/include/`, `/bits/`, ...)
+    as `decorator` for a distinct color
+  - `/delete-node/` + `/delete-property/` directives and their targets rendered
+    `deprecated` (dim/strikethrough)
+  - overridden properties rendered `deprecated`: later same-name definitions,
+    properties removed by `/delete-property/`, and — for same-file overlays —
+    base properties overridden by `&label { }` / `&{/path} { }` extensions
+    (last definition wins, matching dtc merge order)
+- Cross-file overlay resolution (`&label` pointing into included .dtsi) needs
+  the include graph — planned for M1
 
 ## Test
 

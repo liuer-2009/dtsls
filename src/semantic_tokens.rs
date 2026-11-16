@@ -3,6 +3,7 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::Node;
 
+use crate::analysis::{self, Analysis};
 use crate::document::Document;
 use crate::util;
 
@@ -16,21 +17,26 @@ pub const LEGEND_TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::CLASS,
     SemanticTokenType::ENUM,
     SemanticTokenType::ENUM_MEMBER,
+    SemanticTokenType::DECORATOR,
 ];
 
-pub const LEGEND_TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[SemanticTokenModifier::DECLARATION];
+pub const LEGEND_TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
+    SemanticTokenModifier::DECLARATION,
+    SemanticTokenModifier::DEPRECATED,
+];
 
 const COMMENT: u32 = 0;
 const STRING: u32 = 1;
 const NUMBER: u32 = 2;
-const KEYWORD: u32 = 3;
 const MACRO: u32 = 4;
 const PROPERTY: u32 = 5;
 const CLASS: u32 = 6;
 const ENUM: u32 = 7;
 const ENUM_MEMBER: u32 = 8;
+const DECORATOR: u32 = 9;
 
 const DECLARATION: u32 = 1 << 0;
+const DEPRECATED: u32 = 1 << 1;
 
 struct RawToken {
     line: u32,
@@ -41,8 +47,9 @@ struct RawToken {
 }
 
 pub fn semantic_tokens(doc: &Document) -> SemanticTokens {
+    let analysis = analysis::analyze(doc);
     let mut raw = Vec::new();
-    walk(doc.tree.root_node(), doc, &mut raw);
+    walk(doc.tree.root_node(), doc, &analysis, &mut raw);
     raw.sort_by_key(|t| (t.line, t.character));
 
     let mut data = Vec::with_capacity(raw.len());
@@ -110,7 +117,14 @@ fn push_span(
     }
 }
 
-fn directive(out: &mut Vec<RawToken>, doc: &Document, node: Node, token_type: u32) {
+/// Color the leading directive keyword of a node (`/dts-v1/`, `#ifdef`, ...).
+fn directive(
+    out: &mut Vec<RawToken>,
+    doc: &Document,
+    node: Node,
+    token_type: u32,
+    token_modifiers: u32,
+) {
     let head_end = (node.start_byte() + 24).min(node.end_byte());
     let head = doc.slice(node.start_byte()..head_end);
     if let Some(word) = head.split_whitespace().next() {
@@ -122,109 +136,247 @@ fn directive(out: &mut Vec<RawToken>, doc: &Document, node: Node, token_type: u3
                 node.start_byte(),
                 node.start_byte() + word.len(),
                 token_type,
-                0,
+                token_modifiers,
             );
         }
     }
 }
 
-fn recurse(node: Node, doc: &Document, out: &mut Vec<RawToken>, skip: Option<usize>) {
+fn recurse(
+    node: Node,
+    doc: &Document,
+    analysis: &Analysis,
+    out: &mut Vec<RawToken>,
+    skip: Option<usize>,
+) {
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             if Some(child.id()) == skip {
                 continue;
             }
-            walk(child, doc, out);
+            walk(child, doc, analysis, out);
         }
     }
 }
 
-fn walk(node: Node, doc: &Document, out: &mut Vec<RawToken>) {
+fn walk(node: Node, doc: &Document, analysis: &Analysis, out: &mut Vec<RawToken>) {
     match node.kind() {
         "comment" => push_span(out, doc, node.start_byte(), node.end_byte(), COMMENT, 0),
-        "string_literal" | "byte_string_literal" | "system_lib_string" => {
+        "string_literal" | "preproc_string_literal" | "system_lib_string" | "bytestring" => {
             push_span(out, doc, node.start_byte(), node.end_byte(), STRING, 0)
         }
-        "integer_literal" | "unit_address" => {
+        "int_literal" | "char_literal" | "preproc_number_literal" | "preproc_char_literal" => {
             push_span(out, doc, node.start_byte(), node.end_byte(), NUMBER, 0)
         }
+        // Label tokens include the trailing ':'.
+        "label" => push_span(
+            out,
+            doc,
+            node.start_byte(),
+            node.end_byte().saturating_sub(1),
+            ENUM,
+            DECLARATION,
+        ),
         "reference" => push_span(out, doc, node.start_byte(), node.end_byte(), ENUM_MEMBER, 0),
-        "property" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                push_span(out, doc, name.start_byte(), name.end_byte(), PROPERTY, 0);
-            }
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i)
-                    && child.kind() == "/bits/" {
-                        push_span(out, doc, child.start_byte(), child.end_byte(), KEYWORD, 0);
-                        break;
-                    }
-            }
-            recurse(node, doc, out, None);
+        "preproc_identifier" | "preproc_function_call" => {
+            push_span(out, doc, node.start_byte(), node.end_byte(), MACRO, 0)
         }
-        "node" => {
-            for label in node
-                .children_by_field_name("label", &mut node.walk())
-            {
-                push_span(out, doc, label.start_byte(), label.end_byte(), ENUM, DECLARATION);
-            }
-            let mut skip = None;
-            if let Some(name) = node.child_by_field_name("name") {
-                if name.kind() == "reference" {
-                    push_span(out, doc, name.start_byte(), name.end_byte(), ENUM_MEMBER, 0);
-                    skip = Some(name.id());
-                } else {
-                    push_span(out, doc, name.start_byte(), name.end_byte(), CLASS, 0);
+        "property" => {
+            if let Some(delete) = util::find_child(node, "delete_property") {
+                directive(out, doc, delete, DECORATOR, DEPRECATED);
+                if let Some(name) = delete.child_by_field_name("name") {
+                    push_span(out, doc, name.start_byte(), name.end_byte(), PROPERTY, DEPRECATED);
                 }
+                return;
             }
-            recurse(node, doc, out, skip);
+            let modifiers = if analysis.dead_properties.contains(&node.id()) {
+                DEPRECATED
+            } else {
+                0
+            };
+            if let Some(name) = node.child_by_field_name("name") {
+                push_span(out, doc, name.start_byte(), name.end_byte(), PROPERTY, modifiers);
+            }
+            recurse(node, doc, analysis, out, None);
+        }
+        "prop_data" | "array" | "int_binary_op" | "int_unary_op" | "int_ternary_op"
+        | "int_parenthesized_expression" | "preproc_binary_expression"
+        | "preproc_unary_expression" | "preproc_parenthesized_expression" => {
+            recurse(node, doc, analysis, out, None)
+        }
+        "bits" => {
+            // "/bits/" keyword only; the size literal is colored by recursion.
+            push_span(out, doc, node.start_byte(), node.start_byte() + 6, DECORATOR, 0);
+            recurse(node, doc, analysis, out, None);
+        }
+        "incbin" => {
+            directive(out, doc, node, DECORATOR, 0);
+            recurse(node, doc, analysis, out, None);
+        }
+        "header" => directive(out, doc, node, DECORATOR, 0),
+        "memreserve" => {
+            // Labels may precede the directive, so locate it in the text.
+            let text = util::node_text(doc, node);
+            if let Some(offset) = text.find("/memreserve/") {
+                push_span(
+                    out,
+                    doc,
+                    node.start_byte() + offset,
+                    node.start_byte() + offset + 12,
+                    DECORATOR,
+                    0,
+                );
+            }
+            recurse(node, doc, analysis, out, None);
+        }
+        "include" => {
+            directive(out, doc, node, DECORATOR, 0);
+            recurse(node, doc, analysis, out, None);
+        }
+        "subnode" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                push_span(out, doc, name.start_byte(), name.end_byte(), CLASS, 0);
+            }
+            recurse(node, doc, analysis, out, None);
+        }
+        "delete_node" => {
+            directive(out, doc, node, DECORATOR, DEPRECATED);
+            if let Some(name) = node.child_by_field_name("name") {
+                push_span(out, doc, name.start_byte(), name.end_byte(), CLASS, DEPRECATED);
+            }
+        }
+        "delete_node_ref" => {
+            directive(out, doc, node, DECORATOR, DEPRECATED);
+            if let Some(reference) = util::find_child(node, "reference") {
+                push_span(
+                    out,
+                    doc,
+                    reference.start_byte(),
+                    reference.end_byte(),
+                    ENUM_MEMBER,
+                    DEPRECATED,
+                );
+            }
+        }
+        "omit_node" => {
+            directive(out, doc, node, DECORATOR, 0);
+            recurse(node, doc, analysis, out, None);
+        }
+        "omit_node_ref" => {
+            directive(out, doc, node, DECORATOR, 0);
+            recurse(node, doc, analysis, out, None);
         }
         "preproc_include" => {
-            directive(out, doc, node, MACRO);
-            recurse(node, doc, out, None);
+            directive(out, doc, node, MACRO, 0);
+            recurse(node, doc, analysis, out, None);
         }
-        "dtsi_include" => {
-            directive(out, doc, node, KEYWORD);
-            recurse(node, doc, out, None);
+        "preproc_def" => {
+            directive(out, doc, node, MACRO, 0);
+            if let Some(name) = node.child_by_field_name("name") {
+                push_span(out, doc, name.start_byte(), name.end_byte(), MACRO, 0);
+            }
         }
-        "preproc_def" | "preproc_function_def" => {
+        "preproc_function_def" => {
+            directive(out, doc, node, MACRO, 0);
             if let Some(name) = node.child_by_field_name("name") {
                 push_span(out, doc, name.start_byte(), name.end_byte(), MACRO, 0);
             }
         }
         "preproc_undef" => {
-            directive(out, doc, node, MACRO);
-            if let Some(name) = node.child_by_field_name("name") {
-                push_span(out, doc, name.start_byte(), name.end_byte(), MACRO, 0);
-            }
+            directive(out, doc, node, MACRO, 0);
+            recurse(node, doc, analysis, out, None);
         }
-        "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_elifdef" | "preproc_else" => {
-            directive(out, doc, node, MACRO);
-            recurse(node, doc, out, None);
+        "preproc_call" => directive(out, doc, node, MACRO, 0),
+        "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_elifdef" | "preproc_else"
+        | "preproc_if_in_node_def" | "preproc_ifdef_in_node_def" | "preproc_elif_in_node_def"
+        | "preproc_elifdef_in_node_def" | "preproc_else_in_node_def"
+        | "preproc_ifdef_in_array" | "preproc_elif_in_array" | "preproc_elifdef_in_array"
+        | "preproc_else_in_array" => {
+            directive(out, doc, node, MACRO, 0);
+            recurse(node, doc, analysis, out, None);
         }
-        "file_version" | "plugin" => directive(out, doc, node, KEYWORD),
-        "memory_reservation" => {
-            directive(out, doc, node, KEYWORD);
-            recurse(node, doc, out, None);
+        _ => recurse(node, doc, analysis, out, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::Document;
+
+    /// Decode relative semantic tokens back to absolute positions.
+    fn decoded(doc: &Document) -> Vec<(u32, u32, u32, u32, u32)> {
+        let tokens = semantic_tokens(doc);
+        let mut out = Vec::new();
+        let mut line = 0;
+        let mut character = 0;
+        for t in &tokens.data {
+            line += t.delta_line;
+            character = if t.delta_line == 0 {
+                character + t.delta_start
+            } else {
+                t.delta_start
+            };
+            out.push((line, character, t.length, t.token_type, t.token_modifiers_bitset));
         }
-        "delete_node" => {
-            directive(out, doc, node, KEYWORD);
-            recurse(node, doc, out, None);
-        }
-        "delete_property" => {
-            directive(out, doc, node, KEYWORD);
-            if let Some(name) = node.child_by_field_name("name") {
-                push_span(out, doc, name.start_byte(), name.end_byte(), PROPERTY, 0);
-            }
-        }
-        "omit_if_no_ref" => {
-            directive(out, doc, node, KEYWORD);
-            recurse(node, doc, out, None);
-        }
-        "incbin" => {
-            directive(out, doc, node, KEYWORD);
-            recurse(node, doc, out, None);
-        }
-        _ => recurse(node, doc, out, None),
+        out
+    }
+
+    fn line_of(doc: &Document, needle: &str) -> usize {
+        doc.text
+            .lines()
+            .position(|l| l.contains(needle))
+            .expect("needle not found")
+    }
+
+    const OVERLAY: &str = "/dts-v1/;\n\n/ {\n    intc: interrupt-controller@1000 {\n        compatible = \"arm,gic\";\n        reg = <0x1000 0x100>;\n    };\n};\n\n&intc {\n    reg = <0x1000 0x200>;\n    status = \"okay\";\n};\n";
+
+    #[test]
+    fn overridden_base_property_is_marked_deprecated() {
+        let doc = Document::open(OVERLAY, 0);
+        let base_line = line_of(&doc, "0x1000 0x100") as u32;
+        let ext_line = line_of(&doc, "0x1000 0x200") as u32;
+        let tokens = decoded(&doc);
+
+        let base_tokens: Vec<_> = tokens.iter().filter(|t| t.0 == base_line).collect();
+        assert!(
+            base_tokens.iter().any(|t| t.4 & DEPRECATED != 0),
+            "base reg property should carry the deprecated modifier"
+        );
+        assert!(
+            tokens
+                .iter()
+                .filter(|t| t.0 == ext_line)
+                .all(|t| t.4 & DEPRECATED == 0),
+            "extension reg property must not be deprecated"
+        );
+    }
+
+    #[test]
+    fn delete_property_target_is_marked_deprecated() {
+        let doc = Document::open(
+            "/dts-v1/;\n\n/ {\n    n {\n        a = <1>;\n        /delete-property/ a;\n    };\n};\n",
+            0,
+        );
+        let delete_line = line_of(&doc, "/delete-property/") as u32;
+        let tokens = decoded(&doc);
+        let line_tokens: Vec<_> = tokens.iter().filter(|t| t.0 == delete_line).collect();
+        assert!(
+            line_tokens
+                .iter()
+                .any(|t| t.3 == DECORATOR && t.4 & DEPRECATED != 0)
+        );
+        assert!(
+            line_tokens
+                .iter()
+                .any(|t| t.3 == PROPERTY && t.4 & DEPRECATED != 0)
+        );
+    }
+
+    #[test]
+    fn directives_use_decorator_token_type() {
+        let doc = Document::open("/dts-v1/;\n\n/ {\n    a = <1>;\n};\n", 0);
+        let tokens = decoded(&doc);
+        assert!(tokens.iter().any(|t| t.3 == DECORATOR));
     }
 }

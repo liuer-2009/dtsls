@@ -1,0 +1,11 @@
+/dts-v1/;
+
+/ {
+    serial@2000 {
+        compatible = "a";
+    };
+
+    i2c@2000 {
+        compatible = "b";
+    };
+};

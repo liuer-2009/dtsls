@@ -26,7 +26,7 @@ impl Document {
     fn empty_tree() -> Tree {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_devicetree::LANGUAGE.into())
+            .set_language(&tree_sitter_devicetree2::LANGUAGE.into())
             .expect("devicetree grammar should load");
         parser.parse("", None).expect("parsing empty text always succeeds")
     }
@@ -35,7 +35,7 @@ impl Document {
     fn parse(rope: &Rope, old_tree: Option<&Tree>) -> Option<Tree> {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_devicetree::LANGUAGE.into())
+            .set_language(&tree_sitter_devicetree2::LANGUAGE.into())
             .ok()?;
         let mut chunk: (&str, usize) = ("", usize::MAX);
         let mut callback = |byte: usize, _point: Point| -> &[u8] {
@@ -119,21 +119,21 @@ mod tests {
         /* block comment
            spanning lines */
     };
-
-    &{/soc/uart@1000} {
-        status = "okay";
-    };
 };
 
 / {
     /delete-node/ nonexistent;
+};
+
+&{/soc/uart@1000} {
+    status = "okay";
 };
 "#;
 
     fn count_errors(node: tree_sitter::Node) -> usize {
         let mut count = usize::from(node.is_error() || node.is_missing());
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
+            if let Some(child) = node.child(i as u32) {
                 count += count_errors(child);
             }
         }
