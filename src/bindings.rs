@@ -218,11 +218,14 @@ pub fn scan(index: &BindingIndex, dir: &Path) {
     }
     files.sort();
 
+    if files.is_empty() {
+        return;
+    }
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(files.len().max(1));
-    let chunk_size = files.len().div_ceil(workers);
+        .min(files.len());
+    let chunk_size = files.len().div_ceil(workers).max(1);
     let failed: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for chunk in files.chunks(chunk_size) {

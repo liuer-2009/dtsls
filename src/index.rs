@@ -509,11 +509,14 @@ pub fn scan_workspace(index: &Index, roots: &[PathBuf], skip: &HashSet<Url>) {
         }
     }
 
+    if targets.is_empty() {
+        return;
+    }
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(targets.len().max(1));
-    let chunk_size = targets.len().div_ceil(workers);
+        .min(targets.len());
+    let chunk_size = targets.len().div_ceil(workers).max(1);
     let roots = roots.to_vec();
     std::thread::scope(|scope| {
         for chunk in targets.chunks(chunk_size) {
