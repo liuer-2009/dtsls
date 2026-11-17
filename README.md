@@ -49,6 +49,21 @@ cargo build --release
   includes resolve against auto-detected kernel include dirs (walks up for
   `include/dt-bindings`) or `initializationOptions.includePaths`. Triggers:
   `&` for labels, ALL-CAPS words / `<` for macros; lowercase never pops
+- **M3: binding validation** — every node with `compatible` is checked against
+  the kernel bindings (`Documentation/devicetree/bindings`, auto-detected or
+  `initializationOptions.bindingsPath`). Binding violations (missing required
+  property, property not allowed by a strict binding) are ERRORS — including
+  in `.dtsi` fragments; a `compatible` with no binding is a WARNING. Compound
+  compatibles (`items:`) match position by position; child-node schemas in
+  `patternProperties` validate as their own bindings; meta-schema properties
+  (`pinctrl-*`, `*-supply`, `assigned-clocks`, ...) are always allowed. The
+  dtschema package (schemas + meta-schemas) is downloaded once into
+  `~/.cache/dtsls/` so `$ref`s and dtschema-hosted compatibles (`cache`,
+  `operating-points-v2`) resolve. No network access is made after that first
+  download; unresolved `$ref`s only disable the unknown-property check for
+  that binding.
+- **M3: goto binding** — with the cursor on a node (not on a label), `gd`
+  jumps to the YAML binding of the node's `compatible`
 
 ## Test
 

@@ -1,0 +1,26 @@
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/acme,widget.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Acme widget
+
+maintainers:
+  - Test <test@example.com>
+
+properties:
+  compatible:
+    const: acme,widget
+  reg:
+    maxItems: 1
+  clocks:
+    maxItems: 2
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+allOf:
+  - $ref: base.yaml#

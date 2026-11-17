@@ -4,23 +4,186 @@ use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use tree_sitter::Node;
 
+use crate::bindings::BindingIndex;
 use crate::document::Document;
 use crate::{index, util};
 
 const SOURCE: &str = "dtsls";
 const MAX_DIAGNOSTICS: usize = 100;
+const MAX_BINDING_DIAGNOSTICS_PER_NODE: usize = 12;
 
 /// Syntax errors plus semantic errors, sorted by position.
 pub fn all(
     doc: &Document,
     file_path: Option<&Path>,
     include_dirs: &[PathBuf],
+    bindings: &BindingIndex,
 ) -> Vec<Diagnostic> {
     let mut out = compute(doc);
     out.extend(semantic(doc));
     out.extend(unresolved_includes(doc, file_path, include_dirs));
+    out.extend(binding_diagnostics(doc, bindings, file_path));
     out.sort_by_key(|d| (d.range.start, d.range.end));
     out
+}
+
+/// Validate nodes against their devicetree bindings: binding violations are
+/// errors, a `compatible` without any matching binding is a warning.
+pub fn binding_diagnostics(
+    doc: &Document,
+    bindings: &BindingIndex,
+    file_path: Option<&Path>,
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    if bindings.is_empty() {
+        return out;
+    }
+    let _ = file_path;
+    check_bindings(doc.tree.root_node(), doc, bindings, &mut out);
+    out
+}
+
+fn check_bindings(
+    node: Node,
+    doc: &Document,
+    bindings: &BindingIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    if out.len() >= MAX_DIAGNOSTICS {
+        return;
+    }
+    if node.kind() == "subnode"
+        && let (Some(name_node), Some(compatibles)) = (
+            node.child_by_field_name("name"),
+            compatible_strings(doc, node),
+        ) {
+            let matched = bindings.lookup(&compatibles);
+            match matched {
+                None => out.push(Diagnostic {
+                    range: node_range(doc, name_node),
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    source: Some(SOURCE.to_string()),
+                    message: format!(
+                        "no binding found for compatible \"{}\"",
+                        compatibles.join("\", \"")
+                    ),
+                    ..Default::default()
+                }),
+                Some(binding) => {
+                    let file = binding
+                        .uri
+                        .path_segments()
+                        .and_then(|mut s| s.next_back())
+                        .unwrap_or("")
+                        .to_string();
+                    let node_name = util::node_text(doc, name_node);
+                    let mut count = 0;
+                    for required in &binding.required {
+                        if node_property(node, required, doc).is_none() {
+                            push_binding_diag(
+                                out,
+                                doc,
+                                name_node,
+                                DiagnosticSeverity::ERROR,
+                                format!(
+                                    "missing required property '{required}' for node \
+                                     '{node_name}' (binding: {file})"
+                                ),
+                            );
+                            count += 1;
+                        }
+                    }
+                    if binding.strict && binding.refs_complete {
+                        let body = util::node_def_of(node).unwrap_or(node);
+                        for i in 0..body.child_count() {
+                            let Some(child) = body.child(i as u32) else { continue };
+                            if child.kind() != "property" {
+                                continue;
+                            }
+                            let Some(prop_name) = child.child_by_field_name("name") else {
+                                continue;
+                            };
+                            let name = util::node_text(doc, prop_name);
+                            if bindings.is_property_allowed(name, &binding) {
+                                continue;
+                            }
+                            push_binding_diag(
+                                out,
+                                doc,
+                                prop_name,
+                                DiagnosticSeverity::ERROR,
+                                format!(
+                                    "property '{name}' is not allowed by binding {file} \
+                                     (node '{node_name}')"
+                                ),
+                            );
+                            count += 1;
+                            if count >= MAX_BINDING_DIAGNOSTICS_PER_NODE {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            check_bindings(child, doc, bindings, out);
+        }
+    }
+}
+
+fn push_binding_diag(
+    out: &mut Vec<Diagnostic>,
+    doc: &Document,
+    node: Node,
+    severity: DiagnosticSeverity,
+    message: String,
+) {
+    out.push(Diagnostic {
+        range: node_range(doc, node),
+        severity: Some(severity),
+        source: Some(SOURCE.to_string()),
+        message,
+        ..Default::default()
+    });
+}
+
+/// All `compatible` strings declared by this node's `compatible` property.
+pub fn compatible_strings(doc: &Document, node: Node) -> Option<Vec<String>> {
+    let prop = node_property(node, "compatible", doc)?;
+    let mut out = Vec::new();
+    for i in 0..prop.child_count() {
+        let Some(data) = prop.child(i as u32) else { continue };
+        if data.kind() != "prop_data" {
+            continue;
+        }
+        if let Some(string) = util::find_child(data, "string_literal") {
+            out.push(util::node_text(doc, string).trim_matches('"').to_string());
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn node_property<'a>(node: Node<'a>, name: &str, doc: &Document) -> Option<Node<'a>> {
+    // properties live inside the node's `{ ... }` body, not on the subnode
+    let container = match node.kind() {
+        "subnode" | "devicetree" => util::node_def_of(node).unwrap_or(node),
+        _ => node,
+    };
+    for i in 0..container.child_count() {
+        let Some(child) = container.child(i as u32) else { continue };
+        if child.kind() != "property" {
+            continue;
+        }
+        if child
+            .child_by_field_name("name")
+            .is_some_and(|n| util::node_text(doc, n) == name)
+        {
+            return Some(child);
+        }
+    }
+    None
 }
 
 /// Collect syntax errors (ERROR nodes and missing tokens) from the parse tree.
@@ -473,7 +636,7 @@ mod tests {
         assert!(!valid.is_empty(), "no valid fixtures found");
         for path in broken {
             let text = std::fs::read_to_string(&path).unwrap();
-            let diags = all(&Document::open(&text, 0), None, &[]);
+            let diags = all(&Document::open(&text, 0), None, &[], &BindingIndex::default());
             assert!(!diags.is_empty(), "broken fixture not detected: {path}");
             assert!(
                 diags
@@ -484,7 +647,7 @@ mod tests {
         }
         for path in warning {
             let text = std::fs::read_to_string(&path).unwrap();
-            let diags = all(&Document::open(&text, 0), None, &[]);
+            let diags = all(&Document::open(&text, 0), None, &[], &BindingIndex::default());
             assert!(!diags.is_empty(), "warning fixture not detected: {path}");
             assert!(
                 diags
@@ -496,7 +659,7 @@ mod tests {
         for path in valid {
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(
-                all(&Document::open(&text, 0), None, &[]).is_empty(),
+                all(&Document::open(&text, 0), None, &[], &BindingIndex::default()).is_empty(),
                 "valid fixture has errors: {path}"
             );
         }
@@ -592,5 +755,41 @@ mod tests {
         assert_eq!(unresolved_includes(&doc, None, &[]).len(), 1);
         // with the fixture dir as include dir -> clean
         assert!(unresolved_includes(&doc, None, &[dir]).is_empty());
+    }
+
+    #[test]
+    fn binding_violations_are_errors_and_missing_binding_is_a_warning() {
+        let bindings = BindingIndex::default();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/bindings");
+        // build a tiny index by hand from the fixture files
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "yaml") {
+                for binding in crate::bindings::parse_bindings(&path) {
+                    bindings.insert_for_test(binding);
+                }
+            }
+        }
+
+        // missing required 'reg' + unknown property -> two errors
+        let text = "/dts-v1/;\n\n/ {\n    widget@0 {\n        compatible = \"acme,widget\";\n        bogus-prop;\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let diags = binding_diagnostics(&doc, &bindings, None);
+        assert!(diags.iter().any(|d| d.message.contains("missing required property 'reg'")));
+        assert!(diags.iter().any(|d| d.message.contains("'bogus-prop' is not allowed")));
+        assert!(diags.iter().all(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
+
+        // compatible with no binding -> warning only
+        let text = "/dts-v1/;\n\n/ {\n    x@0 {\n        compatible = \"acme,unknown\";\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let diags = binding_diagnostics(&doc, &bindings, None);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diags[0].message.contains("no binding found"));
+
+        // fully valid node -> clean
+        let text = "/dts-v1/;\n\n/ {\n    widget@0 {\n        compatible = \"acme,widget\";\n        reg = <0 1>;\n        clocks = <&c 0>;\n        status_probe;\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        assert!(binding_diagnostics(&doc, &bindings, None).is_empty());
     }
 }

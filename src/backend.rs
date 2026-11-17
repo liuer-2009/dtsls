@@ -7,6 +7,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, info, warn};
 
+use crate::bindings::{self, BindingIndex};
 use crate::completion;
 use crate::document::Document;
 use crate::hints;
@@ -21,6 +22,8 @@ pub struct Backend {
     /// Workspace-wide contribution tables (labels, refs, includes), built in
     /// background; requests read finished entries only.
     index: Arc<Index>,
+    /// compatible -> devicetree binding, built in background at startup.
+    bindings: Arc<BindingIndex>,
 }
 
 impl Backend {
@@ -30,6 +33,7 @@ impl Backend {
             documents: RwLock::new(HashMap::new()),
             root_dirs: RwLock::new(Vec::new()),
             index: Arc::new(Index::default()),
+            bindings: Arc::new(BindingIndex::default()),
         }
     }
 
@@ -66,15 +70,30 @@ impl LanguageServer for Backend {
         }
         // `<dt-bindings/...>` resolution: auto-detect a kernel tree by walking
         // up for `include/dt-bindings`, plus client-supplied includePaths.
+        let kernel_root = index::detect_kernel_root(&roots);
         roots.extend(index::detect_include_dirs(&roots));
-        if let Some(options) = params.initialization_options
-            && let Some(paths) = options.get("includePaths").and_then(|v| v.as_array()) {
+        let mut bindings_dir = kernel_root
+            .map(|root| root.join("Documentation/devicetree/bindings"))
+            .filter(|dir| dir.is_dir());
+        if let Some(options) = params.initialization_options {
+            if let Some(paths) = options.get("includePaths").and_then(|v| v.as_array()) {
                 for path in paths {
                     if let Some(p) = path.as_str() {
                         roots.push(PathBuf::from(p));
                     }
                 }
             }
+            if let Some(path) = options.get("bindingsPath").and_then(|v| v.as_str()) {
+                let dir = PathBuf::from(path);
+                if dir.is_dir() {
+                    bindings_dir = Some(dir);
+                }
+            }
+        }
+        if let Some(dir) = bindings_dir {
+            let bindings = Arc::clone(&self.bindings);
+            tokio::task::spawn_blocking(move || bindings::scan(&bindings, &dir));
+        }
         *self.root_dirs.write().unwrap() = roots;
         // Background workspace scan: index every dts file under the roots so
         // goto definition / references work for files never opened.
@@ -142,7 +161,12 @@ impl LanguageServer for Backend {
             docs.insert(td.uri.clone(), Document::open(&td.text, td.version));
             match docs.get(&td.uri) {
                 Some(doc) => (
-                    diagnostics::all(doc, td.uri.to_file_path().ok().as_deref(), &self.include_dirs()),
+                    diagnostics::all(
+                        doc,
+                        td.uri.to_file_path().ok().as_deref(),
+                        &self.include_dirs(),
+                        &self.bindings,
+                    ),
                     doc.version,
                 ),
                 None => return,
@@ -162,7 +186,12 @@ impl LanguageServer for Backend {
                 Some(doc) => {
                     doc.apply_changes(&params.content_changes, params.text_document.version);
                     (
-                        diagnostics::all(doc, uri.to_file_path().ok().as_deref(), &self.include_dirs()),
+                        diagnostics::all(
+                            doc,
+                            uri.to_file_path().ok().as_deref(),
+                            &self.include_dirs(),
+                            &self.bindings,
+                        ),
                         doc.version,
                         doc.text.clone(),
                     )
@@ -237,20 +266,45 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let label = {
-            let docs = self.documents.read().unwrap();
-            let Some(doc) = docs.get(&uri) else {
-                return Ok(None);
-            };
-            completion::label_at_cursor(doc, util::position_to_byte(&doc.rope, position))
-        };
-        let Some(label) = label else {
+        let docs = self.documents.read().unwrap();
+        let Some(doc) = docs.get(&uri) else {
             return Ok(None);
         };
-        Ok(index::resolve_label(&self.index, &uri, &label).map(|(target_uri, def)| {
+        let byte = util::position_to_byte(&doc.rope, position);
+        if let Some(label) = completion::label_at_cursor(doc, byte) {
+            return Ok(index::resolve_label(&self.index, &uri, &label).map(
+                |(target_uri, def)| {
+                    GotoDefinitionResponse::Scalar(Location {
+                        uri: target_uri,
+                        range: def.range,
+                    })
+                },
+            ));
+        }
+        // not on a label: jump to the binding of the enclosing node
+        let Some(node) = doc.tree.root_node().descendant_for_byte_range(byte, byte) else {
+            return Ok(None);
+        };
+        let Some(subnode) = enclosing_node(node) else {
+            return Ok(None);
+        };
+        let Some(compatibles) = node_compatibles(doc, subnode) else {
+            return Ok(None);
+        };
+        let binding = self.bindings.lookup(&compatibles);
+        Ok(binding.map(|binding| {
             GotoDefinitionResponse::Scalar(Location {
-                uri: target_uri,
-                range: def.range,
+                uri: binding.uri.clone(),
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                },
             })
         }))
     }
@@ -324,4 +378,17 @@ impl LanguageServer for Backend {
             semantic_tokens::semantic_tokens(doc),
         )))
     }
+}
+
+fn enclosing_node(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    loop {
+        if node.kind() == "subnode" {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn node_compatibles(doc: &Document, node: tree_sitter::Node) -> Option<Vec<String>> {
+    diagnostics::compatible_strings(doc, node)
 }

@@ -1,0 +1,9 @@
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/base.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+properties:
+  status_probe:
+    description: property pulled in through a $ref
+    type: boolean

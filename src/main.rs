@@ -1,5 +1,6 @@
 mod analysis;
 mod backend;
+mod bindings;
 mod completion;
 mod diagnostics;
 mod document;

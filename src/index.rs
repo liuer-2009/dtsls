@@ -494,27 +494,35 @@ pub fn scan_workspace(index: &Index, roots: &[PathBuf], skip: &HashSet<Url>) {
     );
 }
 
-/// Auto-detect kernel-tree include dirs for `<dt-bindings/...>` resolution:
-/// walk up from each root looking for `include/dt-bindings`.
-pub fn detect_include_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// Auto-detect the kernel tree root by walking up from each root looking for
+/// `include/dt-bindings`.
+pub fn detect_kernel_root(roots: &[PathBuf]) -> Option<PathBuf> {
     for root in roots {
         let mut dir = Some(root.as_path());
         for _ in 0..6 {
             let Some(d) = dir else { break };
             if d.join("include/dt-bindings").is_dir() {
-                let include = d.join("include");
-                if !out.contains(&include) {
-                    out.push(include);
-                }
-                let prefixes = d.join("scripts/dtc/include-prefixes");
-                if prefixes.is_dir() && !out.contains(&prefixes) {
-                    out.push(prefixes);
-                }
-                break;
+                return Some(d.to_path_buf());
             }
             dir = d.parent();
         }
+    }
+    None
+}
+
+/// Auto-detect kernel-tree include dirs for `<dt-bindings/...>` resolution.
+pub fn detect_include_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(kernel_root) = detect_kernel_root(roots) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let include = kernel_root.join("include");
+    if include.is_dir() {
+        out.push(include);
+    }
+    let prefixes = kernel_root.join("scripts/dtc/include-prefixes");
+    if prefixes.is_dir() {
+        out.push(prefixes);
     }
     out
 }
