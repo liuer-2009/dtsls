@@ -115,6 +115,10 @@ impl LanguageServer for Backend {
             }
         }
         if let Some(dir) = bindings_dir {
+            // binding checks need the dtschema package for `$ref` resolution;
+            // surface its absence as an error at the top of every dts file
+            let missing = bindings::dtschema_package_dir().is_none();
+            self.bindings.set_missing_dtschema(missing);
             let bindings = Arc::clone(&self.bindings);
             tokio::task::spawn_blocking(move || bindings::scan(&bindings, &dir));
         }

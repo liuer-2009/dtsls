@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use tree_sitter::Node;
 
 use crate::bindings::BindingIndex;
@@ -110,13 +110,16 @@ fn run(
     bindings: &BindingIndex,
     cats: u8,
 ) -> Vec<Diagnostic> {
-    // without a binding index, binding checks are pointless work
-    let cats = if cats & CAT_BINDINGS != 0 && bindings.is_empty() {
+    let bindings_requested = cats & CAT_BINDINGS != 0;
+    let missing_dtschema = bindings_requested && bindings.missing_dtschema();
+    // without a populated binding index, binding checks are pointless work —
+    // but the "dtschema not installed" notice must still get through
+    let cats = if bindings_requested && bindings.is_empty() {
         cats & !CAT_BINDINGS
     } else {
         cats
     };
-    if cats == 0 {
+    if cats == 0 && !missing_dtschema {
         return Vec::new();
     }
     let mut ctx = DiagCtx {
@@ -127,7 +130,30 @@ fn run(
         cats,
         out: Vec::new(),
     };
-    walk(doc.tree.root_node(), &mut ctx, false);
+    if missing_dtschema {
+        // one synthetic diagnostic at the very top: without the dtschema
+        // package, `$ref` resolution (and thus property validation) is
+        // incomplete, so say so instead of pretending the file is clean
+        ctx.push(
+            Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
+            },
+            DiagnosticSeverity::ERROR,
+            "dtschema (python package) is not installed — property validation and \
+             `$ref` resolution are incomplete; install it with: pip install dtschema"
+                .to_string(),
+        );
+    }
+    if cats != 0 {
+        walk(doc.tree.root_node(), &mut ctx, false);
+    }
     let mut out = ctx.out;
     out.sort_by_key(|d| (d.range.start, d.range.end));
     out

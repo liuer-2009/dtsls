@@ -44,9 +44,19 @@ pub struct BindingIndex {
     implicit_properties: RwLock<HashSet<String>>,
     /// meta-schema property patterns (`-supply$`, `.*-names$`, ...)
     implicit_patterns: RwLock<Vec<regex::Regex>>,
+    /// bindings were configured but no dtschema package is installed
+    dtschema_missing: RwLock<bool>,
 }
 
 impl BindingIndex {
+    pub fn set_missing_dtschema(&self, missing: bool) {
+        *self.dtschema_missing.write().unwrap() = missing;
+    }
+
+    pub fn missing_dtschema(&self) -> bool {
+        *self.dtschema_missing.read().unwrap()
+    }
+
     /// May the node carry this property according to the binding and the
     /// meta-schemas?
     pub fn is_property_allowed(&self, name: &str, binding: &Binding) -> bool {
@@ -179,27 +189,36 @@ pub fn is_common_property(name: &str) -> bool {
     COMMON_PROPERTIES.contains(&name)
 }
 
-/// Scan the kernel bindings tree plus the dtschema package (downloaded on
-/// first run). Runs on a worker thread at startup.
+/// Scan the kernel bindings tree plus the dtschema package installed on the
+/// host. Runs on a worker thread at startup.
 pub fn scan(index: &BindingIndex, dir: &Path) {
     let started = std::time::Instant::now();
-    let repo = ensure_dtschema_repo();
-    if let Some(repo) = &repo {
+    let package = dtschema_package_dir();
+    if let Some(package) = package {
         let mut properties = HashSet::new();
         let mut patterns = Vec::new();
-        collect_meta_allowlist(&repo.join("meta-schemas"), &mut properties, &mut patterns);
+        collect_meta_allowlist(
+            &package.join("meta-schemas"),
+            &mut properties,
+            &mut patterns,
+        );
         tracing::info!(
             properties = properties.len(),
             patterns = patterns.len(),
             "meta-schema allowlist"
         );
         index.set_implicit(properties, patterns);
+    } else {
+        tracing::warn!("dtschema python package not found; run `pip install dtschema`");
     }
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut scan_dirs = vec![dir.to_path_buf()];
-    if let Some(repo) = &repo {
-        scan_dirs.push(repo.join("schemas"));
+    if let Some(package) = package {
+        let schemas = package.join("schemas");
+        if schemas.is_dir() {
+            scan_dirs.push(schemas);
+        }
     }
     for scan_dir in &scan_dirs {
         for entry in walkdir::WalkDir::new(scan_dir)
@@ -730,97 +749,47 @@ fn in_tree_root(binding_dir: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-/// Schema root of a local dtschema python install, if any.
-fn local_schema_roots() -> &'static Vec<PathBuf> {
-    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    ROOTS.get_or_init(|| {
-        let mut roots = Vec::new();
+/// Root of a dtschema python package installed on this host (`pip install
+/// dtschema`, or `DTSLS_SCHEMAS_DIR` pointing at it). Nothing is downloaded:
+/// without the package, `$ref`s into dtschema and dtschema-hosted compatibles
+/// stay unresolved, and the server reports that at the top of each file.
+pub fn dtschema_package_dir() -> Option<&'static PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
         if let Ok(dir) = std::env::var("DTSLS_SCHEMAS_DIR") {
-            roots.push(PathBuf::from(dir));
-        }
-        let repo_schemas = schema_cache_dir().join("repo/schemas");
-        if repo_schemas.is_dir() {
-            roots.push(repo_schemas);
+            let dir = PathBuf::from(dir);
+            if dir.is_dir() {
+                return Some(dir);
+            }
         }
         let output = std::process::Command::new("python3")
-            .args(["-c", "import dtschema,os;print(os.path.dirname(dtschema.__file__))"])
-            .output();
-        if let Ok(output) = output
-            && output.status.success() {
-                let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !dir.is_empty() {
-                    roots.push(PathBuf::from(dir).join("schemas"));
-                }
-            }
-        roots
-    })
+            .args([
+                "-c",
+                "import dtschema,os;print(os.path.dirname(dtschema.__file__))",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!dir.is_empty()).then(|| PathBuf::from(dir))
+    });
+    dir.as_ref()
 }
 
-fn schema_cache_dir() -> PathBuf {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("dtsls/dt-schema")
-}
-
-/// Download and extract the dtschema repository once into the user cache.
-/// `schemas/` supplies bindings for compatibles the kernel tree only
-/// references (cache, operating-points-v2, ...); `meta-schemas/` supplies
-/// the implicit property allowlist.
-fn ensure_dtschema_repo() -> Option<PathBuf> {
-    let root = schema_cache_dir().join("repo");
-    if root.join("schemas").is_dir() {
-        return Some(root);
-    }
-    let url = "https://github.com/devicetree-org/dt-schema/archive/refs/heads/main.tar.gz";
-    let mut response = http_agent().get(url).call().ok()?;
-    let reader = response.body_mut().as_reader();
-    let decoder = flate2::read::GzDecoder::new(reader);
-    let mut archive = tar::Archive::new(decoder);
-    let tmp = schema_cache_dir().join("repo.tmp");
-    std::fs::remove_dir_all(&tmp).ok();
-    std::fs::create_dir_all(&tmp).ok()?;
-    let mut extracted = 0usize;
-    for entry in archive.entries().ok()? {
-        let Ok(mut entry) = entry else { continue };
-        let Ok(path) = entry.path() else { continue };
-        // keep only dtschema-main/dtschema/{schemas,meta-schemas}/...
-        let path = path.to_path_buf();
-        let mut components = path.components();
-        components.next(); // dtschema-main
-        let Some(stripped) = components.next() else { continue };
-        if stripped.as_os_str() != "dtschema" {
-            continue;
-        }
-        let rest: PathBuf = components.collect();
-        if rest.as_os_str().is_empty() {
-            continue;
-        }
-        if !(rest.starts_with("schemas") || rest.starts_with("meta-schemas")) {
-            continue;
-        }
-        if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(tmp.join(&rest)).ok();
-            continue;
-        }
-        let dest = tmp.join(&rest);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        if entry.unpack(&dest).is_ok() {
-            extracted += 1;
+/// `schemas/` roots of the local dtschema install, used for `$ref` resolution.
+fn local_schema_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(package) = dtschema_package_dir() {
+        let schemas = package.join("schemas");
+        if schemas.is_dir() {
+            roots.push(schemas);
+        } else if package.is_dir() {
+            roots.push(package.clone());
         }
     }
-    if extracted == 0 {
-        std::fs::remove_dir_all(&tmp).ok();
-        return None;
-    }
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::rename(&tmp, &root).ok()?;
-    tracing::info!(files = extracted, "downloaded dtschema repository");
-    Some(root)
+    roots
 }
 
 /// Union of `properties` keys and `patternProperties` from every
@@ -885,17 +854,6 @@ fn collect_property_declarations(
         }
         _ => {}
     }
-}
-
-fn http_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        // never let a stalled connection wedge the whole binding scan
-        ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(60)))
-            .build()
-            .new_agent()
-    })
 }
 
 #[cfg(test)]
