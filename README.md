@@ -64,6 +64,9 @@ cargo build --release
   that binding.
 - **M3: goto binding** — with the cursor on a node (not on a label), `gd`
   jumps to the YAML binding of the node's `compatible`
+- **M3: property completion** — typing a property name inside a node whose
+  `compatible` has a binding suggests that binding's properties (required
+  ones first, already-present ones dropped); value positions never trigger
 
 ## Test
 
@@ -72,7 +75,8 @@ cargo test                          # unit tests (incl. testdata fixtures)
 cargo test -- --ignored             # parses a real kernel dtsi (path baked in test)
 python3 scripts/smoke_test.py       # end-to-end LSP session over stdio
 python3 scripts/diagnostics_test.py # broken/valid fixtures -> publishDiagnostics
-python3 scripts/bench_real.py /path/to/soc.dtsi   # real-world timing
+python3 scripts/bench.py            # state update / jump / completion latencies
+python3 scripts/bench_real.py /path/to/soc.dtsi   # real-world parse timing
 ```
 
 ## Neovim

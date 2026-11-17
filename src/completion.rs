@@ -17,10 +17,12 @@ pub enum Context {
     Labels(String),
     /// bare ALL_CAPS word (macro convention), or `<` just typed
     Defines(String),
+    /// lowercase word at a property-name position inside a node body
+    Properties(String),
 }
 
-/// Classify the completion context at the cursor. Lowercase words (node and
-/// property names) intentionally return None so the popup never nags there.
+/// Classify the completion context at the cursor. Lowercase words only offer
+/// property names, and only when the line so far cannot be a value.
 pub fn completion_context(doc: &Document, cursor: usize) -> Option<Context> {
     let cursor = cursor.min(doc.rope.len_bytes());
     let line = doc.rope.byte_to_line(cursor);
@@ -56,7 +58,55 @@ pub fn completion_context(doc: &Document, cursor: usize) -> Option<Context> {
     if macro_case {
         return Some(Context::Defines(word));
     }
+    // property-name position: everything before the word on this line is
+    // whitespace (a value would contain `=` / `<` / `,` / `&` / `"`)
+    let head = doc.slice(line_start..start);
+    if head.chars().all(|c| c == ' ' || c == '\t') && !word.is_empty() {
+        return Some(Context::Properties(word));
+    }
     None
+}
+
+/// Property-name items from a node's binding. Required properties sort first;
+/// properties the node already has are dropped.
+pub fn items_from_binding(
+    binding: &crate::bindings::Binding,
+    existing: &std::collections::HashSet<String>,
+    prefix: &str,
+) -> Vec<CompletionItem> {
+    let file = binding
+        .uri
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .unwrap_or("")
+        .to_string();
+    let mut items: Vec<CompletionItem> = binding
+        .properties
+        .iter()
+        .chain(binding.required.iter())
+        .filter(|name| !existing.contains(*name) && name.starts_with(prefix))
+        .map(|name| {
+            let required = binding.required.contains(name);
+            CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some(if required {
+                    format!("{file} (required)")
+                } else {
+                    file.clone()
+                }),
+                sort_text: Some(if required {
+                    format!("0{name}")
+                } else {
+                    format!("1{name}")
+                }),
+                ..Default::default()
+            }
+        })
+        .collect();
+    items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+    items.dedup_by(|a, b| a.label == b.label);
+    items
 }
 
 /// Items straight from the background index: no tree walk, no IO. This is the
@@ -206,10 +256,48 @@ mod tests {
 
     #[test]
     fn lowercase_words_never_complete() {
+        // mid-value lowercase words are not a completion context
         assert_eq!(context_at("/ { a = <1>;\n};\n", "a"), None);
         assert_eq!(context_at("/ { spi@1000 {\n};\n", "spi"), None);
         // node names in all caps would be completed as defines — acceptable,
         // node names are lowercase by convention.
+    }
+
+    #[test]
+    fn property_position_detected() {
+        let text = "/ {\n    node {\n        clo\n    };\n};\n";
+        assert_eq!(
+            context_at(text, "clo"),
+            Some(Context::Properties("clo".to_string()))
+        );
+        // after `=` it is a value, not a property name
+        assert_eq!(context_at("/ {\n    a = clo\n};\n", "clo"), None);
+    }
+
+    #[test]
+    fn binding_items_are_required_first_and_deduped() {
+        use crate::bindings::Binding;
+        use std::collections::HashSet;
+        let binding = Binding {
+            uri: tower_lsp::lsp_types::Url::parse("file:///b.yaml").unwrap(),
+            singles: vec!["acme,x".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "clocks", "reg", "status_probe"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required: vec!["compatible".to_string(), "reg".to_string()],
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        };
+        let existing = HashSet::from(["compatible".to_string()]);
+        let items = items_from_binding(&binding, &existing, "");
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        // "reg" (required) first; "compatible" already present -> dropped
+        assert_eq!(labels.first(), Some(&"reg"));
+        assert!(!labels.contains(&"compatible"));
+        assert_eq!(items.len(), 3);
     }
 
     #[test]

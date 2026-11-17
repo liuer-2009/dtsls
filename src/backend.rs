@@ -179,22 +179,26 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let started = std::time::Instant::now();
         let uri = params.text_document.uri;
         let (diags, version, text) = {
             let mut docs = self.documents.write().unwrap();
             match docs.get_mut(&uri) {
                 Some(doc) => {
                     doc.apply_changes(&params.content_changes, params.text_document.version);
-                    (
-                        diagnostics::all(
-                            doc,
-                            uri.to_file_path().ok().as_deref(),
-                            &self.include_dirs(),
-                            &self.bindings,
-                        ),
-                        doc.version,
-                        doc.text.clone(),
-                    )
+                    let parse_done = started.elapsed();
+                    let diags = diagnostics::all(
+                        doc,
+                        uri.to_file_path().ok().as_deref(),
+                        &self.include_dirs(),
+                        &self.bindings,
+                    );
+                    debug!(
+                        parse_us = parse_done.as_micros() as u64,
+                        diagnostics_us = started.elapsed().as_micros() as u64,
+                        "did_change handled"
+                    );
+                    (diags, doc.version, doc.text.clone())
                 }
                 None => {
                     warn!(uri = %uri, "did_change for unknown document");
@@ -252,6 +256,10 @@ impl LanguageServer for Backend {
                         fi.map(|f| completion::items_from_defines(&f.defines, &prefix))
                     })
                     .unwrap_or_default(),
+                completion::Context::Properties(prefix) => {
+                    let byte = util::position_to_byte(&doc.rope, position);
+                    property_items(doc, byte, &prefix, &self.bindings)
+                }
             }
         };
         debug!(count = items.len(), elapsed_us = started.elapsed().as_micros() as u64, "completion");
@@ -391,4 +399,68 @@ fn enclosing_node(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
 
 fn node_compatibles(doc: &Document, node: tree_sitter::Node) -> Option<Vec<String>> {
     diagnostics::compatible_strings(doc, node)
+}
+
+/// Binding-based property completion for the node enclosing `byte`.
+fn property_items(
+    doc: &Document,
+    byte: usize,
+    prefix: &str,
+    bindings: &BindingIndex,
+) -> Vec<CompletionItem> {
+    let Some(node) = doc.tree.root_node().descendant_for_byte_range(byte, byte) else {
+        return Vec::new();
+    };
+    let Some(subnode) = enclosing_node(node) else {
+        return Vec::new();
+    };
+    let Some(compatibles) = node_compatibles(doc, subnode) else {
+        return Vec::new();
+    };
+    let Some(binding) = bindings.lookup(&compatibles) else {
+        return Vec::new();
+    };
+    let mut existing = HashSet::new();
+    if let Some(body) = util::node_def_of(subnode) {
+        for i in 0..body.child_count() {
+            let Some(child) = body.child(i as u32) else { continue };
+            if child.kind() == "property"
+                && let Some(name) = child.child_by_field_name("name")
+            {
+                existing.insert(util::node_text(doc, name).to_string());
+            }
+        }
+    }
+    completion::items_from_binding(&binding, &existing, prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bindings::Binding;
+
+    #[test]
+    fn property_items_resolve_through_the_enclosing_node() {
+        let text = "/dts-v1/;\n\n/ {\n    mmc@8804000 {\n        compatible = \"acme,mmc\";\n        reg = <0x1>;\n        clo\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(Binding {
+            uri: Url::parse("file:///mmc.yaml").unwrap(),
+            singles: vec!["acme,mmc".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "reg", "clocks", "clock-names"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required: vec!["compatible".to_string()],
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        });
+        // cursor right after "clo" on its line
+        let byte = text.find("clo").unwrap() + 3;
+        let items = property_items(&doc, byte, "clo", &bindings);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["clock-names", "clocks"], "items: {labels:?}");
+    }
 }

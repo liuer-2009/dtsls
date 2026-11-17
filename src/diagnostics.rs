@@ -19,11 +19,24 @@ pub fn all(
     include_dirs: &[PathBuf],
     bindings: &BindingIndex,
 ) -> Vec<Diagnostic> {
+    let started = std::time::Instant::now();
     let mut out = compute(doc);
+    let syntax = started.elapsed();
     out.extend(semantic(doc));
+    let semantic_time = started.elapsed();
     out.extend(unresolved_includes(doc, file_path, include_dirs));
+    let includes = started.elapsed();
     out.extend(binding_diagnostics(doc, bindings, file_path));
+    let bindings_time = started.elapsed();
     out.sort_by_key(|d| (d.range.start, d.range.end));
+    tracing::debug!(
+        syntax_us = syntax.as_micros() as u64,
+        semantic_us = (semantic_time - syntax).as_micros() as u64,
+        includes_us = (includes - semantic_time).as_micros() as u64,
+        bindings_us = (bindings_time - includes).as_micros() as u64,
+        total_us = started.elapsed().as_micros() as u64,
+        "diagnostics phases"
+    );
     out
 }
 
