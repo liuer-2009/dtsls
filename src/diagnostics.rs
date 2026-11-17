@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use tree_sitter::Node;
@@ -9,170 +10,298 @@ use crate::document::Document;
 use crate::{index, util};
 
 const SOURCE: &str = "dtsls";
-const MAX_DIAGNOSTICS: usize = 100;
+const MAX_DIAGNOSTICS: usize = 500;
 const MAX_BINDING_DIAGNOSTICS_PER_NODE: usize = 12;
 
-/// Syntax errors plus semantic errors, sorted by position.
+const CAT_SYNTAX: u8 = 1 << 0;
+const CAT_DUPLICATES: u8 = 1 << 1;
+const CAT_INCLUDES: u8 = 1 << 2;
+const CAT_BINDINGS: u8 = 1 << 3;
+const CAT_ALL: u8 = CAT_SYNTAX | CAT_DUPLICATES | CAT_INCLUDES | CAT_BINDINGS;
+
+/// Node-kind ids resolved once: comparing ids beats comparing kind strings on
+/// every node of every traversal.
+struct Kinds {
+    source_file: u16,
+    subnode: u16,
+    devicetree: u16,
+    property: u16,
+    prop_data: u16,
+    preproc_include: u16,
+    preproc_string_literal: u16,
+    system_lib_string: u16,
+    string_literal: u16,
+    /// containers whose direct subnodes may collide (`node_def`, `#if` bodies)
+    containers: [u16; 3],
+    /// `#else`/`#elif` subtrees are parsed but conditional; duplicates in
+    /// them would be false positives
+    alternatives: HashSet<u16>,
+}
+
+fn kinds() -> &'static Kinds {
+    static KINDS: OnceLock<Kinds> = OnceLock::new();
+    KINDS.get_or_init(|| {
+        let language: tree_sitter::Language = tree_sitter_devicetree2::LANGUAGE.into();
+        let id = |kind: &str| language.id_for_node_kind(kind, true);
+        let mut alternatives = HashSet::new();
+        for kind_id in 0..language.node_kind_count() as u16 {
+            if let Some(kind) = language.node_kind_for_id(kind_id)
+                && (kind.contains("else") || kind.contains("elif"))
+            {
+                alternatives.insert(kind_id);
+            }
+        }
+        Kinds {
+            source_file: id("source_file"),
+            subnode: id("subnode"),
+            devicetree: id("devicetree"),
+            property: id("property"),
+            prop_data: id("prop_data"),
+            preproc_include: id("preproc_include"),
+            preproc_string_literal: id("preproc_string_literal"),
+            system_lib_string: id("system_lib_string"),
+            string_literal: id("string_literal"),
+            containers: [
+                id("node_def"),
+                id("preproc_if_in_node_def"),
+                id("preproc_ifdef_in_node_def"),
+            ],
+            alternatives,
+        }
+    })
+}
+
+struct DiagCtx<'a> {
+    doc: &'a Document,
+    file_path: Option<&'a Path>,
+    include_dirs: &'a [PathBuf],
+    bindings: &'a BindingIndex,
+    cats: u8,
+    out: Vec<Diagnostic>,
+}
+
+impl DiagCtx<'_> {
+    fn push(&mut self, range: Range, severity: DiagnosticSeverity, message: String) {
+        self.out.push(Diagnostic {
+            range,
+            severity: Some(severity),
+            source: Some(SOURCE.to_string()),
+            message,
+            ..Default::default()
+        });
+    }
+}
+
+/// Syntax errors, duplicate nodes, unresolved includes and binding violations
+/// in one traversal, sorted by position.
 pub fn all(
     doc: &Document,
     file_path: Option<&Path>,
     include_dirs: &[PathBuf],
     bindings: &BindingIndex,
 ) -> Vec<Diagnostic> {
-    let started = std::time::Instant::now();
-    let mut out = compute(doc);
-    let syntax = started.elapsed();
-    out.extend(semantic(doc));
-    let semantic_time = started.elapsed();
-    out.extend(unresolved_includes(doc, file_path, include_dirs));
-    let includes = started.elapsed();
-    out.extend(binding_diagnostics(doc, bindings, file_path));
-    let bindings_time = started.elapsed();
+    run(doc, file_path, include_dirs, bindings, CAT_ALL)
+}
+
+fn run(
+    doc: &Document,
+    file_path: Option<&Path>,
+    include_dirs: &[PathBuf],
+    bindings: &BindingIndex,
+    cats: u8,
+) -> Vec<Diagnostic> {
+    // without a binding index, binding checks are pointless work
+    let cats = if cats & CAT_BINDINGS != 0 && bindings.is_empty() {
+        cats & !CAT_BINDINGS
+    } else {
+        cats
+    };
+    if cats == 0 {
+        return Vec::new();
+    }
+    let mut ctx = DiagCtx {
+        doc,
+        file_path,
+        include_dirs,
+        bindings,
+        cats,
+        out: Vec::new(),
+    };
+    walk(doc.tree.root_node(), &mut ctx, false);
+    let mut out = ctx.out;
     out.sort_by_key(|d| (d.range.start, d.range.end));
-    tracing::debug!(
-        syntax_us = syntax.as_micros() as u64,
-        semantic_us = (semantic_time - syntax).as_micros() as u64,
-        includes_us = (includes - semantic_time).as_micros() as u64,
-        bindings_us = (bindings_time - includes).as_micros() as u64,
-        total_us = started.elapsed().as_micros() as u64,
-        "diagnostics phases"
-    );
     out
 }
 
-/// Validate nodes against their devicetree bindings: binding violations are
-/// errors, a `compatible` without any matching binding is a warning.
+fn walk(node: Node, ctx: &mut DiagCtx, in_alternative: bool) {
+    if ctx.out.len() >= MAX_DIAGNOSTICS {
+        return;
+    }
+    let kind = node.kind_id();
+    if ctx.cats & CAT_SYNTAX != 0 {
+        if node.is_error() {
+            let range = error_range(ctx.doc, node);
+            ctx.push(
+                range,
+                DiagnosticSeverity::ERROR,
+                format!("syntax error near {}", snippet(ctx.doc, node)),
+            );
+            // the ERROR node covers the whole malformed region; recursing
+            // would only produce noise about the same span
+            return;
+        }
+        if node.is_missing() {
+            let range = node_range(ctx.doc, node);
+            ctx.push(
+                range,
+                DiagnosticSeverity::ERROR,
+                format!("missing '{}'", node.kind()),
+            );
+            return;
+        }
+    }
+    if ctx.cats & CAT_BINDINGS != 0 && kind == kinds().subnode {
+        check_binding_node(node, ctx);
+    }
+    if ctx.cats & CAT_DUPLICATES != 0 && !in_alternative {
+        if kind == kinds().source_file {
+            check_duplicate_roots(node, ctx);
+        }
+        if kinds().containers.contains(&kind) {
+            check_duplicate_children(node, ctx);
+        }
+    }
+    if ctx.cats & CAT_INCLUDES != 0 && kind == kinds().preproc_include {
+        check_include_node(node, ctx);
+    }
+    let child_alternative = in_alternative || kinds().alternatives.contains(&kind);
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            walk(child, ctx, child_alternative);
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn compute(doc: &Document) -> Vec<Diagnostic> {
+    run(doc, None, &[], &BindingIndex::default(), CAT_SYNTAX)
+}
+
+#[cfg(test)]
+pub fn semantic(doc: &Document) -> Vec<Diagnostic> {
+    run(doc, None, &[], &BindingIndex::default(), CAT_DUPLICATES)
+}
+
+#[cfg(test)]
+pub fn unresolved_includes(
+    doc: &Document,
+    file_path: Option<&Path>,
+    include_dirs: &[PathBuf],
+) -> Vec<Diagnostic> {
+    run(
+        doc,
+        file_path,
+        include_dirs,
+        &BindingIndex::default(),
+        CAT_INCLUDES,
+    )
+}
+
+/// Test-only view of the binding checks.
+#[cfg(test)]
 pub fn binding_diagnostics(
     doc: &Document,
     bindings: &BindingIndex,
     file_path: Option<&Path>,
 ) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    if bindings.is_empty() {
-        return out;
-    }
-    let _ = file_path;
-    check_bindings(doc.tree.root_node(), doc, bindings, &mut out);
-    out
+    run(doc, file_path, &[], bindings, CAT_BINDINGS)
 }
 
-fn check_bindings(
-    node: Node,
-    doc: &Document,
-    bindings: &BindingIndex,
-    out: &mut Vec<Diagnostic>,
-) {
-    if out.len() >= MAX_DIAGNOSTICS {
+/// Validate one node against its binding: missing required properties and
+/// (for strict, fully resolved bindings) unknown properties are errors; a
+/// `compatible` with no matching binding is a warning.
+fn check_binding_node(node: Node, ctx: &mut DiagCtx) {
+    let (Some(name_node), Some(compatibles)) = (
+        node.child_by_field_name("name"),
+        compatible_strings(ctx.doc, node),
+    ) else {
         return;
+    };
+    let Some(binding) = ctx.bindings.lookup(&compatibles) else {
+        ctx.push(
+            node_range(ctx.doc, name_node),
+            DiagnosticSeverity::WARNING,
+            format!(
+                "no binding found for compatible \"{}\"",
+                compatibles.join("\", \"")
+            ),
+        );
+        return;
+    };
+    let file = binding
+        .uri
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .unwrap_or("")
+        .to_string();
+    let node_name = util::node_text(ctx.doc, name_node);
+    let mut count = 0;
+    for required in &binding.required {
+        if node_property(node, required, ctx.doc).is_none() {
+            ctx.push(
+                node_range(ctx.doc, name_node),
+                DiagnosticSeverity::ERROR,
+                format!(
+                    "missing required property '{required}' for node \
+                     '{node_name}' (binding: {file})"
+                ),
+            );
+            count += 1;
+        }
     }
-    if node.kind() == "subnode"
-        && let (Some(name_node), Some(compatibles)) = (
-            node.child_by_field_name("name"),
-            compatible_strings(doc, node),
-        ) {
-            let matched = bindings.lookup(&compatibles);
-            match matched {
-                None => out.push(Diagnostic {
-                    range: node_range(doc, name_node),
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    source: Some(SOURCE.to_string()),
-                    message: format!(
-                        "no binding found for compatible \"{}\"",
-                        compatibles.join("\", \"")
-                    ),
-                    ..Default::default()
-                }),
-                Some(binding) => {
-                    let file = binding
-                        .uri
-                        .path_segments()
-                        .and_then(|mut s| s.next_back())
-                        .unwrap_or("")
-                        .to_string();
-                    let node_name = util::node_text(doc, name_node);
-                    let mut count = 0;
-                    for required in &binding.required {
-                        if node_property(node, required, doc).is_none() {
-                            push_binding_diag(
-                                out,
-                                doc,
-                                name_node,
-                                DiagnosticSeverity::ERROR,
-                                format!(
-                                    "missing required property '{required}' for node \
-                                     '{node_name}' (binding: {file})"
-                                ),
-                            );
-                            count += 1;
-                        }
-                    }
-                    if binding.strict && binding.refs_complete {
-                        let body = util::node_def_of(node).unwrap_or(node);
-                        for i in 0..body.child_count() {
-                            let Some(child) = body.child(i as u32) else { continue };
-                            if child.kind() != "property" {
-                                continue;
-                            }
-                            let Some(prop_name) = child.child_by_field_name("name") else {
-                                continue;
-                            };
-                            let name = util::node_text(doc, prop_name);
-                            if bindings.is_property_allowed(name, &binding) {
-                                continue;
-                            }
-                            push_binding_diag(
-                                out,
-                                doc,
-                                prop_name,
-                                DiagnosticSeverity::ERROR,
-                                format!(
-                                    "property '{name}' is not allowed by binding {file} \
-                                     (node '{node_name}')"
-                                ),
-                            );
-                            count += 1;
-                            if count >= MAX_BINDING_DIAGNOSTICS_PER_NODE {
-                                break;
-                            }
-                        }
-                    }
-                }
+    if binding.strict && binding.refs_complete {
+        let body = util::node_def_of(node).unwrap_or(node);
+        for i in 0..body.child_count() {
+            let Some(child) = body.child(i as u32) else { continue };
+            if child.kind_id() != kinds().property {
+                continue;
+            }
+            let Some(prop_name) = child.child_by_field_name("name") else {
+                continue;
+            };
+            let name = util::node_text(ctx.doc, prop_name);
+            if ctx.bindings.is_property_allowed(name, &binding) {
+                continue;
+            }
+            ctx.push(
+                node_range(ctx.doc, prop_name),
+                DiagnosticSeverity::ERROR,
+                format!("property '{name}' is not allowed by binding {file} (node '{node_name}')"),
+            );
+            count += 1;
+            if count >= MAX_BINDING_DIAGNOSTICS_PER_NODE {
+                break;
             }
         }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            check_bindings(child, doc, bindings, out);
-        }
     }
-}
-
-fn push_binding_diag(
-    out: &mut Vec<Diagnostic>,
-    doc: &Document,
-    node: Node,
-    severity: DiagnosticSeverity,
-    message: String,
-) {
-    out.push(Diagnostic {
-        range: node_range(doc, node),
-        severity: Some(severity),
-        source: Some(SOURCE.to_string()),
-        message,
-        ..Default::default()
-    });
 }
 
 /// All `compatible` strings declared by this node's `compatible` property.
 pub fn compatible_strings(doc: &Document, node: Node) -> Option<Vec<String>> {
     let prop = node_property(node, "compatible", doc)?;
+    let k = kinds();
     let mut out = Vec::new();
     for i in 0..prop.child_count() {
         let Some(data) = prop.child(i as u32) else { continue };
-        if data.kind() != "prop_data" {
+        if data.kind_id() != k.prop_data {
             continue;
         }
-        if let Some(string) = util::find_child(data, "string_literal") {
-            out.push(util::node_text(doc, string).trim_matches('"').to_string());
+        for j in 0..data.child_count() {
+            let Some(child) = data.child(j as u32) else { continue };
+            if child.kind_id() == k.string_literal {
+                out.push(util::node_text(doc, child).trim_matches('"').to_string());
+                break;
+            }
         }
     }
     if out.is_empty() { None } else { Some(out) }
@@ -180,13 +309,15 @@ pub fn compatible_strings(doc: &Document, node: Node) -> Option<Vec<String>> {
 
 fn node_property<'a>(node: Node<'a>, name: &str, doc: &Document) -> Option<Node<'a>> {
     // properties live inside the node's `{ ... }` body, not on the subnode
-    let container = match node.kind() {
-        "subnode" | "devicetree" => util::node_def_of(node).unwrap_or(node),
-        _ => node,
+    let k = kinds();
+    let container = if node.kind_id() == k.subnode || node.kind_id() == k.devicetree {
+        util::node_def_of(node).unwrap_or(node)
+    } else {
+        node
     };
     for i in 0..container.child_count() {
         let Some(child) = container.child(i as u32) else { continue };
-        if child.kind() != "property" {
+        if child.kind_id() != k.property {
             continue;
         }
         if child
@@ -199,215 +330,106 @@ fn node_property<'a>(node: Node<'a>, name: &str, doc: &Document) -> Option<Node<
     None
 }
 
-/// Collect syntax errors (ERROR nodes and missing tokens) from the parse tree.
-pub fn compute(doc: &Document) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    collect(doc.tree.root_node(), doc, &mut out);
-    out
-}
-
-/// Semantic errors that the grammar alone cannot see.
-pub fn semantic(doc: &Document) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    check_duplicates(doc.tree.root_node(), doc, &mut out);
-    out
-}
-
-/// `#include`s that resolve to no existing file. This is how a missing
-/// include dir (no kernel tree detection, no includePaths) becomes visible:
-/// every dt-bindings include lights up until the configuration is fixed.
-pub fn unresolved_includes(
-    doc: &Document,
-    file_path: Option<&Path>,
-    include_dirs: &[PathBuf],
-) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    check_includes(doc.tree.root_node(), doc, file_path, include_dirs, &mut out);
-    out
-}
-
-fn check_includes(
-    node: Node,
-    doc: &Document,
-    file_path: Option<&Path>,
-    include_dirs: &[PathBuf],
-    out: &mut Vec<Diagnostic>,
-) {
-    if out.len() >= MAX_DIAGNOSTICS {
+fn check_include_node(node: Node, ctx: &mut DiagCtx) {
+    let Some(path_node) = node.child_by_field_name("path") else {
         return;
+    };
+    let kind = path_node.kind_id();
+    let raw = util::node_text(ctx.doc, path_node);
+    let (target, quoted) = if kind == kinds().preproc_string_literal {
+        (raw.trim_matches('"'), true)
+    } else if kind == kinds().system_lib_string {
+        (raw.trim_matches(|c| c == '<' || c == '>'), false)
+    } else {
+        // `#include SOME_MACRO` — statically unresolvable, skip.
+        return;
+    };
+    let resolved = index::resolve_include(
+        ctx.file_path.and_then(Path::parent),
+        target,
+        quoted,
+        ctx.include_dirs,
+    );
+    if resolved.is_none() {
+        ctx.push(
+            node_range(ctx.doc, node),
+            DiagnosticSeverity::ERROR,
+            format!(
+                "unresolved #include \"{target}\" — no include dir matches; \
+                 open the workspace at the kernel root or set \
+                 initializationOptions.includePaths"
+            ),
+        );
     }
-    if node.kind() == "preproc_include"
-        && let Some(path_node) = node.child_by_field_name("path") {
-            let raw = util::node_text(doc, path_node);
-            let (target, quoted) = match path_node.kind() {
-                "preproc_string_literal" => (raw.trim_matches('"'), true),
-                "system_lib_string" => (raw.trim_matches(|c| c == '<' || c == '>'), false),
-                // `#include SOME_MACRO` — statically unresolvable, skip.
-                _ => return,
-            };
-            let resolved = index::resolve_include(
-                file_path.and_then(Path::parent),
-                target,
-                quoted,
-                include_dirs,
-            );
-            if resolved.is_none() {
-                out.push(Diagnostic {
-                    range: Range {
-                        start: util::byte_to_position(&doc.rope, node.start_byte()),
-                        end: util::byte_to_position(&doc.rope, node.end_byte()),
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    source: Some(SOURCE.to_string()),
-                    message: format!(
-                        "unresolved #include \"{target}\" — no include dir matches; \
-                         open the workspace at the kernel root or set \
-                         initializationOptions.includePaths"
-                    ),
-                    ..Default::default()
-                });
-            }
-            return;
-        }
+}
+
+/// Multiple `/ { }` roots in one file are silently merged by dtc.
+fn check_duplicate_roots(node: Node, ctx: &mut DiagCtx) {
+    let mut seen_root = false;
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            check_includes(child, doc, file_path, include_dirs, out);
+        let Some(child) = node.child(i as u32) else { continue };
+        if child.kind_id() != kinds().devicetree {
+            continue;
+        }
+        if util::find_child(child, "reference").is_some() {
+            continue;
+        }
+        let range = Range {
+            start: util::byte_to_position(&ctx.doc.rope, child.start_byte()),
+            end: util::byte_to_position(&ctx.doc.rope, child.start_byte() + 1),
+        };
+        if seen_root {
+            ctx.push(range, DiagnosticSeverity::ERROR, "duplicate node '/'".to_string());
+        } else {
+            seen_root = true;
         }
     }
 }
 
 /// Flag sibling nodes that define the same name (dtc would silently merge
 /// them) or that claim the same unit address under one parent.
-fn check_duplicates(node: Node, doc: &Document, out: &mut Vec<Diagnostic>) {
-    if out.len() >= MAX_DIAGNOSTICS {
-        return;
-    }
-    if node.kind() == "source_file" {
-        // Multiple `/ { }` roots in one file are silently merged by dtc.
-        let mut seen_root = false;
-        for i in 0..node.child_count() {
-            let Some(child) = node.child(i as u32) else { continue };
-            if child.kind() != "devicetree" {
-                continue;
-            }
-            if util::find_child(child, "reference").is_some() {
-                continue;
-            }
-            let range = Range {
-                start: util::byte_to_position(&doc.rope, child.start_byte()),
-                end: util::byte_to_position(&doc.rope, child.start_byte() + 1),
-            };
-            if seen_root {
-                out.push(Diagnostic {
-                    range,
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    source: Some(SOURCE.to_string()),
-                    message: "duplicate node '/'".to_string(),
-                    ..Default::default()
-                });
-            } else {
-                seen_root = true;
-            }
+fn check_duplicate_children(node: Node, ctx: &mut DiagCtx) {
+    let mut seen_names: HashMap<String, String> = HashMap::new();
+    let mut seen_addresses: HashMap<String, String> = HashMap::new();
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else { continue };
+        if child.kind_id() != kinds().subnode {
+            continue;
         }
-    }
-    // Node definitions live in node_def bodies, also directly inside #if blocks.
-    if matches!(
-        node.kind(),
-        "node_def" | "preproc_if_in_node_def" | "preproc_ifdef_in_node_def"
-    ) {
-        let mut seen_names: HashMap<String, String> = HashMap::new();
-        let mut seen_addresses: HashMap<String, String> = HashMap::new();
-        for i in 0..node.child_count() {
-            let Some(child) = node.child(i as u32) else { continue };
-            if child.kind() != "subnode" {
-                continue;
-            }
-            let Some(name_node) = child.child_by_field_name("name") else {
-                continue;
-            };
-            let full = util::node_text(doc, name_node).to_string();
-            let (name, address) = match full.split_once('@') {
-                Some((name, addr)) => (name.to_string(), Some(addr.to_string())),
-                None => (full.clone(), None),
-            };
-            if seen_names.contains_key(&full) {
-                out.push(Diagnostic {
-                    range: node_range(doc, name_node),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    source: Some(SOURCE.to_string()),
-                    message: format!("duplicate node '{full}'"),
-                    ..Default::default()
-                });
-            } else {
-                seen_names.insert(full.clone(), name.clone());
-            }
-            if let Some(addr) = &address {
-                match seen_addresses.get(addr) {
-                    Some(first_name) if first_name != &name => {
-                        // Legitimate on some SoCs (e.g. Qualcomm GENI: one
-                        // serial engine, several protocol nodes per address),
-                        // so this is a warning, not an error.
-                        out.push(Diagnostic {
-                            range: node_range(doc, name_node),
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            source: Some(SOURCE.to_string()),
-                            message: format!(
-                                "node '{full}' shares address with '{}@{addr}'",
-                                first_name
-                            ),
-                            ..Default::default()
-                        });
-                    }
-                    None => {
-                        seen_addresses.insert(addr.clone(), name.clone());
-                    }
-                    _ => {}
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let full = util::node_text(ctx.doc, name_node).to_string();
+        let (name, address) = match full.split_once('@') {
+            Some((name, addr)) => (name.to_string(), Some(addr.to_string())),
+            None => (full.clone(), None),
+        };
+        if seen_names.contains_key(&full) {
+            ctx.push(
+                node_range(ctx.doc, name_node),
+                DiagnosticSeverity::ERROR,
+                format!("duplicate node '{full}'"),
+            );
+        } else {
+            seen_names.insert(full.clone(), name.clone());
+        }
+        if let Some(addr) = &address {
+            match seen_addresses.get(addr) {
+                Some(first_name) if first_name != &name => {
+                    // Legitimate on some SoCs (e.g. Qualcomm GENI: one serial
+                    // engine, several protocol nodes per address), so this is
+                    // a warning, not an error.
+                    ctx.push(
+                        node_range(ctx.doc, name_node),
+                        DiagnosticSeverity::WARNING,
+                        format!("node '{full}' shares address with '{first_name}@{addr}'"),
+                    );
                 }
+                None => {
+                    seen_addresses.insert(addr.clone(), name.clone());
+                }
+                _ => {}
             }
-        }
-    }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            // Both #ifdef branches are parsed; checking the alternative would
-            // produce false duplicates, so only the primary branch is walked.
-            if child.kind().contains("else") || child.kind().contains("elif") {
-                continue;
-            }
-            check_duplicates(child, doc, out);
-        }
-    }
-}
-
-fn collect(node: Node, doc: &Document, out: &mut Vec<Diagnostic>) {
-    if out.len() >= MAX_DIAGNOSTICS {
-        return;
-    }
-    if node.is_error() {
-        let range = error_range(doc, node);
-        out.push(Diagnostic {
-            range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some(SOURCE.to_string()),
-            message: format!("syntax error near {}", snippet(doc, node)),
-            ..Default::default()
-        });
-        // The ERROR node covers the whole malformed region; recursing would
-        // only produce noise about the same span.
-        return;
-    }
-    if node.is_missing() {
-        out.push(Diagnostic {
-            range: node_range(doc, node),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some(SOURCE.to_string()),
-            message: format!("missing '{}'", node.kind()),
-            ..Default::default()
-        });
-        return;
-    }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            collect(child, doc, out);
         }
     }
 }

@@ -42,13 +42,37 @@ impl Backend {
         self.root_dirs.read().unwrap().clone()
     }
 
-
-    /// Rebuild one document's contribution table off the main loop.
+    /// Rebuild one document's contribution table off the main loop, then the
+    /// tables of every file that includes it (directly or transitively) —
+    /// their merged completion data caches this file's contributions.
     fn schedule_file_index(&self, uri: Url, text: String, version: i32) {
         let index = Arc::clone(&self.index);
         let roots = self.root_dirs.read().unwrap().clone();
+        // capture live text of open dependents before leaving the request
+        let dependents: Vec<(Url, Option<(String, i32)>)> = {
+            let docs = self.documents.read().unwrap();
+            self.index
+                .dependents_transitive(&uri)
+                .into_iter()
+                .map(|dependent| {
+                    let live = docs
+                        .get(&dependent)
+                        .map(|doc| (doc.text.clone(), doc.version));
+                    (dependent, live)
+                })
+                .collect()
+        };
         tokio::task::spawn_blocking(move || {
             index::build_and_insert(&index, &uri, &text, version, &roots, 0);
+            // Closed dependents keep their own (unchanged) label/include data;
+            // only their *merged* completion view would be stale, and that is
+            // only consumed while they are open. Rebuilding every closed board
+            // file that includes this dtsi on every keystroke is not worth it.
+            for (dependent, live) in dependents {
+                if let Some((text, version)) = live {
+                    index::build_and_insert(&index, &dependent, &text, version, &roots, 0);
+                }
+            }
         });
     }
 }

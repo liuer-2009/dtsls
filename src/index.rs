@@ -59,6 +59,8 @@ pub type DefineMap = HashMap<String, (String, String)>;
 #[derive(Default)]
 pub struct Index {
     files: RwLock<HashMap<Url, FileIndex>>,
+    /// reverse `#include` edges: included file -> files that include it
+    reverse: RwLock<HashMap<Url, HashSet<Url>>>,
 }
 
 impl Index {
@@ -74,9 +76,50 @@ impl Index {
             // or a stale rebuild overwrite them.
             Some(existing) if existing.version > entry.version => {}
             _ => {
+                // keep the reverse include graph in sync before replacing the
+                // forward edges
+                {
+                    let mut reverse = self.reverse.write().unwrap();
+                    if let Some(old) = files.get(&uri) {
+                        for included in &old.includes {
+                            if !entry.includes.contains(included)
+                                && let Some(dependents) = reverse.get_mut(included)
+                            {
+                                dependents.remove(&uri);
+                            }
+                        }
+                    }
+                    for included in &entry.includes {
+                        reverse
+                            .entry(included.clone())
+                            .or_default()
+                            .insert(uri.clone());
+                    }
+                }
                 files.insert(uri, entry);
             }
         }
+    }
+
+    /// Files that include `uri`, directly or transitively. A change there
+    /// invalidates their merged completion data and label resolution.
+    pub fn dependents_transitive(&self, uri: &Url) -> Vec<Url> {
+        let reverse = self.reverse.read().unwrap();
+        let mut out = Vec::new();
+        let mut visited = HashSet::from([uri.clone()]);
+        let mut stack = vec![uri.clone()];
+        while let Some(current) = stack.pop() {
+            let Some(dependents) = reverse.get(&current) else {
+                continue;
+            };
+            for dependent in dependents {
+                if visited.insert(dependent.clone()) {
+                    out.push(dependent.clone());
+                    stack.push(dependent.clone());
+                }
+            }
+        }
+        out
     }
 
     pub fn has(&self, uri: &Url) -> bool {
@@ -584,6 +627,19 @@ mod tests {
         assert_eq!(def.path, "/soc/serial@1000");
         // unknown label
         assert!(resolve_label(&index, &board_uri, "nope").is_none());
+    }
+
+    #[test]
+    fn reverse_include_edges_are_tracked() {
+        let index = Index::default();
+        let (board_uri, board_text) = fixture("board.dts");
+        let (soc_uri, soc_text) = fixture("soc.dtsi");
+        build_and_insert(&index, &soc_uri, &soc_text, 0, &[], 0);
+        build_and_insert(&index, &board_uri, &board_text, 0, &[], 0);
+        // editing soc.dtsi must invalidate board.dts
+        assert_eq!(index.dependents_transitive(&soc_uri), vec![board_uri.clone()]);
+        // and nothing depends on the board itself
+        assert!(index.dependents_transitive(&board_uri).is_empty());
     }
 
     #[test]
