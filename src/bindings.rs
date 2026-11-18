@@ -44,29 +44,9 @@ pub struct BindingIndex {
     implicit_properties: RwLock<HashSet<String>>,
     /// meta-schema property patterns (`-supply$`, `.*-names$`, ...)
     implicit_patterns: RwLock<Vec<regex::Regex>>,
-    /// bindings were configured but no dtschema package is installed
-    dtschema_missing: RwLock<bool>,
-    /// no kernel bindings directory could be located at all
-    bindings_missing: RwLock<bool>,
 }
 
 impl BindingIndex {
-    pub fn set_missing_dtschema(&self, missing: bool) {
-        *self.dtschema_missing.write().unwrap() = missing;
-    }
-
-    pub fn missing_dtschema(&self) -> bool {
-        *self.dtschema_missing.read().unwrap()
-    }
-
-    pub fn set_missing_bindings(&self, missing: bool) {
-        *self.bindings_missing.write().unwrap() = missing;
-    }
-
-    pub fn missing_bindings(&self) -> bool {
-        *self.bindings_missing.read().unwrap()
-    }
-
     /// May the node carry this property according to the binding and the
     /// meta-schemas?
     pub fn is_property_allowed(&self, name: &str, binding: &Binding) -> bool {

@@ -60,11 +60,15 @@ cargo build --release
   `$ref`s and dtschema-hosted compatibles (`cache`, `operating-points-v2`)
   resolve against the host's **dtschema python package** — install it with
   `pip install dtschema` (or point `DTSLS_SCHEMAS_DIR` at a package dir).
-  Nothing is downloaded; without the package every file gets one ERROR at the
-  top telling you to install it, and unresolved `$ref`s only disable the
-  unknown-property check for that binding. If no kernel bindings directory is
-  found at all, every file also gets a top-of-file ERROR — the feature is
-  never silently dead.
+  Nothing is downloaded; without the package the feature is degraded and
+  unresolved `$ref`s only disable the unknown-property check for that binding.
+- **Feature status notices** — a feature that cannot work at all reports an
+  ERROR at the top of every file; a feature that works with reduced fidelity
+  reports a WARNING. Message shape is always `<feature>: unavailable|degraded
+  — <detail>`. Current notices: `devicetree bindings` (no bindings dir found →
+  error), `dtschema` (pip package missing → warning), `dt-bindings headers`
+  (kernel tree without include/dt-bindings → warning), `workspace index` (no
+  workspace root → warning). Nothing degrades silently.
 - **M3: goto binding** — with the cursor on a node (not on a label), `gd`
   jumps to the YAML binding of the node's `compatible`
 - **M3: property completion** — typing a property name inside a node whose

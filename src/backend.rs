@@ -13,6 +13,7 @@ use crate::document::Document;
 use crate::hints;
 use crate::index::{self, Index};
 use crate::util;
+use crate::status::FeatureIssue;
 use crate::{diagnostics, semantic_tokens, symbols};
 
 pub struct Backend {
@@ -24,6 +25,9 @@ pub struct Backend {
     index: Arc<Index>,
     /// compatible -> devicetree binding, built in background at startup.
     bindings: Arc<BindingIndex>,
+    /// Whole-feature conditions (unavailable = error, degraded = warning),
+    /// reported at the top of every file.
+    status: RwLock<Vec<FeatureIssue>>,
 }
 
 impl Backend {
@@ -34,6 +38,7 @@ impl Backend {
             root_dirs: RwLock::new(Vec::new()),
             index: Arc::new(Index::default()),
             bindings: Arc::new(BindingIndex::default()),
+            status: RwLock::new(Vec::new()),
         }
     }
 
@@ -92,8 +97,9 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        let had_client_root = !roots.is_empty();
         // `<dt-bindings/...>` resolution: auto-detect a kernel tree by walking
-        // up for `include/dt-bindings`, plus client-supplied includePaths.
+        // up for the kernel layout, plus client-supplied includePaths.
         let kernel_root = index::detect_kernel_root(&roots);
         roots.extend(index::detect_include_dirs(&roots));
         let mut bindings_dir = kernel_root
@@ -115,13 +121,27 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        match bindings_dir {
+
+        // Whole-feature status: unavailable = ERROR, degraded = WARNING, both
+        // reported at the top of every file. A feature never fails silently.
+        let mut issues = Vec::new();
+        if !had_client_root {
+            issues.push(FeatureIssue::degraded(
+                "workspace index",
+                "no workspace root — cross-file go-to-definition/references are \
+                 limited to open buffers; open the editor inside the project",
+            ));
+        }
+        match &bindings_dir {
             Some(dir) => {
-                // binding checks need the dtschema package for `$ref`
-                // resolution; surface its absence as an error at the top of
-                // every dts file
-                let missing = bindings::dtschema_package_dir().is_none();
-                self.bindings.set_missing_dtschema(missing);
+                if bindings::dtschema_package_dir().is_none() {
+                    issues.push(FeatureIssue::degraded(
+                        "dtschema",
+                        "python package not installed — `$ref` resolution and \
+                         unknown-property checks are limited; install it with: \
+                         pip install dtschema",
+                    ));
+                }
                 info!(
                     kernel_root = ?kernel_root,
                     bindings_dir = %dir.display(),
@@ -129,11 +149,17 @@ impl LanguageServer for Backend {
                     "binding configuration"
                 );
                 let bindings = Arc::clone(&self.bindings);
+                let dir = dir.clone();
                 tokio::task::spawn_blocking(move || bindings::scan(&bindings, &dir));
             }
             None => {
-                // silent feature loss is worse than a loud error
-                self.bindings.set_missing_bindings(true);
+                issues.push(FeatureIssue::unavailable(
+                    "devicetree bindings",
+                    "no Documentation/devicetree/bindings found — binding \
+                     validation, property completion and go-to-binding are \
+                     disabled; open the kernel tree root or set \
+                     initializationOptions.bindingsPath",
+                ));
                 warn!(
                     kernel_root = ?kernel_root,
                     roots = ?roots,
@@ -141,6 +167,16 @@ impl LanguageServer for Backend {
                 );
             }
         }
+        if let Some(root) = &kernel_root
+            && !root.join("include/dt-bindings").is_dir()
+        {
+            issues.push(FeatureIssue::degraded(
+                "dt-bindings headers",
+                "include/dt-bindings is missing — `<dt-bindings/...>` includes \
+                 cannot be resolved",
+            ));
+        }
+        *self.status.write().unwrap() = issues;
         *self.root_dirs.write().unwrap() = roots;
         // Background workspace scan: index every dts file under the roots so
         // goto definition / references work for files never opened.
@@ -213,6 +249,7 @@ impl LanguageServer for Backend {
                         td.uri.to_file_path().ok().as_deref(),
                         &self.include_dirs(),
                         &self.bindings,
+                        &self.status.read().unwrap(),
                     ),
                     doc.version,
                 ),
@@ -239,6 +276,7 @@ impl LanguageServer for Backend {
                         uri.to_file_path().ok().as_deref(),
                         &self.include_dirs(),
                         &self.bindings,
+                        &self.status.read().unwrap(),
                     );
                     debug!(
                         parse_us = parse_done.as_micros() as u64,

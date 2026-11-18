@@ -7,6 +7,7 @@ mod document;
 mod hints;
 mod index;
 mod semantic_tokens;
+mod status;
 mod symbols;
 mod util;
 

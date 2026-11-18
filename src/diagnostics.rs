@@ -7,6 +7,7 @@ use tree_sitter::Node;
 
 use crate::bindings::BindingIndex;
 use crate::document::Document;
+use crate::status::FeatureIssue;
 use crate::{index, util};
 
 const SOURCE: &str = "dtsls";
@@ -93,14 +94,16 @@ impl DiagCtx<'_> {
 }
 
 /// Syntax errors, duplicate nodes, unresolved includes and binding violations
-/// in one traversal, sorted by position.
+/// in one traversal, sorted by position. Whole-feature issues (`status`) are
+/// reported at the top of the file.
 pub fn all(
     doc: &Document,
     file_path: Option<&Path>,
     include_dirs: &[PathBuf],
     bindings: &BindingIndex,
+    status: &[FeatureIssue],
 ) -> Vec<Diagnostic> {
-    run(doc, file_path, include_dirs, bindings, CAT_ALL)
+    run(doc, file_path, include_dirs, bindings, status, CAT_ALL)
 }
 
 fn run(
@@ -108,20 +111,17 @@ fn run(
     file_path: Option<&Path>,
     include_dirs: &[PathBuf],
     bindings: &BindingIndex,
+    status: &[FeatureIssue],
     cats: u8,
 ) -> Vec<Diagnostic> {
-    let bindings_requested = cats & CAT_BINDINGS != 0;
-    let missing_bindings = bindings_requested && bindings.missing_bindings();
-    let missing_dtschema = bindings_requested && bindings.missing_dtschema();
-    let notice = missing_bindings || missing_dtschema;
     // without a populated binding index, binding checks are pointless work —
-    // but the configuration notices must still get through
-    let cats = if bindings_requested && bindings.is_empty() {
+    // but the feature notices must still get through
+    let cats = if cats & CAT_BINDINGS != 0 && bindings.is_empty() {
         cats & !CAT_BINDINGS
     } else {
         cats
     };
-    if cats == 0 && !notice {
+    if cats == 0 && status.is_empty() {
         return Vec::new();
     }
     let mut ctx = DiagCtx {
@@ -132,6 +132,8 @@ fn run(
         cats,
         out: Vec::new(),
     };
+    // one synthetic diagnostic per unusable/degraded feature, right at the
+    // top of the file; the message shape is `feature: state — detail`
     let top = Range {
         start: Position {
             line: 0,
@@ -142,28 +144,8 @@ fn run(
             character: 0,
         },
     };
-    if missing_bindings {
-        ctx.push(
-            top.clone(),
-            DiagnosticSeverity::ERROR,
-            "no devicetree bindings found — property completion and binding \
-             validation are disabled; set initializationOptions.bindingsPath \
-             (e.g. <linux>/Documentation/devicetree/bindings) or open the \
-             kernel tree root"
-                .to_string(),
-        );
-    }
-    if missing_dtschema {
-        // one synthetic diagnostic at the very top: without the dtschema
-        // package, `$ref` resolution (and thus property validation) is
-        // incomplete, so say so instead of pretending the file is clean
-        ctx.push(
-            top,
-            DiagnosticSeverity::ERROR,
-            "dtschema (python package) is not installed — property validation and \
-             `$ref` resolution are incomplete; install it with: pip install dtschema"
-                .to_string(),
-        );
+    for issue in status {
+        ctx.push(top.clone(), issue.severity, issue.message());
     }
     if cats != 0 {
         walk(doc.tree.root_node(), &mut ctx, false);
@@ -224,12 +206,12 @@ fn walk(node: Node, ctx: &mut DiagCtx, in_alternative: bool) {
 
 #[cfg(test)]
 pub fn compute(doc: &Document) -> Vec<Diagnostic> {
-    run(doc, None, &[], &BindingIndex::default(), CAT_SYNTAX)
+    run(doc, None, &[], &BindingIndex::default(), &[], CAT_SYNTAX)
 }
 
 #[cfg(test)]
 pub fn semantic(doc: &Document) -> Vec<Diagnostic> {
-    run(doc, None, &[], &BindingIndex::default(), CAT_DUPLICATES)
+    run(doc, None, &[], &BindingIndex::default(), &[], CAT_DUPLICATES)
 }
 
 #[cfg(test)]
@@ -243,6 +225,7 @@ pub fn unresolved_includes(
         file_path,
         include_dirs,
         &BindingIndex::default(),
+        &[],
         CAT_INCLUDES,
     )
 }
@@ -254,7 +237,7 @@ pub fn binding_diagnostics(
     bindings: &BindingIndex,
     file_path: Option<&Path>,
 ) -> Vec<Diagnostic> {
-    run(doc, file_path, &[], bindings, CAT_BINDINGS)
+    run(doc, file_path, &[], bindings, &[], CAT_BINDINGS)
 }
 
 /// Validate one node against its binding: missing required properties and
@@ -711,7 +694,7 @@ mod tests {
         assert!(!valid.is_empty(), "no valid fixtures found");
         for path in broken {
             let text = std::fs::read_to_string(&path).unwrap();
-            let diags = all(&Document::open(&text, 0), None, &[], &BindingIndex::default());
+            let diags = all(&Document::open(&text, 0), None, &[], &BindingIndex::default(), &[]);
             assert!(!diags.is_empty(), "broken fixture not detected: {path}");
             assert!(
                 diags
@@ -722,7 +705,7 @@ mod tests {
         }
         for path in warning {
             let text = std::fs::read_to_string(&path).unwrap();
-            let diags = all(&Document::open(&text, 0), None, &[], &BindingIndex::default());
+            let diags = all(&Document::open(&text, 0), None, &[], &BindingIndex::default(), &[]);
             assert!(!diags.is_empty(), "warning fixture not detected: {path}");
             assert!(
                 diags
@@ -734,7 +717,8 @@ mod tests {
         for path in valid {
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(
-                all(&Document::open(&text, 0), None, &[], &BindingIndex::default()).is_empty(),
+                all(&Document::open(&text, 0), None, &[], &BindingIndex::default(), &[])
+                    .is_empty(),
                 "valid fixture has errors: {path}"
             );
         }
@@ -866,5 +850,22 @@ mod tests {
         let text = "/dts-v1/;\n\n/ {\n    widget@0 {\n        compatible = \"acme,widget\";\n        reg = <0 1>;\n        clocks = <&c 0>;\n        status_probe;\n    };\n};\n";
         let doc = Document::open(text, 0);
         assert!(binding_diagnostics(&doc, &bindings, None).is_empty());
+    }
+
+    #[test]
+    fn feature_notices_are_emitted_at_the_top() {
+        let issues = vec![
+            FeatureIssue::unavailable("devicetree bindings", "no bindings dir"),
+            FeatureIssue::degraded("dtschema", "pip install dtschema"),
+        ];
+        let text = "/dts-v1/;\n\n/ {\n    a;\n};\n";
+        let doc = Document::open(text, 0);
+        let diags = all(&doc, None, &[], &BindingIndex::default(), &issues);
+        assert_eq!(diags.len(), 2, "diags: {diags:?}");
+        assert_eq!(diags[0].range.start.line, 0);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(diags[0].message.starts_with("devicetree bindings: unavailable"));
+        assert_eq!(diags[1].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diags[1].message.starts_with("dtschema: degraded"));
     }
 }
