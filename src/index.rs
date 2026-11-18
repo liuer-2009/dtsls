@@ -545,9 +545,14 @@ pub fn scan_workspace(index: &Index, roots: &[PathBuf], skip: &HashSet<Url>) {
 pub fn detect_kernel_root(roots: &[PathBuf]) -> Option<PathBuf> {
     for root in roots {
         let mut dir = Some(root.as_path());
-        for _ in 0..6 {
+        for _ in 0..8 {
             let Some(d) = dir else { break };
-            if d.join("include/dt-bindings").is_dir() {
+            let has_headers = d.join("include/dt-bindings").is_dir();
+            // vendor/trimmed trees may lack include/dt-bindings but still
+            // carry the binding documentation
+            let has_bindings = d.join("Documentation/devicetree/bindings").is_dir()
+                && d.join("scripts/dtc").is_dir();
+            if has_headers || has_bindings {
                 return Some(d.to_path_buf());
             }
             dir = d.parent();

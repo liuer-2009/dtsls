@@ -62,7 +62,9 @@ cargo build --release
   `pip install dtschema` (or point `DTSLS_SCHEMAS_DIR` at a package dir).
   Nothing is downloaded; without the package every file gets one ERROR at the
   top telling you to install it, and unresolved `$ref`s only disable the
-  unknown-property check for that binding.
+  unknown-property check for that binding. If no kernel bindings directory is
+  found at all, every file also gets a top-of-file ERROR — the feature is
+  never silently dead.
 - **M3: goto binding** — with the cursor on a node (not on a label), `gd`
   jumps to the YAML binding of the node's `compatible`
 - **M3: property completion** — typing a property name inside a node whose

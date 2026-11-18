@@ -111,15 +111,17 @@ fn run(
     cats: u8,
 ) -> Vec<Diagnostic> {
     let bindings_requested = cats & CAT_BINDINGS != 0;
+    let missing_bindings = bindings_requested && bindings.missing_bindings();
     let missing_dtschema = bindings_requested && bindings.missing_dtschema();
+    let notice = missing_bindings || missing_dtschema;
     // without a populated binding index, binding checks are pointless work —
-    // but the "dtschema not installed" notice must still get through
+    // but the configuration notices must still get through
     let cats = if bindings_requested && bindings.is_empty() {
         cats & !CAT_BINDINGS
     } else {
         cats
     };
-    if cats == 0 && !missing_dtschema {
+    if cats == 0 && !notice {
         return Vec::new();
     }
     let mut ctx = DiagCtx {
@@ -130,21 +132,33 @@ fn run(
         cats,
         out: Vec::new(),
     };
+    let top = Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: Position {
+            line: 0,
+            character: 0,
+        },
+    };
+    if missing_bindings {
+        ctx.push(
+            top.clone(),
+            DiagnosticSeverity::ERROR,
+            "no devicetree bindings found — property completion and binding \
+             validation are disabled; set initializationOptions.bindingsPath \
+             (e.g. <linux>/Documentation/devicetree/bindings) or open the \
+             kernel tree root"
+                .to_string(),
+        );
+    }
     if missing_dtschema {
         // one synthetic diagnostic at the very top: without the dtschema
         // package, `$ref` resolution (and thus property validation) is
         // incomplete, so say so instead of pretending the file is clean
         ctx.push(
-            Range {
-                start: Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: Position {
-                    line: 0,
-                    character: 0,
-                },
-            },
+            top,
             DiagnosticSeverity::ERROR,
             "dtschema (python package) is not installed — property validation and \
              `$ref` resolution are incomplete; install it with: pip install dtschema"

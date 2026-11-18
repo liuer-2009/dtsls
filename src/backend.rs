@@ -97,6 +97,7 @@ impl LanguageServer for Backend {
         let kernel_root = index::detect_kernel_root(&roots);
         roots.extend(index::detect_include_dirs(&roots));
         let mut bindings_dir = kernel_root
+            .as_ref()
             .map(|root| root.join("Documentation/devicetree/bindings"))
             .filter(|dir| dir.is_dir());
         if let Some(options) = params.initialization_options {
@@ -114,13 +115,31 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        if let Some(dir) = bindings_dir {
-            // binding checks need the dtschema package for `$ref` resolution;
-            // surface its absence as an error at the top of every dts file
-            let missing = bindings::dtschema_package_dir().is_none();
-            self.bindings.set_missing_dtschema(missing);
-            let bindings = Arc::clone(&self.bindings);
-            tokio::task::spawn_blocking(move || bindings::scan(&bindings, &dir));
+        match bindings_dir {
+            Some(dir) => {
+                // binding checks need the dtschema package for `$ref`
+                // resolution; surface its absence as an error at the top of
+                // every dts file
+                let missing = bindings::dtschema_package_dir().is_none();
+                self.bindings.set_missing_dtschema(missing);
+                info!(
+                    kernel_root = ?kernel_root,
+                    bindings_dir = %dir.display(),
+                    dtschema = ?bindings::dtschema_package_dir(),
+                    "binding configuration"
+                );
+                let bindings = Arc::clone(&self.bindings);
+                tokio::task::spawn_blocking(move || bindings::scan(&bindings, &dir));
+            }
+            None => {
+                // silent feature loss is worse than a loud error
+                self.bindings.set_missing_bindings(true);
+                warn!(
+                    kernel_root = ?kernel_root,
+                    roots = ?roots,
+                    "no devicetree bindings directory found"
+                );
+            }
         }
         *self.root_dirs.write().unwrap() = roots;
         // Background workspace scan: index every dts file under the roots so
