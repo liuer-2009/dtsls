@@ -90,6 +90,7 @@ python3 scripts/smoke_test.py       # end-to-end LSP session over stdio
 python3 scripts/compat_test.py      # two-stage compatible completion
 python3 scripts/diagnostics_test.py # broken/valid fixtures -> publishDiagnostics
 python3 scripts/bench.py            # state update / jump / completion latencies
+python3 scripts/bench_rate.py       # throughput: ops per fixed >=100 ms window
 python3 scripts/bench_real.py /path/to/soc.dtsi   # real-world parse timing
 ```
 

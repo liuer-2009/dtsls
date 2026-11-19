@@ -415,49 +415,14 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        let docs = self.documents.read().unwrap();
-        let Some(doc) = docs.get(&uri) else {
-            return Ok(None);
-        };
-        let byte = util::position_to_byte(&doc.rope, position);
-        if let Some(label) = completion::label_at_cursor(doc, byte) {
-            return Ok(index::resolve_label(&self.index, &uri, &label).map(
-                |(target_uri, def)| {
-                    GotoDefinitionResponse::Scalar(Location {
-                        uri: target_uri,
-                        range: def.range,
-                    })
-                },
-            ));
-        }
-        // not on a label: jump to the binding of the enclosing node
-        let Some(node) = doc.tree.root_node().descendant_for_byte_range(byte, byte) else {
-            return Ok(None);
-        };
-        let Some(subnode) = enclosing_node(node) else {
-            return Ok(None);
-        };
-        let Some(compatibles) = node_compatibles(doc, subnode) else {
-            return Ok(None);
-        };
-        let binding = self.bindings.lookup(&compatibles);
-        Ok(binding.map(|binding| {
-            GotoDefinitionResponse::Scalar(Location {
-                uri: binding.uri.clone(),
-                range: Range {
-                    start: Position {
-                        line: 0,
-                        character: 0,
-                    },
-                    end: Position {
-                        line: 0,
-                        character: 0,
-                    },
-                },
-            })
-        }))
+        let started = std::time::Instant::now();
+        let response = self.definition(params);
+        debug!(
+            found = response.is_some(),
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "definition"
+        );
+        Ok(response)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -528,6 +493,41 @@ impl LanguageServer for Backend {
         Ok(Some(SemanticTokensResult::Tokens(
             semantic_tokens::semantic_tokens(doc),
         )))
+    }
+}
+
+impl Backend {
+    fn definition(&self, params: GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.documents.read().unwrap();
+        let doc = docs.get(&uri)?;
+        let byte = util::position_to_byte(&doc.rope, position);
+        if let Some(label) = completion::label_at_cursor(doc, byte) {
+            let (target_uri, def) = index::resolve_label(&self.index, &uri, &label)?;
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: target_uri,
+                range: def.range,
+            }));
+        }
+        // not on a label: jump to the binding of the enclosing node
+        let node = doc.tree.root_node().descendant_for_byte_range(byte, byte)?;
+        let subnode = enclosing_node(node)?;
+        let compatibles = node_compatibles(doc, subnode)?;
+        let binding = self.bindings.lookup(&compatibles)?;
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: binding.uri.clone(),
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
+            },
+        }))
     }
 }
 
