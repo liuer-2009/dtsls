@@ -497,6 +497,66 @@ fn parse_vendor_prefixes(path: &Path) -> BTreeMap<String, String> {
     names
 }
 
+/// dtschema's `fixup_node_props` (fixups.py): implicit properties the tooling
+/// adds to a schema. Names and conditions are a direct port so the validator
+/// sees the same allowed set dt-schema does.
+fn fixup_node_props(
+    schema: &Yaml,
+    properties: &mut FxHashSet<String>,
+    patterns: &mut Vec<regex::Regex>,
+) {
+    let additional = yaml_get(schema, "additionalProperties");
+    let unevaluated = yaml_get(schema, "unevaluatedProperties");
+    // the fixup only runs when the schema says anything about other properties
+    if additional.is_none() && unevaluated.is_none() {
+        return;
+    }
+    if properties.contains("clocks") {
+        for name in [
+            "assigned-clocks",
+            "assigned-clock-rates-u64",
+            "assigned-clock-rates",
+            "assigned-clock-parents",
+            "assigned-clock-sscs",
+        ] {
+            properties.insert(name.to_string());
+        }
+    }
+    if properties.contains("ranges") {
+        properties.insert("dma-ranges".to_string());
+    }
+    // unrestricted schemas get nothing else
+    let open = matches!(additional, Some(Yaml::Boolean(true)))
+        || matches!(unevaluated, Some(Yaml::Boolean(true)));
+    if open {
+        return;
+    }
+    for name in [
+        "phandle",
+        "status",
+        "secure-status",
+        "$nodename",
+        "bootph-pre-sram",
+        "bootph-verify",
+        "bootph-pre-ram",
+        "bootph-some-ram",
+        "bootph-all",
+    ] {
+        properties.insert(name.to_string());
+    }
+    let has_numbered_pinctrl = properties.iter().any(|name| {
+        name.strip_prefix("pinctrl-")
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|first| first.is_ascii_digit())
+    });
+    if !has_numbered_pinctrl {
+        properties.insert("pinctrl-names".to_string());
+        if let Some(pattern) = compile_pattern("^pinctrl-[0-9]+$") {
+            patterns.push(pattern);
+        }
+    }
+}
+
 fn build_binding(
     uri: &Url,
     path: &Path,
@@ -551,6 +611,7 @@ fn build_binding(
     if properties.contains("interrupts") || properties.contains("interrupt-controller") {
         properties.insert("interrupt-parent".to_string());
     }
+    fixup_node_props(schema, &mut properties, &mut patterns);
 
     let mut required = Vec::new();
     let mut required_any = Vec::new();
@@ -1190,6 +1251,49 @@ properties:
             ]
         );
         assert_eq!(index.vendor_less_compatibles(), vec!["operating-points-v2"]);
+    }
+
+    #[test]
+    fn node_props_fixup_follows_dtschema() {
+        let dir = std::env::temp_dir().join(format!("dtsls-nodeprops-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = "%YAML 1.2\n---\n$id: http://devicetree.org/schemas/t.yaml#\n\
+                    $schema: http://devicetree.org/meta-schemas/core.yaml#\n\
+                    title: t\nmaintainers: [{name: t, email: t@example.com}]\n\
+                    properties:\n  compatible:\n    const: acme,t\n  clocks: true\n  ranges: true\n";
+
+        let strict_path = dir.join("strict.yaml");
+        std::fs::write(&strict_path, format!("{head}additionalProperties: false\n")).unwrap();
+        let bindings = parse_bindings(&strict_path);
+        let binding = bindings.first().expect("no binding");
+        // clocks => assigned-clock* group, ranges => dma-ranges, strict =>
+        // implicit node properties + the pinctrl group
+        assert!(binding.properties.contains("assigned-clocks"));
+        assert!(binding.properties.contains("assigned-clock-rates"));
+        assert!(binding.properties.contains("dma-ranges"));
+        assert!(binding.properties.contains("bootph-all"));
+        assert!(binding.properties.contains("pinctrl-names"));
+        assert!(binding.patterns.iter().any(|re| re.is_match("pinctrl-0")));
+
+        let open_path = dir.join("open.yaml");
+        std::fs::write(&open_path, format!("{head}additionalProperties: true\n")).unwrap();
+        let bindings = parse_bindings(&open_path);
+        let binding = bindings.first().expect("no binding");
+        assert!(binding.properties.contains("assigned-clocks"));
+        assert!(binding.properties.contains("dma-ranges"));
+        assert!(!binding.properties.contains("bootph-all"));
+        assert!(!binding.properties.contains("pinctrl-names"));
+
+        let silent_path = dir.join("silent.yaml");
+        std::fs::write(&silent_path, head).unwrap();
+        let bindings = parse_bindings(&silent_path);
+        let binding = bindings.first().expect("no binding");
+        assert!(!binding.properties.contains("assigned-clocks"));
+        assert!(!binding.properties.contains("dma-ranges"));
+
+        for name in ["strict.yaml", "open.yaml", "silent.yaml"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
     }
 
     #[test]
