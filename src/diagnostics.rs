@@ -32,6 +32,9 @@ struct Kinds {
     preproc_string_literal: u16,
     system_lib_string: u16,
     string_literal: u16,
+    node_def: u16,
+    /// `foo:` tokens on nodes and properties
+    label: u16,
     /// containers whose direct subnodes may collide (`node_def`, `#if` bodies)
     containers: [u16; 3],
     /// `#else`/`#elif` subtrees are parsed but conditional; duplicates in
@@ -61,6 +64,8 @@ fn kinds() -> &'static Kinds {
             preproc_string_literal: id("preproc_string_literal"),
             system_lib_string: id("system_lib_string"),
             string_literal: id("string_literal"),
+            node_def: id("node_def"),
+            label: id("label"),
             containers: [
                 id("node_def"),
                 id("preproc_if_in_node_def"),
@@ -114,9 +119,17 @@ const CACHE_LIMIT: usize = 200_000;
 /// Per-subtree result cache: a keystroke only changes one small subtree, so
 /// everything else is served from here. Keyed by the subtree's text, which
 /// also survives the positions of the whole file shifting.
+/// One memoized subtree: its diagnostics plus the labels it defines (byte
+/// ranges relative to the subtree start; labels never span a subtree unit, so
+/// nested units are not double counted).
+struct CachedUnit {
+    diags: Vec<RawDiag>,
+    labels: Vec<(u32, u32)>,
+}
+
 #[derive(Default)]
 pub struct DiagCache {
-    entries: dashmap::DashMap<CacheKey, std::sync::Arc<Vec<RawDiag>>>,
+    entries: dashmap::DashMap<CacheKey, std::sync::Arc<CachedUnit>>,
     generation: std::sync::atomic::AtomicU64,
 }
 
@@ -137,11 +150,11 @@ impl DiagCache {
         }
     }
 
-    fn get(&self, key: &CacheKey) -> Option<std::sync::Arc<Vec<RawDiag>>> {
+    fn get(&self, key: &CacheKey) -> Option<std::sync::Arc<CachedUnit>> {
         self.entries.get(key).map(|entry| entry.clone())
     }
 
-    fn insert(&self, key: CacheKey, value: Vec<RawDiag>) {
+    fn insert(&self, key: CacheKey, value: CachedUnit) {
         self.entries.insert(key, std::sync::Arc::new(value));
     }
 }
@@ -278,10 +291,37 @@ fn run(
         cats,
     };
     let mut raws: Vec<RawDiag> = Vec::new();
+    let mut labels: Vec<(u32, u32)> = Vec::new();
     if cats & CAT_DUPLICATES != 0 {
         check_duplicate_roots(root, doc, &mut out);
     }
-    check_node(&ctx, root, false, &mut raws);
+    check_node(
+        &ctx,
+        root,
+        false,
+        &mut raws,
+        (cats & CAT_DUPLICATES != 0).then_some(&mut labels),
+    );
+    if cats & CAT_DUPLICATES != 0 && !labels.is_empty() {
+        labels.sort_unstable();
+        let mut seen: FxHashMap<&str, ()> = FxHashMap::default();
+        for (start, end) in labels {
+            let (start, end) = (start as usize, (end as usize).min(doc.text.len()));
+            if start >= end {
+                continue;
+            }
+            // the label token includes its trailing ':'
+            let name = &doc.text[start..end.saturating_sub(1)];
+            if seen.insert(name, ()).is_some() {
+                raws.push(RawDiag {
+                    start: start as u32,
+                    end: end as u32,
+                    severity: DiagnosticSeverity::ERROR,
+                    message: format!("duplicate label '{name}'"),
+                });
+            }
+        }
+    }
     out.extend(raws.iter().map(|raw| Diagnostic {
         range: Range {
             start: util::byte_to_position(&doc.rope, raw.start as usize),
@@ -299,7 +339,13 @@ fn run(
 
 /// Check one structural node and everything below it. Property subtrees are
 /// skipped: they can never contain subnodes, duplicates or includes.
-fn check_node(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<RawDiag>) {
+fn check_node(
+    ctx: &CheckCtx,
+    node: Node,
+    in_alternative: bool,
+    out: &mut Vec<RawDiag>,
+    mut labels: Option<&mut Vec<(u32, u32)>>,
+) {
     let k = kinds();
     let kind = node.kind_id();
     if kind == k.property {
@@ -311,7 +357,7 @@ fn check_node(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<Ra
     }
     let alternative = in_alternative || k.alternatives.contains(&kind);
     if kind == k.subnode {
-        check_subnode(ctx, node, alternative, out);
+        check_subnode(ctx, node, alternative, out, labels);
         return;
     }
     if kind == k.preproc_include {
@@ -323,12 +369,24 @@ fn check_node(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<Ra
     if k.containers.contains(&kind) && ctx.cats & CAT_DUPLICATES != 0 && !alternative {
         duplicate_children_into(ctx.doc, node, out);
     }
+    // labels on the root node and on overlays are not covered by a subnode
+    // unit, so collect them here
+    if !alternative
+        && ctx.cats & CAT_DUPLICATES != 0
+        && (kind == k.devicetree
+            || kind == k.node_def
+            || node.kind() == "reference"
+            || k.containers.contains(&kind))
+        && let Some(dst) = labels.as_deref_mut()
+    {
+        container_labels(ctx.doc, node, dst);
+    }
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
             if child.is_named() {
-                check_node(ctx, child, alternative, out);
+                check_node(ctx, child, alternative, out, labels.as_deref_mut());
             }
             if !cursor.goto_next_sibling() {
                 break;
@@ -340,9 +398,23 @@ fn check_node(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<Ra
 /// A subnode's diagnostics depend only on its own text, so the whole subtree
 /// result is memoized (except inside `#else`/`#elif`, where duplicate checks
 /// must not run).
-fn check_subnode(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<RawDiag>) {
+fn check_subnode(
+    ctx: &CheckCtx,
+    node: Node,
+    in_alternative: bool,
+    out: &mut Vec<RawDiag>,
+    labels: Option<&mut Vec<(u32, u32)>>,
+) {
     let Some(cache) = ctx.cache.filter(|_| !in_alternative) else {
         check_subnode_uncached(ctx, node, in_alternative, out);
+        // no cache in this run (or an `#else` branch): labels still count,
+        // but duplicates inside alternatives are not reported
+        if !in_alternative
+            && ctx.cats & CAT_DUPLICATES != 0
+            && let Some(dst) = labels
+        {
+            subtree_labels(node, dst);
+        }
         return;
     };
     let base = node.start_byte() as u32;
@@ -354,13 +426,96 @@ fn check_subnode(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec
         cats: ctx.cats,
     };
     if let Some(hit) = cache.get(&key) {
-        out.extend(hit.iter().map(|raw| raw.shifted(base)));
+        out.extend(hit.diags.iter().map(|raw| raw.shifted(base)));
+        if let Some(dst) = labels {
+            dst.extend(hit.labels.iter().map(|&(start, end)| (start + base, end + base)));
+        }
         return;
     }
     let mut local = Vec::new();
     check_subnode_uncached(ctx, node, in_alternative, &mut local);
-    cache.insert(key, local.iter().map(|raw| raw.rebase(base)).collect());
+    // labels of the whole subtree: nested units are not visited once this
+    // entry is reused, so they belong to the outermost reachable unit
+    let mut abs_labels = Vec::new();
+    if ctx.cats & CAT_DUPLICATES != 0 {
+        subtree_labels(node, &mut abs_labels);
+    }
+    let relative = abs_labels
+        .iter()
+        .map(|&(start, end)| (start - base, end - base))
+        .collect();
+    cache.insert(
+        key,
+        CachedUnit {
+            diags: local.iter().map(|raw| raw.rebase(base)).collect(),
+            labels: relative,
+        },
+    );
     out.extend(local);
+    if let Some(dst) = labels {
+        dst.extend(abs_labels);
+    }
+}
+
+/// Labels defined in a subtree, skipping `#else`/`#elif` branches (we cannot
+/// know which branch the preprocessor keeps, so they never report duplicates).
+fn subtree_labels(node: Node, out: &mut Vec<(u32, u32)>) {
+    let k = kinds();
+    let kind = node.kind_id();
+    if k.alternatives.contains(&kind) {
+        return;
+    }
+    if kind == k.label {
+        out.push((node.start_byte() as u32, node.end_byte() as u32));
+        return;
+    }
+    if node.is_error() || node.is_missing() {
+        return;
+    }
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.is_named() && child.kind_id() != k.prop_data {
+                subtree_labels(child, out);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+/// Labels attached to a container that is not inside a subnode (the root node,
+/// overlay bodies) plus the labels of its direct properties.
+fn container_labels(_doc: &Document, node: Node, out: &mut Vec<(u32, u32)>) {
+    let k = kinds();
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let child = cursor.node();
+        if child.kind_id() == k.label {
+            out.push((child.start_byte() as u32, child.end_byte() as u32));
+        } else if child.kind_id() == k.property {
+            let mut prop_cursor = child.walk();
+            if prop_cursor.goto_first_child() {
+                loop {
+                    let kind_child = prop_cursor.node();
+                    if kind_child.kind_id() == k.label {
+                        out.push((kind_child.start_byte() as u32, kind_child.end_byte() as u32));
+                    }
+                    if !prop_cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
 }
 
 fn check_subnode_uncached(
@@ -373,7 +528,7 @@ fn check_subnode_uncached(
         check_binding_node(node, ctx.doc, ctx.bindings, out);
     }
     if let Some(body) = util::node_def_of(node) {
-        check_node(ctx, body, in_alternative, out);
+        check_node(ctx, body, in_alternative, out, None);
     }
 }
 
@@ -710,11 +865,25 @@ fn check_duplicate_roots(node: Node, doc: &Document, out: &mut Vec<Diagnostic>) 
 fn duplicate_children_into(doc: &Document, node: Node, out: &mut Vec<RawDiag>) {
     let mut seen_names: FxHashMap<&str, ()> = FxHashMap::default();
     let mut seen_addresses: FxHashMap<&str, &str> = FxHashMap::default();
+    let mut seen_properties: FxHashMap<&str, ()> = FxHashMap::default();
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
-            if child.kind_id() == kinds().subnode
+            if child.kind_id() == kinds().property
+                && let Some(name_node) = child.child_by_field_name("name")
+            {
+                // dtc is strict about this: duplicate_property_names is an error
+                let name = util::node_text(doc, name_node);
+                if seen_properties.insert(name, ()).is_some() {
+                    out.push(RawDiag {
+                        start: name_node.start_byte() as u32,
+                        end: name_node.end_byte() as u32,
+                        severity: DiagnosticSeverity::ERROR,
+                        message: format!("duplicate property '{name}'"),
+                    });
+                }
+            } else if child.kind_id() == kinds().subnode
                 && let Some(name_node) = child.child_by_field_name("name")
             {
                 let full = util::node_text(doc, name_node);
@@ -1207,7 +1376,7 @@ mod tests {
     #[test]
     fn cached_diagnostics_match_full_recompute() {
         use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier};
-        let text = "/dts-v1/;\n\n/ {\n    widget@1000 {\n        compatible = \"acme,widget\";\n        reg = <0x0 0x1000>;\n        bogus = <1>;\n    };\n\n    widget@2000 {\n        compatible = \"acme,widget\";\n        reg = <0x0 0x2000>;\n    };\n};\n";
+        let text = "/dts-v1/;\n\n/ {\n    lbl: widget@1000 {\n        compatible = \"acme,widget\";\n        reg = <0x0 0x1000>;\n        bogus = <1>;\n        reg = <0x1 0x1000>;\n    };\n\n    lbl: widget@2000 {\n        compatible = \"acme,widget\";\n        reg = <0x0 0x2000>;\n    };\n};\n";
         let mut doc = Document::open(text, 0);
         let cache = DiagCache::default();
         let bindings = BindingIndex::default();
@@ -1380,6 +1549,46 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_properties_are_errors() {
+        let text = "/dts-v1/;\n\n/ {\n    node@1 {\n        reg = <1>;\n        reg = <2>;\n    };\n};\n";
+        let diags = semantic(&Document::open(text, 0));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("duplicate property 'reg'"));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+
+        // same name in different nodes is fine
+        let text = "/dts-v1/;\n\n/ {\n    a {\n        reg = <1>;\n    };\n    b {\n        reg = <2>;\n    };\n};\n";
+        assert!(semantic(&Document::open(text, 0)).is_empty());
+    }
+
+    #[test]
+    fn duplicate_labels_are_errors() {
+        // node labels
+        let text = "/dts-v1/;\n\n/ {\n    a: node@1 {\n    };\n    a: node@2 {\n    };\n};\n";
+        let diags = semantic(&Document::open(text, 0));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("duplicate label 'a'"));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+
+        // property labels
+        let text = "/dts-v1/;\n\n/ {\n    node {\n        l: p = <1>;\n        l: q = <2>;\n    };\n};\n";
+        let diags = semantic(&Document::open(text, 0));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("duplicate label 'l'"));
+
+        // distinct labels are fine
+        let text = "/dts-v1/;\n\n/ {\n    a: node@1 {\n    };\n    b: node@2 {\n    };\n};\n";
+        assert!(semantic(&Document::open(text, 0)).is_empty());
+    }
+
+    #[test]
+    fn duplicate_labels_in_alternative_branches_are_ignored() {
+        let text = "/dts-v1/;\n\n/ {\n    node {\n#ifdef A\n        l: p = <1>;\n#else\n        l: q = <2>;\n#endif\n    };\n};\n";
+        let diags = semantic(&Document::open(text, 0));
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
     fn addressed_child_names_match_exactly() {
         let bindings = BindingIndex::default();
         bindings.insert_for_test(crate::bindings::Binding {
@@ -1399,3 +1608,4 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
     }
 }
+

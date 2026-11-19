@@ -686,11 +686,15 @@ pub fn items_from_binding(
         .and_then(|mut s| s.next_back())
         .unwrap_or("")
         .to_string();
+    // one item per property: required entries also live in `properties`, and
+    // anything the node already has (property or child node) is dropped
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut items: Vec<CompletionItem> = binding
         .properties
         .iter()
         .chain(binding.required.iter())
         .filter(|name| !existing.contains(*name) && name.starts_with(prefix))
+        .filter(|name| seen.insert(name.as_str()))
         .map(|name| {
             let required = binding.required.contains(name);
             CompletionItem {
@@ -711,7 +715,6 @@ pub fn items_from_binding(
         })
         .collect();
     items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
-    items.dedup_by(|a, b| a.label == b.label);
     items
 }
 
@@ -941,6 +944,37 @@ mod tests {
         let inside_a = text.find("/* } */").unwrap();
         let node = text_node(&Document::open(text, 0), inside_a).expect("no text node");
         assert_eq!(node.compatibles, vec!["http://x/{y}"]);
+    }
+
+    #[test]
+    fn binding_items_are_unique() {
+        use crate::bindings::Binding;
+        use tower_lsp::lsp_types::Url;
+        let binding = Binding {
+            uri: Url::parse("file:///t.yaml").unwrap(),
+            singles: vec!["acme,t".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "reg", "clocks"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            // `reg` is both allowed and required: must not produce two items
+            required: vec!["compatible".to_string(), "reg".to_string()],
+            required_any: Vec::new(),
+            strict: false,
+            refs_complete: true,
+            patterns: Vec::new(),
+        };
+        let mut existing = std::collections::HashSet::new();
+        let items = items_from_binding(&binding, &existing, "");
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["compatible", "reg", "clocks"], "items: {labels:?}");
+
+        // properties the node already has are never suggested
+        existing.insert("reg".to_string());
+        let items = items_from_binding(&binding, &existing, "");
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["compatible", "clocks"], "items: {labels:?}");
     }
 
     #[test]
