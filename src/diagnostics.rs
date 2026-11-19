@@ -472,11 +472,12 @@ fn check_binding_node(
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
-    // one pass over the body: property name text plus the compatible property,
-    // so nothing is scanned twice
+    // one pass over the body: property names, plus child node names because a
+    // required entry may be a child node (`required: [ports]`)
     let k = kinds();
     let body = util::node_def_of(node).unwrap_or(node);
     let mut props: Vec<(Node, &str)> = Vec::with_capacity(body.child_count() / 2);
+    let mut child_names: Vec<&str> = Vec::new();
     let mut compatible = None;
     let mut cursor = body.walk();
     if cursor.goto_first_child() {
@@ -490,12 +491,20 @@ fn check_binding_node(
                     compatible = Some(child);
                 }
                 props.push((child, name));
+            } else if child.kind_id() == k.subnode
+                && let Some(child_name) = child.child_by_field_name("name")
+            {
+                // exact name: `required: [port@0]` must not match `port@1`
+                child_names.push(util::node_text(doc, child_name));
             }
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
     }
+    let has = |name: &str| {
+        props.iter().any(|(_, prop)| *prop == name) || child_names.contains(&name)
+    };
     let Some(compatible) = compatible else {
         return;
     };
@@ -532,7 +541,7 @@ fn check_binding_node(
     let node_name = util::node_text(doc, name_node);
     let mut count = 0;
     for required in &binding.required {
-        if props.iter().any(|(_, name)| *name == required) {
+        if has(required) {
             continue;
         }
         push(
@@ -542,6 +551,23 @@ fn check_binding_node(
             format!(
                 "missing required property '{required}' for node \
                  '{node_name}' (binding: {file})"
+            ),
+        );
+        count += 1;
+    }
+    for group in &binding.required_any {
+        if group.iter().any(|name| has(name)) {
+            continue;
+        }
+        push(
+            name_start,
+            name_end,
+            DiagnosticSeverity::ERROR,
+            format!(
+                "missing required property '{}' (or '{}') for node \
+                 '{node_name}' (binding: {file})",
+                group[0],
+                group.get(1).map(String::as_str).unwrap_or("")
             ),
         );
         count += 1;
@@ -1194,6 +1220,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
             required: vec!["compatible".to_string(), "reg".to_string()],
+            required_any: Vec::new(),
             strict: true,
             refs_complete: true,
             patterns: Vec::new(),
@@ -1258,5 +1285,117 @@ mod tests {
         assert!(diags[0].message.starts_with("devicetree bindings: unavailable"));
         assert_eq!(diags[1].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diags[1].message.starts_with("dtschema: degraded"));
+    }
+
+    fn irq_binding() -> crate::bindings::Binding {
+        crate::bindings::Binding {
+            uri: tower_lsp::lsp_types::Url::parse("file:///irq.yaml").unwrap(),
+            singles: vec!["acme,irq".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "interrupts", "interrupts-extended"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required: vec!["compatible".to_string()],
+            required_any: vec![vec![
+                "interrupts".to_string(),
+                "interrupts-extended".to_string(),
+            ]],
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn interrupts_extended_satisfies_required_interrupts() {
+        // dt-schema rewrites `required: [interrupts]` into "interrupts or
+        // interrupts-extended"
+        for (label, interrupts) in [
+            (
+                "interrupts",
+                "        interrupts = <0 5 4>;\n",
+            ),
+            (
+                "interrupts-extended",
+                "        interrupts-extended = <&intc 0 5 4>;\n",
+            ),
+        ] {
+            let text = format!(
+                "/dts-v1/;\n\n/ {{\n    irq@1000 {{\n        compatible = \"acme,irq\";\n{interrupts}    }};\n}};\n"
+            );
+            let doc = Document::open(&text, 0);
+            let bindings = BindingIndex::default();
+            bindings.insert_for_test(irq_binding());
+            let diags = binding_diagnostics(&doc, &bindings, None);
+            assert!(diags.is_empty(), "{label}: {diags:?}");
+        }
+
+        // neither form: one error naming both alternatives
+        let text = "/dts-v1/;\n\n/ {\n    irq@1000 {\n        compatible = \"acme,irq\";\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(irq_binding());
+        let diags = binding_diagnostics(&doc, &bindings, None);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("'interrupts' (or 'interrupts-extended')"));
+    }
+
+    #[test]
+    fn child_node_satisfies_a_required_entry() {
+        let text = "/dts-v1/;\n\n/ {\n    disp@2000 {\n        compatible = \"acme,disp\";\n        ports {\n            port {\n            };\n        };\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(crate::bindings::Binding {
+            uri: tower_lsp::lsp_types::Url::parse("file:///disp.yaml").unwrap(),
+            singles: vec!["acme,disp".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "ports"].into_iter().map(str::to_string).collect(),
+            required: vec!["compatible".to_string(), "ports".to_string()],
+            required_any: Vec::new(),
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        });
+        let diags = binding_diagnostics(&doc, &bindings, None);
+        assert!(diags.is_empty(), "{diags:?}");
+
+        let text = "/dts-v1/;\n\n/ {\n    disp@2000 {\n        compatible = \"acme,disp\";\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(crate::bindings::Binding {
+            uri: tower_lsp::lsp_types::Url::parse("file:///disp.yaml").unwrap(),
+            singles: vec!["acme,disp".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "ports"].into_iter().map(str::to_string).collect(),
+            required: vec!["compatible".to_string(), "ports".to_string()],
+            required_any: Vec::new(),
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        });
+        let diags = binding_diagnostics(&doc, &bindings, None);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("missing required property 'ports'"));
+    }
+
+    #[test]
+    fn addressed_child_names_match_exactly() {
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(crate::bindings::Binding {
+            uri: tower_lsp::lsp_types::Url::parse("file:///tcon.yaml").unwrap(),
+            singles: vec!["acme,tcon".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "ports"].into_iter().map(str::to_string).collect(),
+            required: vec!["compatible".to_string(), "ports".to_string()],
+            required_any: Vec::new(),
+            strict: false,
+            refs_complete: true,
+            patterns: Vec::new(),
+        });
+        let text = "/dts-v1/;\n\n/ {\n    tcon@1000 {\n        compatible = \"acme,tcon\";\n        ports {\n            port@0 {\n            };\n            port {\n            };\n        };\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let diags = binding_diagnostics(&doc, &bindings, None);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 }

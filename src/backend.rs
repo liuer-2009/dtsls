@@ -594,6 +594,13 @@ fn node_view(doc: &Document, byte: usize, bindings: &BindingIndex) -> NodeView {
                     && let Some(name) = child.child_by_field_name("name")
                 {
                     existing.insert(util::node_text(doc, name).to_string());
+                } else if child.kind() == "subnode"
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    // child nodes (`ports`, `mdio`, ...) are declared under
+                    // `properties:` too, so they count as already present
+                    let name = util::node_text(doc, name);
+                    existing.insert(name.split('@').next().unwrap_or(name).to_string());
                 }
             }
         }
@@ -657,6 +664,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
             required: vec!["compatible".to_string()],
+            required_any: Vec::new(),
             strict: true,
             refs_complete: true,
             patterns: Vec::new(),
@@ -702,6 +710,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
             required: vec!["compatible".to_string()],
+            required_any: Vec::new(),
             strict: true,
             refs_complete: true,
             patterns: Vec::new(),
@@ -721,6 +730,7 @@ mod tests {
             compounds: Vec::new(),
             properties: props.iter().map(|p| p.to_string()).collect(),
             required: vec!["compatible".to_string()],
+            required_any: Vec::new(),
             strict: true,
             refs_complete: true,
             patterns: Vec::new(),

@@ -56,6 +56,9 @@ pub struct Binding {
     pub properties: FxHashSet<String>,
     /// required property names
     pub required: Vec<String>,
+    /// groups where at least one member must be present: dt-schema rewrites
+    /// `required: [interrupts]` into "interrupts or interrupts-extended"
+    pub required_any: Vec<Vec<String>>,
     /// `additionalProperties: false` / `unevaluatedProperties: false`
     pub strict: bool,
     /// every `$ref` resolved locally; unknown-property checks are only safe
@@ -289,6 +292,7 @@ impl Binding {
             compounds: self.compounds.clone(),
             properties: self.properties.clone(),
             required: self.required.clone(),
+            required_any: self.required_any.clone(),
             strict: self.strict,
             refs_complete: self.refs_complete,
             patterns: self.patterns.clone(),
@@ -538,10 +542,27 @@ fn build_binding(
         0,
     );
 
+    // dt-schema fixups (`fixup_interrupts` in dtschema): supporting
+    // `interrupts` implies `interrupts-extended` and `interrupt-parent` are
+    // supported too, and either interrupt form satisfies the requirement.
+    if properties.contains("interrupts") {
+        properties.insert("interrupts-extended".to_string());
+    }
+    if properties.contains("interrupts") || properties.contains("interrupt-controller") {
+        properties.insert("interrupt-parent".to_string());
+    }
+
     let mut required = Vec::new();
+    let mut required_any = Vec::new();
     if let Some(list) = yaml_get(schema, "required").and_then(Yaml::as_vec) {
         for item in list {
-            if let Some(name) = item.as_str() {
+            let Some(name) = item.as_str() else { continue };
+            if name == "interrupts" {
+                required_any.push(vec![
+                    "interrupts".to_string(),
+                    "interrupts-extended".to_string(),
+                ]);
+            } else {
                 required.push(name.to_string());
             }
         }
@@ -561,6 +582,7 @@ fn build_binding(
         compounds,
         properties,
         required,
+        required_any,
         strict,
         refs_complete,
         patterns,
@@ -1124,6 +1146,7 @@ properties:
             compounds,
             properties: FxHashSet::default(),
             required: Vec::new(),
+            required_any: Vec::new(),
             strict: false,
             refs_complete: true,
             patterns: Vec::new(),
@@ -1150,6 +1173,7 @@ properties:
                 compounds: Vec::new(),
                 properties: FxHashSet::default(),
                 required: Vec::new(),
+                required_any: Vec::new(),
                 strict: false,
                 refs_complete: true,
                 patterns: Vec::new(),
@@ -1166,5 +1190,36 @@ properties:
             ]
         );
         assert_eq!(index.vendor_less_compatibles(), vec!["operating-points-v2"]);
+    }
+
+    #[test]
+    fn interrupts_fixup_follows_dtschema() {
+        let dir = std::env::temp_dir().join(format!("dtsls-fixup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("acme,irq-test.yaml");
+        std::fs::write(
+            &path,
+            "%YAML 1.2\n---\n$id: http://devicetree.org/schemas/acme,irq-test.yaml#\n\
+             $schema: http://devicetree.org/meta-schemas/core.yaml#\n\
+             title: irq test\nmaintainers: [{name: t, email: t@example.com}]\n\
+             properties:\n  compatible:\n    const: acme,irq-test\n  interrupts:\n    maxItems: 1\n\
+             required:\n  - compatible\n  - interrupts\nadditionalProperties: false\n",
+        )
+        .unwrap();
+        let bindings = parse_bindings(&path);
+        let binding = bindings.first().expect("no binding");
+        // declaring `interrupts` also accepts `interrupts-extended` and
+        // `interrupt-parent`, and either interrupt form satisfies required
+        assert!(binding.properties.contains("interrupts-extended"));
+        assert!(binding.properties.contains("interrupt-parent"));
+        assert_eq!(binding.required, vec!["compatible"]);
+        assert_eq!(
+            binding.required_any,
+            vec![vec![
+                "interrupts".to_string(),
+                "interrupts-extended".to_string()
+            ]]
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

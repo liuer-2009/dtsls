@@ -439,26 +439,6 @@ fn block_properties(text: &str, start: usize, end: usize) -> (Vec<String>, Vec<S
     let mut in_string = false;
     let mut i = start;
     let mut chunk_start = start;
-    let mut take_chunk = |from: usize, to: usize| {
-        let chunk = &text[from..to];
-        let Some(equals) = chunk.find('=') else {
-            return;
-        };
-        let name = chunk[..equals].trim();
-        let name = name.split_whitespace().next_back().unwrap_or("");
-        if name.is_empty()
-            || !name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_alphanumeric() || c == '#' || c == '_' || c == '-')
-        {
-            return;
-        }
-        properties.push(name.to_string());
-        if name == "compatible" {
-            collect_strings(&chunk[equals + 1..], &mut compatibles);
-        }
-    };
     while i < end {
         let b = bytes[i];
         if in_comment {
@@ -498,8 +478,18 @@ fn block_properties(text: &str, start: usize, end: usize) -> (Vec<String>, Vec<S
             }
             b'{' => {
                 if depth == 0 {
-                    // nested node starts here; its header is not a property
-                    take_chunk(chunk_start, i);
+                    // nested node starts here: the chunk before it is either a
+                    // property missing its `;` or the child node's header
+                    take_chunk(
+                        text,
+                        chunk_start,
+                        i,
+                        &mut properties,
+                        &mut compatibles,
+                    );
+                    if let Some(name) = child_node_name(&text[chunk_start..i]) {
+                        properties.push(name);
+                    }
                     chunk_start = i + 1;
                 }
                 depth += 1;
@@ -513,15 +503,58 @@ fn block_properties(text: &str, start: usize, end: usize) -> (Vec<String>, Vec<S
                 }
             }
             b';' if depth == 0 => {
-                take_chunk(chunk_start, i);
+                take_chunk(text, chunk_start, i, &mut properties, &mut compatibles);
                 chunk_start = i + 1;
                 i += 1;
             }
             _ => i += 1,
         }
     }
-    take_chunk(chunk_start, end);
+    take_chunk(text, chunk_start, end, &mut properties, &mut compatibles);
     (properties, compatibles)
+}
+
+/// One statement of a block: registers its property name, and the
+/// `compatible` strings when it is the compatible property.
+fn take_chunk(
+    text: &str,
+    from: usize,
+    to: usize,
+    properties: &mut Vec<String>,
+    compatibles: &mut Vec<String>,
+) {
+    let chunk = &text[from..to];
+    let Some(equals) = chunk.find('=') else {
+        return;
+    };
+    let name = chunk[..equals].trim();
+    let name = name.split_whitespace().next_back().unwrap_or("");
+    if name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '#' || c == '_' || c == '-')
+    {
+        return;
+    }
+    properties.push(name.to_string());
+    if name == "compatible" {
+        collect_strings(&chunk[equals + 1..], compatibles);
+    }
+}
+
+/// Node name of a `{`-header chunk (`label: ports@0` -> `ports`).
+fn child_node_name(chunk: &str) -> Option<String> {
+    let header = chunk.trim();
+    let header = header.rsplit(':').next().unwrap_or(header).trim();
+    let token = header.split_whitespace().next_back()?;
+    let name = token.split('@').next().unwrap_or(token);
+    let plausible = !name.is_empty()
+        && !name.starts_with('&')
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | ','));
+    plausible.then(|| name.to_string())
 }
 
 fn collect_strings(value: &str, out: &mut Vec<String>) {
@@ -987,6 +1020,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
             required: vec!["compatible".to_string(), "reg".to_string()],
+            required_any: Vec::new(),
             strict: true,
             refs_complete: true,
             patterns: Vec::new(),
