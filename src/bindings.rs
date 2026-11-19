@@ -1,10 +1,41 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 
 use tower_lsp::lsp_types::Url;
 use yaml_rust2::{Yaml, YamlLoader};
+
+/// Completions for `compatible = "…"`: vendors, their devices, and the
+/// compatibles that carry no vendor prefix (`operating-points-v2`, ...).
+#[derive(Default)]
+pub struct CompatibleIndex {
+    /// vendor -> (full compatible -> defining file name)
+    vendors: BTreeMap<String, BTreeMap<String, String>>,
+    /// vendor -> human readable name, from `vendor-prefixes.yaml`
+    vendor_names: BTreeMap<String, String>,
+    /// compatibles without a vendor prefix
+    vendor_less: BTreeSet<String>,
+}
+
+impl CompatibleIndex {
+    fn add(&mut self, compatible: &str, file: &str) {
+        match compatible.split_once(',') {
+            Some((vendor, device)) if !vendor.is_empty() && !device.is_empty() => {
+                self.vendors
+                    .entry(vendor.to_string())
+                    .or_default()
+                    .entry(compatible.to_string())
+                    .or_insert_with(|| file.to_string());
+            }
+            Some(_) => {}
+            None if !compatible.is_empty() => {
+                self.vendor_less.insert(compatible.to_string());
+            }
+            None => {}
+        }
+    }
+}
 
 /// Compound compatible pattern: per position, the allowed values.
 type CompoundPattern = Vec<Vec<String>>;
@@ -44,9 +75,51 @@ pub struct BindingIndex {
     implicit_properties: RwLock<HashSet<String>>,
     /// meta-schema property patterns (`-supply$`, `.*-names$`, ...)
     implicit_patterns: RwLock<Vec<regex::Regex>>,
+    /// vendors/devices/vendor-less compatibles for `compatible = "…"`
+    compat: RwLock<CompatibleIndex>,
 }
 
 impl BindingIndex {
+    pub fn compatible_vendors(&self) -> Vec<(String, Option<String>, usize)> {
+        let compat = self.compat.read().unwrap();
+        compat
+            .vendors
+            .iter()
+            .map(|(vendor, devices)| {
+                (
+                    vendor.clone(),
+                    compat.vendor_names.get(vendor).cloned(),
+                    devices.len(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn compatible_devices(&self, vendor: &str) -> Vec<(String, String)> {
+        self.compat
+            .read()
+            .unwrap()
+            .vendors
+            .get(vendor)
+            .map(|devices| {
+                devices
+                    .iter()
+                    .map(|(compatible, file)| (compatible.clone(), file.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn vendor_less_compatibles(&self) -> Vec<String> {
+        self.compat
+            .read()
+            .unwrap()
+            .vendor_less
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// May the node carry this property according to the binding and the
     /// meta-schemas?
     pub fn is_property_allowed(&self, name: &str, binding: &Binding) -> bool {
@@ -120,6 +193,12 @@ impl BindingIndex {
 
     fn insert(&self, binding: Binding) {
         let shared = Arc::new(binding.clone_shallow());
+        let file = binding
+            .uri
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .unwrap_or("")
+            .to_string();
         {
             let mut singles = self.by_single.write().unwrap();
             for compatible in &binding.singles {
@@ -143,7 +222,24 @@ impl BindingIndex {
                 }
             }
         }
+        {
+            let mut compat = self.compat.write().unwrap();
+            for compatible in &binding.singles {
+                compat.add(compatible, &file);
+            }
+            for pattern in &binding.compounds {
+                if let Some(allowed) = pattern.first() {
+                    for compatible in allowed {
+                        compat.add(compatible, &file);
+                    }
+                }
+            }
+        }
         *self.count.write().unwrap() += 1;
+    }
+
+    fn set_vendor_names(&self, names: BTreeMap<String, String>) {
+        self.compat.write().unwrap().vendor_names = names;
     }
 }
 
@@ -201,6 +297,8 @@ pub fn scan(index: &BindingIndex, dir: &Path) {
     } else {
         tracing::warn!("dtschema python package not found; run `pip install dtschema`");
     }
+    // human readable vendor names for completion details
+    index.set_vendor_names(parse_vendor_prefixes(&dir.join("vendor-prefixes.yaml")));
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut scan_dirs = vec![dir.to_path_buf()];
@@ -324,6 +422,37 @@ pub fn parse_bindings(path: &Path) -> Vec<Binding> {
         }
     });
     out
+}
+
+/// `vendor-prefixes.yaml`: `"^ti,": description: Texas Instruments, Inc`.
+fn parse_vendor_prefixes(path: &Path) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return names;
+    };
+    let Ok(docs) = YamlLoader::load_from_str(&strip_yaml_directives(&text)) else {
+        return names;
+    };
+    let Some(hash) = docs.first().and_then(Yaml::as_hash) else {
+        return names;
+    };
+    for (key, value) in hash {
+        let Some(key) = key.as_str() else { continue };
+        let vendor = key.trim_start_matches('^').trim_end_matches(',');
+        // skip pattern entries like "^(.*),$"
+        if vendor.is_empty() || !vendor.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            continue;
+        }
+        let Some(description) = value
+            .as_hash()
+            .and_then(|hash| hash.get(&Yaml::String("description".to_string())))
+            .and_then(Yaml::as_str)
+        else {
+            continue;
+        };
+        names.insert(vendor.to_string(), description.trim().to_string());
+    }
+    names
 }
 
 fn build_binding(
@@ -967,5 +1096,37 @@ properties:
         assert!(index
             .lookup(&["fsl,imx28-pinctrl".to_string(), "simple-bus".to_string()])
             .is_some());
+    }
+
+    #[test]
+    fn compatible_index_splits_vendors_and_vendor_less() {
+        let index = BindingIndex::default();
+        for (singles, file) in [
+            (vec!["acme,widget", "operating-points-v2"], "widget.yaml"),
+            (vec!["acme,gadget"], "gadget.yaml"),
+            (vec!["ti,am335x"], "am335x.yaml"),
+        ] {
+            index.insert_for_test(Binding {
+                uri: Url::parse(&format!("file:///{file}")).unwrap(),
+                singles: singles.into_iter().map(str::to_string).collect(),
+                compounds: Vec::new(),
+                properties: HashSet::new(),
+                required: Vec::new(),
+                strict: false,
+                refs_complete: true,
+                patterns: Vec::new(),
+            });
+        }
+        let vendors = index.compatible_vendors();
+        assert!(vendors.iter().any(|(v, _, count)| v == "acme" && *count == 2));
+        assert!(vendors.iter().any(|(v, _, _)| v == "ti"));
+        assert_eq!(
+            index.compatible_devices("acme"),
+            vec![
+                ("acme,gadget".to_string(), "gadget.yaml".to_string()),
+                ("acme,widget".to_string(), "widget.yaml".to_string()),
+            ]
+        );
+        assert_eq!(index.vendor_less_compatibles(), vec!["operating-points-v2"]);
     }
 }

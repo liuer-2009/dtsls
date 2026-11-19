@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionList};
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionList, InsertTextFormat, Range, TextEdit,
+};
+use tree_sitter::Node;
 
 use crate::analysis;
 use crate::document::Document;
 use crate::index::DefineMap;
+use crate::util;
 
 /// label -> (node path, defining file name). An empty file name means the
 /// label is defined in the file the index entry belongs to.
@@ -19,11 +23,20 @@ pub enum Context {
     Defines(String),
     /// lowercase word at a property-name position inside a node body
     Properties(String),
+    /// inside `compatible = "…"`: vendor stage (no comma yet) or device
+    /// stage (after `vendor,`)
+    Compatible {
+        prefix: String,
+        vendor: Option<String>,
+    },
 }
 
 /// Classify the completion context at the cursor. Lowercase words only offer
 /// property names, and only when the line so far cannot be a value.
 pub fn completion_context(doc: &Document, cursor: usize) -> Option<Context> {
+    if let Some(context) = compatible_context(doc, cursor) {
+        return Some(context);
+    }
     let cursor = cursor.min(doc.rope.len_bytes());
     let line = doc.rope.byte_to_line(cursor);
     let line_start = doc.rope.line_to_byte(line);
@@ -65,6 +78,226 @@ pub fn completion_context(doc: &Document, cursor: usize) -> Option<Context> {
         return Some(Context::Properties(word));
     }
     None
+}
+
+/// Inside a `compatible = "…"` string: vendor stage (no comma yet) or device
+/// stage (after `vendor,`). Works on the raw line so it also fires while the
+/// string is still unterminated (everything is mid-typing).
+fn compatible_context(doc: &Document, cursor: usize) -> Option<Context> {
+    let cursor = cursor.min(doc.rope.len_bytes());
+    let line_start = doc.rope.line_to_byte(doc.rope.byte_to_line(cursor));
+    let head = doc.slice(line_start..cursor);
+    // an odd number of quotes means the cursor sits inside a string
+    if head.matches('"').count() % 2 == 0 {
+        return None;
+    }
+    let quote = head.rfind('"')?;
+    let before = &head[..quote];
+    // the string must be the value of a `compatible` property
+    let equals = before.rfind('=')?;
+    let property = before[..equals].trim().split_whitespace().next_back()?;
+    if property != "compatible" {
+        return None;
+    }
+    // endpoint/port nodes are plumbing and never carry compatible
+    if in_endpoint_or_port(doc, cursor) {
+        return None;
+    }
+    let content = &head[quote + 1..];
+    Some(match content.split_once(',') {
+        Some((vendor, prefix)) => Context::Compatible {
+            prefix: prefix.to_string(),
+            vendor: Some(vendor.to_string()),
+        },
+        None => Context::Compatible {
+            prefix: content.to_string(),
+            vendor: None,
+        },
+    })
+}
+
+/// Enclosing `subnode` or root `devicetree` of the cursor position.
+pub fn enclosing_node(doc: &Document, byte: usize) -> Option<Node<'_>> {
+    let node = doc.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    let mut current = Some(node);
+    while let Some(node) = current {
+        match node.kind() {
+            "subnode" | "devicetree" => return Some(node),
+            _ => {}
+        }
+        current = node.parent();
+    }
+    None
+}
+
+/// `endpoint` / `port` nodes (and their `@addr` variants).
+fn is_endpoint_or_port(doc: &Document, node: Node<'_>) -> bool {
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let name = util::node_text(doc, name);
+    let base = name.split('@').next().unwrap_or(name);
+    base == "endpoint" || base == "port"
+}
+
+/// Whether the node enclosing the cursor is `endpoint`/`port` plumbing.
+/// Falls back to a line scan when syntax errors collapse the tree into a
+/// single ERROR node — the normal state while a string is being typed.
+pub fn in_endpoint_or_port(doc: &Document, byte: usize) -> bool {
+    match enclosing_node(doc, byte) {
+        Some(node) if node.kind() == "subnode" => is_endpoint_or_port(doc, node),
+        _ => match line_scanned_node_name(doc, byte) {
+            Some(name) => {
+                let base = name.split('@').next().unwrap_or(&name);
+                base == "endpoint" || base == "port"
+            }
+            None => false,
+        },
+    }
+}
+
+/// Innermost open node name at the cursor line, from brace counting. Only
+/// used to recognise `endpoint`/`port`, so comment/string noise is tolerable.
+fn line_scanned_node_name(doc: &Document, byte: usize) -> Option<String> {
+    let last_line = doc.rope.byte_to_line(byte.min(doc.rope.len_bytes()));
+    let mut stack: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for line in 0..=last_line {
+        let start = doc.rope.line_to_byte(line);
+        let end = if line + 1 < doc.rope.len_lines() {
+            doc.rope.line_to_byte(line + 1)
+        } else {
+            doc.rope.len_bytes()
+        };
+        buf.clear();
+        buf.push_str(&doc.slice(start..end));
+        let code = buf.split("//").next().unwrap_or("").trim();
+        let opens = code.matches('{').count();
+        let closes = code.matches('}').count();
+        if opens > 0 {
+            let name = code
+                .split('{')
+                .next()
+                .unwrap_or("")
+                .rsplit(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .split_whitespace()
+                .next_back()
+                .unwrap_or("")
+                .to_string();
+            for _ in 0..opens {
+                stack.push(name.clone());
+            }
+        }
+        for _ in 0..closes {
+            stack.pop();
+        }
+    }
+    stack.pop()
+}
+
+/// Property-name item that expands to `compatible = ""` with the cursor
+/// between the quotes.
+pub fn compatible_property_item(prefix: &str) -> Option<CompletionItem> {
+    if !prefix.is_empty() && !"compatible".starts_with(prefix) {
+        return None;
+    }
+    Some(CompletionItem {
+        label: "compatible".to_string(),
+        kind: Some(CompletionItemKind::PROPERTY),
+        detail: Some("add a compatible string".to_string()),
+        insert_text: Some("compatible = \"$0\"".to_string()),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        ..Default::default()
+    })
+}
+
+/// Vendor items; accepting one inserts `vendor,` so the device list follows.
+pub fn vendor_completion_items(
+    vendors: Vec<(String, Option<String>, usize)>,
+    prefix: &str,
+    range: &Range,
+) -> Vec<CompletionItem> {
+    vendors
+        .into_iter()
+        .filter(|(vendor, _, _)| vendor.starts_with(prefix))
+        .map(|(vendor, name, count)| CompletionItem {
+            label: vendor.clone(),
+            kind: Some(CompletionItemKind::MODULE),
+            detail: Some(match name {
+                Some(name) => format!("{name} · {count} devices"),
+                None => format!("vendor · {count} devices"),
+            }),
+            filter_text: Some(vendor.clone()),
+            text_edit: Some(
+                TextEdit {
+                    range: range.clone(),
+                    new_text: format!("{vendor},"),
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Compatibles that carry no vendor prefix (`operating-points-v2`, ...).
+pub fn vendor_less_items(
+    compatibles: Vec<String>,
+    prefix: &str,
+    range: &Range,
+) -> Vec<CompletionItem> {
+    compatibles
+        .into_iter()
+        .filter(|compatible| compatible.starts_with(prefix))
+        .map(|compatible| CompletionItem {
+            label: compatible.clone(),
+            kind: Some(CompletionItemKind::CONSTANT),
+            detail: Some("compatible without vendor".to_string()),
+            filter_text: Some(compatible.clone()),
+            text_edit: Some(
+                TextEdit {
+                    range: range.clone(),
+                    new_text: compatible,
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Device items for a resolved vendor; labels are the full compatible strings.
+pub fn device_completion_items(
+    devices: Vec<(String, String)>,
+    prefix: &str,
+    range: &Range,
+) -> Vec<CompletionItem> {
+    devices
+        .into_iter()
+        .filter(|(compatible, _)| {
+            compatible
+                .split_once(',')
+                .map(|(_, device)| device.starts_with(prefix))
+                .unwrap_or(false)
+        })
+        .map(|(compatible, file)| CompletionItem {
+            label: compatible.clone(),
+            kind: Some(CompletionItemKind::CONSTANT),
+            detail: Some(file),
+            filter_text: Some(compatible.clone()),
+            text_edit: Some(
+                TextEdit {
+                    range: range.clone(),
+                    new_text: compatible,
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Property-name items from a node's binding. Required properties sort first;
@@ -206,6 +439,7 @@ fn item(label: &str, detail: &str, kind: CompletionItemKind) -> CompletionItem {
 
 pub fn completion_list(items: Vec<CompletionItem>) -> CompletionList {
     CompletionList {
+        // lists are never truncated, so the client should not re-request
         is_incomplete: false,
         items,
     }
@@ -220,6 +454,71 @@ mod tests {
         let doc = Document::open(text, 0);
         let byte = text.find(needle_end).unwrap() + needle_end.len();
         completion_context(&doc, byte)
+    }
+
+    #[test]
+    fn compatible_vendor_stage() {
+        let open = "/ {\n    node {\n        compatible = \"\n";
+        let expect = Some(Context::Compatible {
+            prefix: String::new(),
+            vendor: None,
+        });
+        assert_eq!(context_at(open, "\""), expect);
+        assert_eq!(
+            context_at("/ {\n    node {\n        compatible = \"ti\n", "\"ti"),
+            Some(Context::Compatible {
+                prefix: "ti".to_string(),
+                vendor: None,
+            })
+        );
+    }
+
+    #[test]
+    fn compatible_device_stage() {
+        assert_eq!(
+            context_at("/ {\n    node {\n        compatible = \"ti,\n", "\"ti,"),
+            Some(Context::Compatible {
+                prefix: String::new(),
+                vendor: Some("ti".to_string()),
+            })
+        );
+        assert_eq!(
+            context_at("/ {\n    node {\n        compatible = \"ti,am\n", "\"ti,am"),
+            Some(Context::Compatible {
+                prefix: "am".to_string(),
+                vendor: Some("ti".to_string()),
+            })
+        );
+        // second string of a multi-compatible stays in device context
+        assert_eq!(
+            context_at(
+                "/ {\n    node {\n        compatible = \"ti,x\", \"\n",
+                "\", \""
+            ),
+            Some(Context::Compatible {
+                prefix: String::new(),
+                vendor: None,
+            })
+        );
+    }
+
+    #[test]
+    fn compatible_context_is_suppressed_for_endpoints_and_other_properties() {
+        let endpoint = "/ {\n    ports {\n        port {\n            endpoint {\n                compatible = \"\n";
+        assert_eq!(context_at(endpoint, "\""), None);
+        assert_eq!(context_at("/ {\n    node {\n        status = \"ok\n", "\"ok"), None);
+    }
+
+    #[test]
+    fn compatible_property_item_is_a_snippet() {
+        let Some(item) = compatible_property_item("") else {
+            panic!("no item");
+        };
+        assert_eq!(item.label, "compatible");
+        assert_eq!(item.insert_text.as_deref(), Some("compatible = \"$0\""));
+        assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        assert!(compatible_property_item("comp").is_some());
+        assert!(compatible_property_item("reg").is_none());
     }
 
     #[test]

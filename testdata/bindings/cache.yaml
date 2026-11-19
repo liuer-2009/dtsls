@@ -1,0 +1,18 @@
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/cache.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Test cache controller
+
+maintainers:
+  - Test <test@example.com>
+
+properties:
+  compatible:
+    const: cache
+
+  cache-size:
+    description: cache size in bytes
+
+additionalProperties: true

@@ -190,7 +190,11 @@ impl LanguageServer for Backend {
                 TextDocumentSyncKind::INCREMENTAL,
             )),
             completion_provider: Some(CompletionOptions {
-                trigger_characters: Some(vec!["&".to_string(), "<".to_string()]),
+                trigger_characters: Some(vec![
+                    "&".to_string(),
+                    "<".to_string(),
+                    "\"".to_string(),
+                ]),
                 resolve_provider: Some(false),
                 ..Default::default()
             }),
@@ -343,7 +347,61 @@ impl LanguageServer for Backend {
                     .unwrap_or_default(),
                 completion::Context::Properties(prefix) => {
                     let byte = util::position_to_byte(&doc.rope, position);
-                    property_items(doc, byte, &prefix, &self.bindings)
+                    let mut items = property_items(doc, byte, &prefix, &self.bindings);
+                    // any node may get a `compatible` unless it already has
+                    // one (or is endpoint/port plumbing)
+                    if node_can_take_compatible(doc, byte)
+                        && let Some(item) = completion::compatible_property_item(&prefix)
+                    {
+                        items.push(item);
+                    }
+                    items
+                }
+                completion::Context::Compatible { prefix, vendor } => {
+                    let byte = util::position_to_byte(&doc.rope, position);
+                    // replace everything typed inside the quotes so far; if the
+                    // cursor sits mid-string, replace up to the closing quote
+                    let line_start =
+                        doc.rope.line_to_byte(doc.rope.byte_to_line(byte));
+                    let head = doc.slice(line_start..byte);
+                    let quote_start = head
+                        .rfind('"')
+                        .map(|offset| line_start + offset + 1)
+                        .unwrap_or(byte);
+                    let line_end = doc
+                        .rope
+                        .line_to_byte(doc.rope.byte_to_line(byte) + 1)
+                        .min(doc.rope.len_bytes());
+                    let tail = doc.slice(byte..line_end);
+                    let end = tail
+                        .find('"')
+                        .map(|offset| byte + offset)
+                        .unwrap_or(byte);
+                    let range = Range {
+                        start: util::byte_to_position(&doc.rope, quote_start),
+                        end: util::byte_to_position(&doc.rope, end),
+                    };
+                    match vendor {
+                        None => {
+                            let mut items = completion::vendor_completion_items(
+                                self.bindings.compatible_vendors(),
+                                &prefix,
+                                &range,
+                            );
+                            items.extend(completion::vendor_less_items(
+                                self.bindings.vendor_less_compatibles(),
+                                &prefix,
+                                &range,
+                            ));
+                            items.sort_by(|a, b| a.label.cmp(&b.label));
+                            items
+                        }
+                        Some(vendor) => completion::device_completion_items(
+                            self.bindings.compatible_devices(&vendor),
+                            &prefix,
+                            &range,
+                        ),
+                    }
                 }
             }
         };
@@ -517,6 +575,18 @@ fn property_items(
         }
     }
     completion::items_from_binding(&binding, &existing, prefix)
+}
+
+/// `compatible` may be added to any node that does not already have one,
+/// except endpoint/port plumbing.
+fn node_can_take_compatible(doc: &Document, byte: usize) -> bool {
+    if completion::in_endpoint_or_port(doc, byte) {
+        return false;
+    }
+    let Some(node) = completion::enclosing_node(doc, byte) else {
+        return false;
+    };
+    diagnostics::compatible_strings(doc, node).is_none()
 }
 
 #[cfg(test)]

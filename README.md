@@ -74,6 +74,12 @@ cargo build --release
 - **M3: property completion** — typing a property name inside a node whose
   `compatible` has a binding suggests that binding's properties (required
   ones first, already-present ones dropped); value positions never trigger
+- **M3: `compatible` completion** — typing a property name also offers
+  `compatible = ""` (snippet, cursor between the quotes) on any node that does
+  not have one; inside the string the server offers vendors first (`qcom`,
+  `ti`, … plus vendor-less compatibles such as `operating-points-v2`), and
+  after `vendor,` that vendor's devices. Endpoint/port nodes are skipped.
+  Lists come straight from the binding scan (in-memory, no I/O on the path)
 
 ## Test
 
@@ -81,6 +87,7 @@ cargo build --release
 cargo test                          # unit tests (incl. testdata fixtures)
 cargo test -- --ignored             # parses a real kernel dtsi (path baked in test)
 python3 scripts/smoke_test.py       # end-to-end LSP session over stdio
+python3 scripts/compat_test.py      # two-stage compatible completion
 python3 scripts/diagnostics_test.py # broken/valid fixtures -> publishDiagnostics
 python3 scripts/bench.py            # state update / jump / completion latencies
 python3 scripts/bench_real.py /path/to/soc.dtsi   # real-world parse timing
