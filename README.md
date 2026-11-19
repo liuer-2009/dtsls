@@ -39,8 +39,11 @@ cargo build --release
   a `.dtsi` opened on its own is treated as a standalone dts with its own
   closure. Opening a board later adopts standalone documents that it includes.
   Diagnostics are only published into documents analysed in that context.
-  At most 8 contexts keep their unit and preprocessed snapshot; the least
-  recently used one is evicted (open documents and the active board are never
+  Binding checks wait for the background binding scan, and every open document
+  is re-diagnosed and republished when the scan finishes (the active document
+  first, the rest computed in parallel); the workspace scan runs after that so
+  the refresh is not competing for CPU. At most 8 contexts keep their unit and
+  preprocessed snapshot; the least recently used one is evicted (open documents and the active board are never
   evicted) and re-analysed when it is next used.
 - **`#include` links** — include paths are document links, so "go to file" on
   an include lands in the included source with the board still active
@@ -135,6 +138,7 @@ python3 scripts/tu_test.py          # cross-file checks via cpp + line markers
 python3 scripts/diagnostics_test.py # broken/valid fixtures -> publishDiagnostics
 python3 scripts/bench.py            # state update / jump / completion latencies
 python3 scripts/bench_rate.py       # throughput: ops per fixed >=100 ms window
+python3 scripts/bench_startup.py    # binding scan -> refreshed diagnostics gap
 python3 scripts/bench_real.py /path/to/soc.dtsi   # real-world parse timing
 ```
 

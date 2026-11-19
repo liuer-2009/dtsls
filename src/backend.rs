@@ -52,6 +52,9 @@ pub struct Backend {
     /// Analysis context per open document (the board root, or the file itself
     /// when it is opened as a standalone dts).
     doc_context: Arc<RwLock<HashMap<Url, PathBuf>>>,
+    /// Most recently opened/edited document: refreshed diagnostics for it are
+    /// published first after the binding scan.
+    last_active: Arc<RwLock<Option<Url>>>,
     /// Live-buffer labels per document version (analysing the tree on every
     /// completion request costs milliseconds on large files).
     same_file_labels: Arc<RwLock<HashMap<Url, (i32, Arc<Vec<CompletionItem>>)>>>,
@@ -73,6 +76,7 @@ impl Backend {
             binding_lines: Arc::new(RwLock::new(HashMap::new())),
             active_board: RwLock::new(None),
             doc_context: Arc::new(RwLock::new(HashMap::new())),
+            last_active: Arc::new(RwLock::new(None)),
             same_file_labels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -241,6 +245,7 @@ impl Backend {
         let pending = Arc::clone(&self.tu_pending);
         let workspace = Arc::clone(&self.workspace);
         let doc_context = Arc::clone(&self.doc_context);
+        let last_active = Arc::clone(&self.last_active);
         let include_dirs = self.include_dirs();
         let client = self.client.clone();
         let task_root = root_uri.clone();
@@ -306,10 +311,14 @@ impl Backend {
             let per_file = output.per_file;
             let root_canonical = std::fs::canonicalize(&publish_root)
                 .unwrap_or_else(|_| publish_root.clone());
-            let open_docs: Vec<(Url, i32)> = {
+            let mut open_docs: Vec<(Url, i32)> = {
                 let docs = documents.read().unwrap();
                 docs.iter().map(|(uri, doc)| (uri.clone(), doc.version)).collect()
             };
+            let active = last_active.read().unwrap().clone();
+            if let Some(active) = active {
+                open_docs.sort_by_key(|(uri, _)| uri != &active);
+            }
             for (uri, version) in open_docs {
                 let in_context = {
                     let contexts = doc_context.read().unwrap();
@@ -714,28 +723,108 @@ impl LanguageServer for Backend {
             let diag_cache = Arc::clone(&self.diag_cache);
             let file_diags = Arc::clone(&self.file_diags);
             let tu_file_diags = Arc::clone(&self.tu_file_diags);
+            let last_active = Arc::clone(&self.last_active);
+            let workspace = Arc::clone(&self.workspace);
+            let scan_roots = self.root_dirs.read().unwrap().clone();
             tokio::spawn(async move {
+                let scan_started = std::time::Instant::now();
                 let scan_bindings = Arc::clone(&bindings);
                 let _ = tokio::task::spawn_blocking(move || {
                     bindings::scan(&scan_bindings, &dir);
                 })
                 .await;
-                let computed: Vec<(Url, i32, Vec<Diagnostic>)> = {
+                let scan_us = scan_started.elapsed().as_micros() as u64;
+                let entries: Vec<(Url, i32)> = {
                     let docs = documents.read().unwrap();
-                    docs.iter()
-                        .map(|(uri, doc)| {
-                            let diags = diagnostics::all_cached(
+                    docs.iter().map(|(uri, doc)| (uri.clone(), doc.version)).collect()
+                };
+                let active = last_active.read().unwrap().clone();
+                let publish_started = std::time::Instant::now();
+                let mut docs = 0usize;
+                let mut diagnostics = 0usize;
+                let mut active_us = 0u64;
+
+                // the active document first: it is what the editor shows
+                let mut rest = entries;
+                if let Some(active) = active.clone()
+                    && let Some(position) = rest.iter().position(|(uri, _)| *uri == active)
+                {
+                    let (uri, version) = rest.remove(position);
+                    let active_started = std::time::Instant::now();
+                    let diags = {
+                        let docs = documents.read().unwrap();
+                        match docs.get(&uri) {
+                            Some(doc) => diagnostics::all_cached(
                                 doc,
                                 uri.to_file_path().ok().as_deref(),
                                 &include_dirs,
                                 &bindings,
                                 &issues,
                                 &diag_cache,
-                            );
-                            (uri.clone(), doc.version, diags)
+                            ),
+                            None => Vec::new(),
+                        }
+                    };
+                    active_us = active_started.elapsed().as_micros() as u64;
+                    file_diags.write().unwrap().insert(uri.clone(), diags.clone());
+                    let mut merged = diags;
+                    let structural = tu_file_diags
+                        .read()
+                        .unwrap()
+                        .get(&uri)
+                        .cloned()
+                        .unwrap_or_default();
+                    merge_extra(&mut merged, structural);
+                    diagnostics += merged.len();
+                    docs += 1;
+                    client
+                        .publish_diagnostics(uri, merged, Some(version))
+                        .await;
+                }
+
+                let compute_started = std::time::Instant::now();
+                let computed: Vec<(Url, i32, Vec<Diagnostic>)> = {
+                    let docs_guard = documents.read().unwrap();
+                    let entries: Vec<(&Url, i32, &Document)> = rest
+                        .iter()
+                        .filter_map(|(uri, version)| {
+                            docs_guard.get(uri).map(|doc| (uri, *version, doc))
                         })
-                        .collect()
+                        .collect();
+                    let workers = std::thread::available_parallelism()
+                        .map(|count| count.get())
+                        .unwrap_or(4)
+                        .min(entries.len().max(1));
+                    let chunk = entries.len().div_ceil(workers).max(1);
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = entries
+                            .chunks(chunk)
+                            .map(|slice| {
+                                scope.spawn(|| {
+                                    slice
+                                        .iter()
+                                        .map(|(uri, version, doc)| {
+                                            let diags = diagnostics::all_cached(
+                                                doc,
+                                                uri.to_file_path().ok().as_deref(),
+                                                &include_dirs,
+                                                &bindings,
+                                                &issues,
+                                                &diag_cache,
+                                            );
+                                            ((*uri).clone(), *version, diags)
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .flat_map(|handle| handle.join().expect("diagnostics worker"))
+                            .collect()
+                    })
                 };
+                let compute_us = compute_started.elapsed().as_micros() as u64;
                 for (uri, version, diags) in computed {
                     file_diags
                         .write()
@@ -749,18 +838,34 @@ impl LanguageServer for Backend {
                         .cloned()
                         .unwrap_or_default();
                     merge_extra(&mut merged, structural);
+                    diagnostics += merged.len();
+                    docs += 1;
                     client
                         .publish_diagnostics(uri, merged, Some(version))
                         .await;
                 }
+                debug!(
+                    scan_us,
+                    active_us,
+                    compute_us,
+                    refresh_us = publish_started.elapsed().as_micros() as u64,
+                    docs,
+                    diagnostics,
+                    "bindings ready; diagnostics refreshed"
+                );
+                // workspace scan after the refresh: running both at once just
+                // makes the first post-scan diagnostics slower
+                let _ = tokio::task::spawn_blocking(move || {
+                    workspace.scan(&scan_roots, &scan_roots);
+                })
+                .await;
             });
+        } else {
+            // no binding scan: go straight to the workspace scan
+            let workspace = Arc::clone(&self.workspace);
+            let scan_roots = self.root_dirs.read().unwrap().clone();
+            tokio::task::spawn_blocking(move || workspace.scan(&scan_roots, &scan_roots));
         }
-        // Background workspace scan: `.dts` roots plus the include graph, so a
-        // file can be mapped to the boards that contain it. Only `#include`
-        // lines are read; parsing happens per unit when a board is checked.
-        let workspace = Arc::clone(&self.workspace);
-        let scan_roots = self.root_dirs.read().unwrap().clone();
-        tokio::task::spawn_blocking(move || workspace.scan(&scan_roots, &scan_roots));
         let capabilities = ServerCapabilities {
             position_encoding: Some(PositionEncodingKind::UTF16),
             text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -825,6 +930,7 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let td = params.text_document;
         info!(uri = %td.uri, version = td.version, bytes = td.text.len(), "did_open");
+        *self.last_active.write().unwrap() = Some(td.uri.clone());
         let path = td.uri.to_file_path().ok();
         let is_board = path
             .as_ref()
@@ -901,6 +1007,7 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let started = std::time::Instant::now();
         let uri = params.text_document.uri;
+        *self.last_active.write().unwrap() = Some(uri.clone());
         let tu_roots = self.analysis_roots(&uri);
         let (diags, version) = {
             let mut docs = self.documents.write().unwrap();
@@ -1573,5 +1680,67 @@ mod tu_bench {
         let t = std::time::Instant::now();
         let _ = tu_data(&unit, &doc);
         println!("names after edit: {:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod refresh_bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_refresh_parallel() {
+        let files = [
+            "/linux-7.2.2/arch/arm64/boot/dts/qcom/sm8650.dtsi",
+            "/linux-7.2.2/arch/arm64/boot/dts/qcom/hamoa.dtsi",
+            "/linux-7.2.2/arch/arm64/boot/dts/qcom/agatti.dtsi",
+            "/linux-7.2.2/arch/arm64/boot/dts/qcom/sm8650-qrd.dts",
+        ];
+        let docs: Vec<(Url, Document)> = files
+            .iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(path).unwrap();
+                (Url::from_file_path(path).unwrap(), Document::open(&text, 0))
+            })
+            .collect();
+        let bindings = Arc::new(BindingIndex::default());
+        bindings::scan(&bindings, std::path::Path::new("/linux-7.2.2/Documentation/devicetree/bindings"));
+        let issues = Vec::new();
+
+        let run = |parallel: bool| {
+            let cache = Arc::new(diagnostics::DiagCache::default());
+            let started = std::time::Instant::now();
+            let compute = |(uri, doc): &(Url, Document)| {
+                diagnostics::all_cached(
+                    doc,
+                    uri.to_file_path().ok().as_deref(),
+                    &[],
+                    &bindings,
+                    &issues,
+                    &cache,
+                )
+            };
+            if parallel {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = docs
+                        .iter()
+                        .map(|entry| scope.spawn(|| compute(entry)))
+                        .collect();
+                    for handle in handles {
+                        let _ = handle.join().unwrap();
+                    }
+                });
+            } else {
+                for entry in &docs {
+                    let _ = compute(entry);
+                }
+            }
+            started.elapsed()
+        };
+        // warm the page cache / binding caches
+        let _ = run(false);
+        let serial = run(false);
+        let parallel = run(true);
+        println!("refresh serial: {serial:?}, parallel: {parallel:?}");
     }
 }
