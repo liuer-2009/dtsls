@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result;
+use tower_lsp::lsp_types::request::{GotoDeclarationParams, GotoDeclarationResponse};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, info, warn};
@@ -41,6 +42,8 @@ pub struct Backend {
     file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Coalesced translation-unit re-runs, per root.
     tu_pending: Arc<RwLock<HashMap<Url, u64>>>,
+    /// Line of `compatible:` per binding file (go-to-binding target).
+    binding_lines: Arc<RwLock<HashMap<Url, u32>>>,
     /// Board whose unit is the active analysis context (dts-lsp's
     /// `activeContext`): a file included by it is analysed in its context.
     active_board: RwLock<Option<PathBuf>>,
@@ -64,6 +67,7 @@ impl Backend {
             diag_cache: diagnostics::DiagCache::default(),
             file_diags: Arc::new(RwLock::new(HashMap::new())),
             tu_pending: Arc::new(RwLock::new(HashMap::new())),
+            binding_lines: Arc::new(RwLock::new(HashMap::new())),
             active_board: RwLock::new(None),
             doc_context: Arc::new(RwLock::new(HashMap::new())),
             same_file_labels: Arc::new(RwLock::new(HashMap::new())),
@@ -710,6 +714,7 @@ impl LanguageServer for Backend {
                 work_done_progress_options: WorkDoneProgressOptions::default(),
             }),
             definition_provider: Some(OneOf::Left(true)),
+            declaration_provider: Some(DeclarationCapability::Simple(true)),
             references_provider: Some(OneOf::Left(true)),
             inlay_hint_provider: Some(OneOf::Left(true)),
             document_symbol_provider: Some(OneOf::Left(true)),
@@ -987,6 +992,25 @@ impl LanguageServer for Backend {
         Ok(response)
     }
 
+    async fn goto_declaration(
+        &self,
+        params: GotoDeclarationParams,
+    ) -> Result<Option<GotoDeclarationResponse>> {
+        let started = std::time::Instant::now();
+        let response = self
+            .location(
+                &params.text_document_position_params.text_document.uri,
+                params.text_document_position_params.position,
+            )
+            .map(GotoDeclarationResponse::Scalar);
+        debug!(
+            found = response.is_some(),
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "declaration"
+        );
+        Ok(response)
+    }
+
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -1118,43 +1142,80 @@ impl Backend {
     fn definition(&self, params: GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        self.location(&uri, position)
+            .map(GotoDefinitionResponse::Scalar)
+    }
+
+    fn location(&self, uri: &Url, position: Position) -> Option<Location> {
         let docs = self.documents.read().unwrap();
-        let doc = docs.get(&uri)?;
+        let doc = docs.get(uri)?;
         let byte = util::position_to_byte(&doc.rope, position);
         if let Some(label) = completion::label_at_cursor(doc, byte) {
             if let Some(data) = self.unit_for(&uri)
                 && let Some(def) = data.labels.get(&label)
                 && let Ok(target) = Url::from_file_path(&def.file)
             {
-                return Some(GotoDefinitionResponse::Scalar(Location {
+                return Some(Location {
                     uri: target,
                     range: def.range,
-                }));
+                });
             }
             let range = completion::label_definition(doc, &label)?;
-            return Some(GotoDefinitionResponse::Scalar(Location {
+            return Some(Location {
                 uri: uri.clone(),
                 range,
-            }));
+            });
         }
-        // not on a label: jump to the binding of the enclosing node
-        let node = doc.tree.root_node().descendant_for_byte_range(byte, byte)?;
-        let subnode = enclosing_node(node)?;
-        let compatibles = node_compatibles(doc, subnode)?;
+        // not on a label: jump to the binding of the enclosing node. A
+        // half-written node may not have a usable tree, so fall back to the
+        // text reader (same one property completion uses).
+        let compatibles = completion::enclosing_node(doc, byte)
+            .and_then(|subnode| node_compatibles(doc, subnode))
+            .filter(|list| !list.is_empty())
+            .or_else(|| {
+                completion::text_node(doc, byte)
+                    .map(|node| node.compatibles)
+                    .filter(|list| !list.is_empty())
+            })?;
         let binding = self.bindings.lookup(&compatibles)?;
-        Some(GotoDefinitionResponse::Scalar(Location {
+        let line = self.binding_line(&binding.uri);
+        Some(Location {
             uri: binding.uri.clone(),
             range: Range {
                 start: Position {
-                    line: 0,
+                    line,
                     character: 0,
                 },
                 end: Position {
-                    line: 0,
+                    line,
                     character: 0,
                 },
             },
-        }))
+        })
+    }
+
+    /// Line of the `compatible:` property in a binding file (the jump target
+    /// inside the YAML; cached per binding file).
+    fn binding_line(&self, uri: &Url) -> u32 {
+        if let Some(line) = self.binding_lines.read().unwrap().get(uri) {
+            return *line;
+        }
+        let line = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| {
+                text.lines().position(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.starts_with("compatible:") && !trimmed.starts_with("compatible: true")
+                })
+            })
+            .unwrap_or(0) as u32;
+        self.binding_lines
+            .write()
+            .unwrap()
+            .insert(uri.clone(), line);
+        line
     }
 }
 

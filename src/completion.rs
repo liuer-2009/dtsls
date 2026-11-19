@@ -119,7 +119,12 @@ fn compatible_context(doc: &Document, cursor: usize) -> Option<Context> {
 
 /// Enclosing `subnode` or root `devicetree` of the cursor position.
 pub fn enclosing_node(doc: &Document, byte: usize) -> Option<Node<'_>> {
-    let node = doc.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    // a zero-width lookup at a line end or inside whitespace falls back to the
+    // root, so probe the byte before the cursor
+    let node = doc
+        .tree
+        .root_node()
+        .descendant_for_byte_range(byte.saturating_sub(1), byte)?;
     let mut current = Some(node);
     while let Some(node) = current {
         match node.kind() {

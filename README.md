@@ -106,7 +106,9 @@ cargo build --release
   ~200 ms after typing pauses; the preprocessed text is reparsed incrementally. On a 200 KB dtsi an edit plus its full
   diagnostics takes ~2 ms server-side (~440 edits/s end to end, 1 s window).
 - **M3: goto binding** — with the cursor on a node (not on a label), `gd`
-  jumps to the YAML binding of the node's `compatible`
+  (definition) and `gD` (declaration) jump to the YAML binding of the node's
+  `compatible`, landing on its `compatible:` property. Half-written nodes work
+  too (the text reader supplies the compatible list when the tree is broken)
 - **M3: property completion** — typing a property name inside a node whose
   `compatible` has a binding suggests that binding's properties (required
   ones first, already-present ones dropped); value positions never trigger.
