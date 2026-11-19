@@ -122,6 +122,7 @@ name = "dtsls"
 version = "0.1.0"
 dependencies = [
  "dashmap 6.2.1",
+ "memchr",
  "regex",
  "ropey",
  "rustc-hash",

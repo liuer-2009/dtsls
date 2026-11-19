@@ -131,7 +131,7 @@ pub fn enclosing_node(doc: &Document, byte: usize) -> Option<Node<'_>> {
 }
 
 /// `endpoint` / `port` nodes (and their `@addr` variants).
-fn is_endpoint_or_port(doc: &Document, node: Node<'_>) -> bool {
+pub fn is_endpoint_or_port(doc: &Document, node: Node<'_>) -> bool {
     let Some(name) = node.child_by_field_name("name") else {
         return false;
     };
@@ -141,61 +141,401 @@ fn is_endpoint_or_port(doc: &Document, node: Node<'_>) -> bool {
 }
 
 /// Whether the node enclosing the cursor is `endpoint`/`port` plumbing.
-/// Falls back to a line scan when syntax errors collapse the tree into a
-/// single ERROR node — the normal state while a string is being typed.
+/// Falls back to the raw text when syntax errors collapse the tree into a
+/// single ERROR node — the normal state while a node is half-written.
 pub fn in_endpoint_or_port(doc: &Document, byte: usize) -> bool {
-    match enclosing_node(doc, byte) {
-        Some(node) if node.kind() == "subnode" => is_endpoint_or_port(doc, node),
-        _ => match line_scanned_node_name(doc, byte) {
-            Some(name) => {
-                let base = name.split('@').next().unwrap_or(&name);
-                base == "endpoint" || base == "port"
-            }
-            None => false,
-        },
+    if let Some(node) = enclosing_node(doc, byte) {
+        if node.kind() == "subnode" {
+            return is_endpoint_or_port(doc, node);
+        }
+    }
+    let Some(header) = text_header(doc, byte) else {
+        return false;
+    };
+    let base = header.name.split('@').next().unwrap_or(&header.name);
+    base == "endpoint" || base == "port"
+}
+
+/// A node read straight from the text. Needed because tree-sitter's error
+/// recovery only inserts `MISSING` nodes while the surrounding skeleton still
+/// matches the grammar; a half-written node (no `;`, no closing brace) makes
+/// the whole region a single ERROR node with no `subnode`/`node_def` inside.
+pub struct TextNode {
+    pub name: String,
+    pub compatibles: Vec<String>,
+    pub properties: Vec<String>,
+}
+
+impl TextNode {
+    /// `endpoint`/`port` plumbing never carries `compatible`.
+    pub fn is_endpoint_or_port(&self) -> bool {
+        let base = self.name.split('@').next().unwrap_or(&self.name);
+        base == "endpoint" || base == "port"
     }
 }
 
-/// Innermost open node name at the cursor line, from brace counting. Only
-/// used to recognise `endpoint`/`port`, so comment/string noise is tolerable.
-fn line_scanned_node_name(doc: &Document, byte: usize) -> Option<String> {
-    let last_line = doc.rope.byte_to_line(byte.min(doc.rope.len_bytes()));
-    let mut stack: Vec<String> = Vec::new();
-    let mut buf = String::new();
-    for line in 0..=last_line {
-        let start = doc.rope.line_to_byte(line);
-        let end = if line + 1 < doc.rope.len_lines() {
-            doc.rope.line_to_byte(line + 1)
-        } else {
-            doc.rope.len_bytes()
-        };
-        buf.clear();
-        buf.push_str(&doc.slice(start..end));
-        let code = buf.split("//").next().unwrap_or("").trim();
-        let opens = code.matches('{').count();
-        let closes = code.matches('}').count();
-        if opens > 0 {
-            let name = code
-                .split('{')
-                .next()
-                .unwrap_or("")
-                .rsplit(':')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .split_whitespace()
-                .next_back()
-                .unwrap_or("")
-                .to_string();
-            for _ in 0..opens {
-                stack.push(name.clone());
+struct TextHeader {
+    name: String,
+    content_start: usize,
+    content_end: usize,
+}
+
+/// `compatible` strings and property names of the node around `byte`, from
+/// the raw text.
+pub fn text_node(doc: &Document, byte: usize) -> Option<TextNode> {
+    let header = text_header(doc, byte)?;
+    let (properties, compatibles) =
+        block_properties(&doc.text, header.content_start, header.content_end);
+    Some(TextNode {
+        name: header.name,
+        compatibles,
+        properties,
+    })
+}
+
+fn text_header(doc: &Document, byte: usize) -> Option<TextHeader> {
+    let text = &doc.text;
+    let cursor = byte.min(text.len());
+    let (open, block_end) = enclosing_brace(text.as_bytes(), cursor)?;
+    let mut name = header_name(text, open);
+    let mut content_start = open + 1;
+    let mut content_end = block_end;
+    let open_indent = line_indent_at(text, open);
+    if let Some((braceless, indent, line_end)) = braceless_header(text, open, cursor, open_indent) {
+        name = braceless;
+        content_start = line_end;
+        content_end = indent_bound(text, line_end, indent, block_end);
+    }
+    Some(TextHeader {
+        name,
+        content_start,
+        content_end,
+    })
+}
+
+/// Innermost brace still open at `cursor`, plus the byte where its block ends
+/// (the closing brace, or EOF when it is missing). Runs over a whole 200 KB
+/// file: the special bytes are collected with vectorized scans first so the
+/// per-token work is a handful of comparisons.
+fn enclosing_brace(bytes: &[u8], cursor: usize) -> Option<(usize, usize)> {
+    let len = bytes.len();
+    let opens: Vec<usize> = memchr::memchr_iter(b'{', bytes).collect();
+    let closes: Vec<usize> = memchr::memchr_iter(b'}', bytes).collect();
+    let quotes: Vec<usize> = memchr::memchr_iter(b'"', bytes).collect();
+    let slashes: Vec<usize> = memchr::memchr_iter(b'/', bytes).collect();
+    let (mut oi, mut ci, mut qi, mut si) = (0, 0, 0, 0);
+    let mut stack: Vec<usize> = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut target_depth = 0;
+    loop {
+        let mut next = len;
+        if oi < opens.len() {
+            next = next.min(opens[oi]);
+        }
+        if ci < closes.len() {
+            next = next.min(closes[ci]);
+        }
+        if qi < quotes.len() {
+            next = next.min(quotes[qi]);
+        }
+        if si < slashes.len() {
+            next = next.min(slashes[si]);
+        }
+        if next >= len {
+            break;
+        }
+        // record the stack as of the cursor before a token at/after it
+        if open.is_none() && next >= cursor {
+            open = stack.last().copied();
+            if open.is_none() {
+                return None;
+            }
+            target_depth = stack.len();
+        }
+        if oi < opens.len() && opens[oi] == next {
+            stack.push(next);
+            oi += 1;
+        } else if ci < closes.len() && closes[ci] == next {
+            stack.pop();
+            ci += 1;
+            if open.is_some() && stack.len() < target_depth {
+                return Some((open.unwrap(), next));
+            }
+        } else if qi < quotes.len() && quotes[qi] == next {
+            // skip the string: its closing quote is the next unescaped one
+            let mut string_end = len;
+            qi += 1;
+            while qi < quotes.len() {
+                let quote = quotes[qi];
+                qi += 1;
+                if !escaped(bytes, quote) {
+                    string_end = quote;
+                    break;
+                }
+            }
+            // slashes and braces inside the string are not syntax
+            while oi < opens.len() && opens[oi] < string_end {
+                oi += 1;
+            }
+            while ci < closes.len() && closes[ci] < string_end {
+                ci += 1;
+            }
+            while si < slashes.len() && slashes[si] < string_end {
+                si += 1;
+            }
+        } else if si < slashes.len() && slashes[si] == next {
+            let slash = next;
+            si += 1;
+            let skip_to = if slash + 1 < len && bytes[slash + 1] == b'*' {
+                memchr::memmem::find(&bytes[slash + 2..], b"*/")
+                    .map(|offset| slash + 2 + offset + 2)
+                    .unwrap_or(len)
+            } else if slash + 1 < len && bytes[slash + 1] == b'/' {
+                memchr::memchr(b'\n', &bytes[slash..])
+                    .map(|offset| slash + offset + 1)
+                    .unwrap_or(len)
+            } else {
+                slash + 1
+            };
+            while oi < opens.len() && opens[oi] < skip_to {
+                oi += 1;
+            }
+            while ci < closes.len() && closes[ci] < skip_to {
+                ci += 1;
+            }
+            while qi < quotes.len() && quotes[qi] < skip_to {
+                qi += 1;
+            }
+            while si < slashes.len() && slashes[si] < skip_to {
+                si += 1;
             }
         }
-        for _ in 0..closes {
-            stack.pop();
+    }
+    // no token at or after the cursor: the stack as of EOF is the answer
+    if open.is_none() {
+        open = Some(stack.last().copied()?);
+    }
+    open.map(|open| (open, len))
+}
+
+fn escaped(bytes: &[u8], index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut i = index;
+    while i > 0 && bytes[i - 1] == b'\\' {
+        backslashes += 1;
+        i -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+fn header_name(text: &str, brace: usize) -> String {
+    let line_start = text[..brace].rfind('\n').map_or(0, |pos| pos + 1);
+    let before = text[line_start..brace].trim();
+    let raw = if before.is_empty() {
+        // `{` on its own line: the header is the previous non-empty line
+        text[..line_start]
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+    } else {
+        before
+    };
+    node_name_from_header(raw)
+}
+
+fn node_name_from_header(header: &str) -> String {
+    // drop labels (`label: node@addr`) and the trailing markers
+    header.rsplit(':').next().unwrap_or(header).trim().to_string()
+}
+
+fn line_indent_at(text: &str, byte: usize) -> usize {
+    let line_start = text[..byte.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |pos| pos + 1);
+    indent_of(&text[line_start..])
+}
+
+fn indent_of(line: &str) -> usize {
+    let mut indent = 0;
+    for c in line.chars() {
+        match c {
+            '\t' => indent += 8 - (indent % 8),
+            ' ' => indent += 1,
+            _ => break,
         }
     }
-    stack.pop()
+    indent
+}
+
+/// A node header written without its `{` yet, deeper than the enclosing block.
+fn braceless_header(
+    text: &str,
+    open: usize,
+    cursor: usize,
+    open_indent: usize,
+) -> Option<(String, usize, usize)> {
+    let mut pos = text[open..].find('\n').map(|offset| open + offset + 1)?;
+    // the line being typed is a partial property, never a header
+    let cursor_line_start = text[..cursor.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let mut found = None;
+    while pos < cursor_line_start {
+        let line_end = text[pos..]
+            .find('\n')
+            .map_or(text.len(), |offset| pos + offset);
+        let line = &text[pos..line_end];
+        let trimmed = line.trim();
+        let looks_like_header = !trimmed.is_empty()
+            && !trimmed.contains('=')
+            && !trimmed.contains(';')
+            && !trimmed.contains('{')
+            && !trimmed.contains('}')
+            && !trimmed.starts_with('#')
+            && trimmed
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '&' || c == '_' || c == '/')
+            && indent_of(line) > open_indent;
+        if looks_like_header {
+            found = Some((node_name_from_header(trimmed), indent_of(line), line_end));
+        }
+        if line_end >= text.len() {
+            break;
+        }
+        pos = line_end + 1;
+    }
+    found
+}
+
+/// End of a brace-less node: the first following line indented at or above
+/// its header.
+fn indent_bound(text: &str, start: usize, indent: usize, block_end: usize) -> usize {
+    let mut pos = start;
+    while pos < block_end {
+        let line_end = text[pos..]
+            .find('\n')
+            .map_or(text.len(), |offset| pos + offset);
+        let line = &text[pos..line_end];
+        if !line.trim().is_empty() && indent_of(line) <= indent {
+            return pos;
+        }
+        pos = line_end + 1;
+    }
+    block_end
+}
+
+/// Top-level properties of a block: names in order, plus the `compatible`
+/// strings. Statements may lack their terminating `;` (mid-typing).
+fn block_properties(text: &str, start: usize, end: usize) -> (Vec<String>, Vec<String>) {
+    let bytes = text.as_bytes();
+    let end = end.min(bytes.len());
+    let mut properties = Vec::new();
+    let mut compatibles = Vec::new();
+    let mut depth = 0i32;
+    let mut in_comment = false;
+    let mut in_string = false;
+    let mut i = start;
+    let mut chunk_start = start;
+    let mut take_chunk = |from: usize, to: usize| {
+        let chunk = &text[from..to];
+        let Some(equals) = chunk.find('=') else {
+            return;
+        };
+        let name = chunk[..equals].trim();
+        let name = name.split_whitespace().next_back().unwrap_or("");
+        if name.is_empty()
+            || !name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '#' || c == '_' || c == '-')
+        {
+            return;
+        }
+        properties.push(name.to_string());
+        if name == "compatible" {
+            collect_strings(&chunk[equals + 1..], &mut compatibles);
+        }
+    };
+    while i < end {
+        let b = bytes[i];
+        if in_comment {
+            if b == b'*' && i + 1 < end && bytes[i + 1] == b'/' {
+                in_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'/' if i + 1 < end && bytes[i + 1] == b'*' => {
+                in_comment = true;
+                i += 2;
+            }
+            b'/' if i + 1 < end && bytes[i + 1] == b'/' => {
+                while i < end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'{' => {
+                if depth == 0 {
+                    // nested node starts here; its header is not a property
+                    take_chunk(chunk_start, i);
+                    chunk_start = i + 1;
+                }
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    chunk_start = i;
+                }
+            }
+            b';' if depth == 0 => {
+                take_chunk(chunk_start, i);
+                chunk_start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    take_chunk(chunk_start, end);
+    (properties, compatibles)
+}
+
+fn collect_strings(value: &str, out: &mut Vec<String>) {
+    let mut rest = value;
+    while let Some(start) = rest.find('"') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('"') else {
+            return;
+        };
+        if end > 0 {
+            out.push(rest[..end].to_string());
+        }
+        rest = &rest[end + 1..];
+    }
 }
 
 /// Property-name item that expands to `compatible = ""` with the cursor
@@ -510,6 +850,67 @@ mod tests {
     }
 
     #[test]
+    fn text_node_reads_half_written_nodes() {
+        // no `;`, no closing braces at all
+        let text = "/dts-v1/;\n\n/ {\n    node@1000 {\n        compatible = \"acme,widget\"\n        re\n";
+        let byte = text.rfind("re\n").unwrap() + 2;
+        let node = text_node(&Document::open(text, 0), byte).expect("no text node");
+        assert_eq!(node.compatibles, vec!["acme,widget"]);
+        assert!(node.properties.contains(&"compatible".to_string()));
+
+        // nested node: the inner one wins, even when outer has a compatible
+        let nested = "/dts-v1/;\n\n/ {\n    outer {\n        compatible = \"acme,widget\";\n        inner {\n            comp\n";
+        let byte = nested.rfind("comp").unwrap() + 4;
+        let node = text_node(&Document::open(nested, 0), byte).expect("no text node");
+        assert!(node.compatibles.is_empty(), "compatibles: {:?}", node.compatibles);
+
+        // only the `}` is missing
+        let missing_close = "/dts-v1/;\n\n/ {\n    node@1000 {\n        compatible = \"acme,widget\";\n        reg = <0x1>;\n    };\n";
+        let byte = missing_close.rfind("reg").unwrap() + 3;
+        let node = text_node(&Document::open(missing_close, 0), byte).expect("no text node");
+        assert_eq!(node.compatibles, vec!["acme,widget"]);
+        assert!(node.properties.contains(&"reg".to_string()));
+    }
+
+    #[test]
+    fn text_node_handles_allman_and_braceless_headers() {
+        // `{` on its own line
+        let allman = "/dts-v1/;\n\n/ {\n    node@1000\n    {\n        compatible = \"acme,widget\";\n        clo\n    };\n};\n";
+        let byte = allman.rfind("clo").unwrap() + 3;
+        let doc = Document::open(allman, 0);
+        let node = text_node(&doc, byte).expect("no text node");
+        assert_eq!(node.compatibles, vec!["acme,widget"]);
+        assert!(!in_endpoint_or_port(&doc, byte));
+
+        // header written but braces not typed yet
+        let braceless = "/dts-v1/;\n\n/ {\n    node@1000\n        compatible = \"acme,widget\"\n        re\n";
+        let byte = braceless.rfind("re\n").unwrap() + 2;
+        let node = text_node(&Document::open(braceless, 0), byte).expect("no text node");
+        assert_eq!(node.compatibles, vec!["acme,widget"]);
+
+        // endpoint detection works from the text as well
+        let endpoint = "/dts-v1/;\n\n/ {\n    ports {\n        port {\n            endpoint {\n                compatible = \"\n";
+        let byte = endpoint.rfind('"').unwrap() + 1;
+        let doc = Document::open(endpoint, 0);
+        assert!(in_endpoint_or_port(&doc, byte));
+    }
+
+    #[test]
+    fn text_node_ignores_syntax_lookalikes_in_strings_and_comments() {
+        // slashes and braces inside a string, and a `}` inside a comment, must
+        // not disturb brace matching for the following node
+        let text = "/dts-v1/;\n\n/ {\n    a {\n        compatible = \"http://x/{y}\";\n        /* } */\n    };\n\n    b {\n        compatible = \"acme,widget\";\n        cl\n    };\n};\n";
+        let byte = text.rfind("cl").unwrap() + 2;
+        let node = text_node(&Document::open(text, 0), byte).expect("no text node");
+        assert_eq!(node.compatibles, vec!["acme,widget"]);
+        assert!(node.properties.contains(&"compatible".to_string()));
+
+        let inside_a = text.find("/* } */").unwrap();
+        let node = text_node(&Document::open(text, 0), inside_a).expect("no text node");
+        assert_eq!(node.compatibles, vec!["http://x/{y}"]);
+    }
+
+    #[test]
     fn compatible_property_item_is_a_snippet() {
         let Some(item) = compatible_property_item("") else {
             panic!("no item");
@@ -648,3 +1049,4 @@ mod tests {
         assert_eq!(irq.detail.as_deref(), Some("1 — irq.h"));
     }
 }
+

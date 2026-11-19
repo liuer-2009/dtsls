@@ -371,15 +371,7 @@ impl LanguageServer for Backend {
                     .unwrap_or_default(),
                 completion::Context::Properties(prefix) => {
                     let byte = util::position_to_byte(&doc.rope, position);
-                    let mut items = property_items(doc, byte, &prefix, &self.bindings);
-                    // any node may get a `compatible` unless it already has
-                    // one (or is endpoint/port plumbing)
-                    if node_can_take_compatible(doc, byte)
-                        && let Some(item) = completion::compatible_property_item(&prefix)
-                    {
-                        items.push(item);
-                    }
-                    items
+                    property_completion(doc, byte, &prefix, &self.bindings)
                 }
                 completion::Context::Compatible { prefix, vendor } => {
                     let byte = util::position_to_byte(&doc.rope, position);
@@ -568,55 +560,122 @@ fn node_compatibles(doc: &Document, node: tree_sitter::Node) -> Option<Vec<Strin
     diagnostics::compatible_strings(doc, node)
 }
 
-/// Binding-based property completion for the node enclosing `byte`.
-fn property_items(
+/// What the node around `byte` looks like for completion: its binding, the
+/// property names it already has, and whether it can still take a
+/// `compatible`. The syntax tree is preferred; a half-written node makes
+/// tree-sitter collapse the region into a single ERROR node, so the raw text
+/// is used as a fallback.
+struct NodeView {
+    binding: Option<Arc<crate::bindings::Binding>>,
+    existing: HashSet<String>,
+    can_add_compatible: bool,
+}
+
+fn node_view(doc: &Document, byte: usize, bindings: &BindingIndex) -> NodeView {
+    let mut existing = HashSet::new();
+    let mut compatibles = None;
+    let mut endpoint = None;
+    if let Some(node) = completion::enclosing_node(doc, byte) {
+        compatibles = node_compatibles(doc, node);
+        endpoint = Some(completion::is_endpoint_or_port(doc, node));
+        if let Some(body) = util::node_def_of(node) {
+            for i in 0..body.child_count() {
+                let Some(child) = body.child(i as u32) else { continue };
+                if child.kind() == "property"
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    existing.insert(util::node_text(doc, name).to_string());
+                }
+            }
+        }
+    }
+    if compatibles.is_none() {
+        // incomplete node: read compatible/properties from the text
+        if let Some(text_node) = completion::text_node(doc, byte) {
+            endpoint.get_or_insert_with(|| text_node.is_endpoint_or_port());
+            if !text_node.compatibles.is_empty() {
+                compatibles = Some(text_node.compatibles);
+                existing.extend(text_node.properties);
+            }
+        }
+    }
+    let endpoint = endpoint.unwrap_or_else(|| completion::in_endpoint_or_port(doc, byte));
+    let binding = compatibles.as_ref().and_then(|list| bindings.lookup(list));
+    NodeView {
+        binding,
+        existing,
+        can_add_compatible: !endpoint && compatibles.is_none(),
+    }
+}
+
+/// Binding-based property completion for the node enclosing `byte`, plus the
+/// `compatible` snippet when the node can still take one.
+fn property_completion(
     doc: &Document,
     byte: usize,
     prefix: &str,
     bindings: &BindingIndex,
 ) -> Vec<CompletionItem> {
-    let Some(node) = doc.tree.root_node().descendant_for_byte_range(byte, byte) else {
-        return Vec::new();
-    };
-    let Some(subnode) = enclosing_node(node) else {
-        return Vec::new();
-    };
-    let Some(compatibles) = node_compatibles(doc, subnode) else {
-        return Vec::new();
-    };
-    let Some(binding) = bindings.lookup(&compatibles) else {
-        return Vec::new();
-    };
-    let mut existing = HashSet::new();
-    if let Some(body) = util::node_def_of(subnode) {
-        for i in 0..body.child_count() {
-            let Some(child) = body.child(i as u32) else { continue };
-            if child.kind() == "property"
-                && let Some(name) = child.child_by_field_name("name")
-            {
-                existing.insert(util::node_text(doc, name).to_string());
-            }
-        }
+    let view = node_view(doc, byte, bindings);
+    let mut items = view
+        .binding
+        .as_ref()
+        .map(|binding| completion::items_from_binding(binding, &view.existing, prefix))
+        .unwrap_or_default();
+    if view.can_add_compatible
+        && let Some(item) = completion::compatible_property_item(prefix)
+    {
+        items.push(item);
     }
-    completion::items_from_binding(&binding, &existing, prefix)
-}
-
-/// `compatible` may be added to any node that does not already have one,
-/// except endpoint/port plumbing.
-fn node_can_take_compatible(doc: &Document, byte: usize) -> bool {
-    if completion::in_endpoint_or_port(doc, byte) {
-        return false;
-    }
-    let Some(node) = completion::enclosing_node(doc, byte) else {
-        return false;
-    };
-    diagnostics::compatible_strings(doc, node).is_none()
+    items
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bindings::Binding;
+
+    fn widget_bindings() -> BindingIndex {
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(Binding {
+            uri: Url::parse("file:///mmc.yaml").unwrap(),
+            singles: vec!["acme,mmc".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "reg", "clocks", "clock-names"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required: vec!["compatible".to_string()],
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        });
+        bindings
+    }
+
+    #[test]
+    fn property_items_work_in_a_half_written_node() {
+        // compatible accepted, but no `;` and no closing braces yet
+        let text = "/dts-v1/;\n\n/ {\n    mmc@8804000 {\n        compatible = \"acme,mmc\"\n        clo\n";
+        let doc = Document::open(text, 0);
+        let bindings = widget_bindings();
+        let byte = text.rfind("clo").unwrap() + 3;
+        let items = property_completion(&doc, byte, "clo", &bindings);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["clock-names", "clocks"], "items: {labels:?}");
+        // the node already has a compatible, so no snippet is offered
+        assert!(!labels.contains(&"compatible"));
+    }
+
+    #[test]
+    fn property_completion_offers_compatible_for_a_fresh_node() {
+        let text = "/dts-v1/;\n\n/ {\n    node@1000 {\n        comp\n";
+        let doc = Document::open(text, 0);
+        let byte = text.rfind("comp").unwrap() + 4;
+        let items = property_completion(&doc, byte, "comp", &BindingIndex::default());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["compatible"]);
+    }
 
     #[test]
     fn property_items_resolve_through_the_enclosing_node() {
@@ -638,8 +697,10 @@ mod tests {
         });
         // cursor right after "clo" on its line
         let byte = text.find("clo").unwrap() + 3;
-        let items = property_items(&doc, byte, "clo", &bindings);
+        let items = property_completion(&doc, byte, "clo", &bindings);
         let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["clock-names", "clocks"], "items: {labels:?}");
     }
 }
+
+

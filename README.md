@@ -79,7 +79,12 @@ cargo build --release
   jumps to the YAML binding of the node's `compatible`
 - **M3: property completion** — typing a property name inside a node whose
   `compatible` has a binding suggests that binding's properties (required
-  ones first, already-present ones dropped); value positions never trigger
+  ones first, already-present ones dropped); value positions never trigger.
+  Works while the node is still half-written (missing `;` and closing braces):
+  tree-sitter's recovery collapses such regions into one ERROR node, so the
+  enclosing node is re-read from the raw text (indentation-aware brace
+  matching, `{` on the next line and header-without-braces included), which
+  makes the property list available right after `compatible` is accepted
 - **M3: `compatible` completion** — typing a property name also offers
   `compatible = ""` (snippet, cursor between the quotes) on any node that does
   not have one; inside the string the server offers vendors first (`qcom`,
