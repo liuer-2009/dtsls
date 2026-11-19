@@ -39,12 +39,12 @@ pub struct Backend {
     file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Coalesced translation-unit re-runs, per root.
     tu_pending: Arc<RwLock<HashMap<Url, u64>>>,
-    /// Labels visible in each root's preprocessed unit (completion/goto use
-    /// this instead of the raw index once a unit has been checked).
-    tu_labels: Arc<RwLock<HashMap<Url, HashMap<String, TuLabel>>>>,
-    /// false when no C preprocessor is installed: cross-file checks fall back
-    /// to the per-file path.
-    cpp_available: bool,
+    /// Names visible in each root's preprocessed unit (labels, references,
+    /// macros, `#*-cells`); completion/goto/hints prefer this over the index.
+    tu_data: Arc<RwLock<HashMap<Url, Arc<TuData>>>>,
+    /// Preprocessed text of each root, parsed incrementally across edits
+    /// (clangd's preamble equivalent: only the changed region reparses).
+    tu_snapshots: Arc<std::sync::Mutex<HashMap<Url, (Document, Vec<PathBuf>)>>>,
 }
 
 impl Backend {
@@ -60,11 +60,8 @@ impl Backend {
             pending_index: Arc::new(RwLock::new(HashMap::new())),
             file_diags: Arc::new(RwLock::new(HashMap::new())),
             tu_pending: Arc::new(RwLock::new(HashMap::new())),
-            tu_labels: Arc::new(RwLock::new(HashMap::new())),
-            cpp_available: std::process::Command::new("cpp")
-                .arg("--version")
-                .output()
-                .is_ok(),
+            tu_data: Arc::new(RwLock::new(HashMap::new())),
+            tu_snapshots: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -125,9 +122,6 @@ impl Backend {
     /// back to the file itself so a lone `.dtsi` still gets its closure
     /// checked).
     fn tu_roots_for(&self, uri: &Url) -> Vec<(Url, PathBuf)> {
-        if !self.cpp_available {
-            return Vec::new();
-        }
         let Ok(path) = uri.to_file_path() else {
             return Vec::new();
         };
@@ -155,14 +149,20 @@ impl Backend {
         roots
     }
 
-    /// `&label` completion. A checked unit is authoritative (it is what cpp
-    /// actually produced): labels expanded from macros are present and labels
-    /// in disabled `#ifdef` branches are not. The live buffer is merged on top
-    /// so a label just typed in this file is offered before the next run.
+    /// The unit that covers `uri`, when one has been checked already.
+    fn unit_for(&self, uri: &Url) -> Option<Arc<TuData>> {
+        let (root, _) = self.tu_roots_for(uri).into_iter().next()?;
+        self.tu_data.read().unwrap().get(&root).cloned()
+    }
+
+    /// `&label` completion. A checked unit is authoritative (it is what the
+    /// preprocessor actually produced): labels expanded from macros are
+    /// present and labels in disabled `#ifdef` branches are not. The live
+    /// buffer is merged on top so a label just typed in this file is offered
+    /// before the next run.
     fn label_items(&self, uri: &Url, doc: &Document, prefix: &str) -> Vec<CompletionItem> {
-        if let Some((root, _)) = self.tu_roots_for(uri).into_iter().next()
-            && let Some(labels) = self.tu_labels.read().unwrap().get(&root)
-        {
+        if let Some(data) = self.unit_for(uri) {
+            let labels = &data.labels;
             let current = uri.to_file_path().ok();
             let mut map: completion::LabelMap = HashMap::new();
             for (name, label) in labels {
@@ -202,7 +202,7 @@ impl Backend {
     /// Re-check a translation unit off the main loop. Coalesced like the index
     /// rebuild: typing only triggers one run once the edits settle.
     fn schedule_tu(&self, root_uri: Url, root_path: PathBuf) {
-        info!(root = %root_uri, "tu scheduled");
+        debug!(root = %root_uri, "tu scheduled");
         let generation = {
             let mut pending = self.tu_pending.write().unwrap();
             let slot = pending.entry(root_uri.clone()).or_insert(0);
@@ -212,7 +212,8 @@ impl Backend {
         let documents = Arc::clone(&self.documents);
         let file_diags = Arc::clone(&self.file_diags);
         let pending = Arc::clone(&self.tu_pending);
-        let tu_labels = Arc::clone(&self.tu_labels);
+        let tu_data = Arc::clone(&self.tu_data);
+        let snapshots = Arc::clone(&self.tu_snapshots);
         let include_dirs = self.include_dirs();
         let client = self.client.clone();
         let task_root = root_uri.clone();
@@ -222,6 +223,7 @@ impl Backend {
                 return;
             }
             let overlays_docs = Arc::clone(&documents);
+            let blocking_root = task_root.clone();
             let root_path_task = root_path.clone();
             let started = std::time::Instant::now();
             let tu_result = tokio::task::spawn_blocking(move || {
@@ -237,22 +239,26 @@ impl Backend {
                         })
                         .collect()
                 };
-                let work = std::env::temp_dir()
-                    .join("dtsls-tu")
-                    .join(format!("{:016x}", crate::tu::hash_path(&root_path_task)));
-                let result = crate::tu::preprocess(
-                    &crate::tu::TuInput {
-                        root: &root_path_task,
-                        include_dirs: &include_dirs,
-                        overlays: &overlays,
-                    },
-                    &work,
-                )?;
-                Some(tu_output(&result))
+                let result = crate::tu::preprocess(&crate::tu::TuInput {
+                    root: &root_path_task,
+                    include_dirs: &include_dirs,
+                    overlays: &overlays,
+                });
+                let previous = snapshots.lock().unwrap().remove(&blocking_root);
+                let mut doc = match previous {
+                    Some((doc, _files)) => doc,
+                    None => Document::open(&result.text, 0),
+                };
+                doc.update_text(&result.text);
+                let output = tu_output(&result, &doc);
+                snapshots
+                    .lock()
+                    .unwrap()
+                    .insert(blocking_root.clone(), (doc, result.files.clone()));
+                output
             })
             .await
-            .ok()
-            .flatten();
+            .ok();
             debug!(
                 root = %task_root,
                 elapsed_us = started.elapsed().as_micros() as u64,
@@ -263,10 +269,10 @@ impl Backend {
                 warn!(root = %task_root, "translation unit check could not run");
                 return;
             };
-            tu_labels
+            tu_data
                 .write()
                 .unwrap()
-                .insert(task_root.clone(), output.labels);
+                .insert(task_root.clone(), Arc::new(output.data));
             for (path, structural) in output.per_file {
                 let Ok(uri) = Url::from_file_path(&path) else {
                     continue;
@@ -305,51 +311,81 @@ impl Backend {
 }
 
 /// A label defined in a preprocessed unit.
-struct TuLabel {
+pub(crate) struct TuLabel {
     /// node path, for the completion detail
-    path: String,
+    pub(crate) path: String,
     /// file the label is defined in
-    file: PathBuf,
+    pub(crate) file: PathBuf,
+    /// range of the label in that file
+    pub(crate) range: Range,
 }
 
-/// Everything the unit tells us: diagnostics grouped by source file, plus the
-/// labels that exist after preprocessing.
+/// An `&label` use in a preprocessed unit.
+struct TuRef {
+    label: String,
+    file: PathBuf,
+    range: Range,
+}
+
+/// Everything the unit tells us besides diagnostics: the names that exist
+/// after preprocessing (so macros and conditionals are already resolved).
+pub(crate) struct TuData {
+    pub(crate) labels: HashMap<String, TuLabel>,
+    refs: Vec<TuRef>,
+    pub(crate) defines: index::DefineMap,
+    pub(crate) cells: Vec<index::CellsProp>,
+}
+
 struct TuOutput {
     per_file: HashMap<PathBuf, Vec<Diagnostic>>,
-    labels: HashMap<String, TuLabel>,
+    data: TuData,
 }
 
-fn tu_output(unit: &crate::tu::TuResult) -> TuOutput {
-    let doc = Document::open(&unit.text, 0);
+fn tu_output(unit: &crate::tu::TuResult, doc: &Document) -> TuOutput {
     TuOutput {
-        per_file: group_diagnostics(unit, &doc),
-        labels: tu_label_map(unit, &doc),
+        per_file: group_diagnostics(unit, doc),
+        data: tu_data(unit, doc),
     }
 }
 
-/// Labels of the preprocessed tree: names expanded by the preprocessor, with
-/// the node path and the file each one came from.
-fn tu_label_map(unit: &crate::tu::TuResult, doc: &Document) -> HashMap<String, TuLabel> {
-    let mut out = HashMap::new();
+fn tu_data(unit: &crate::tu::TuResult, doc: &Document) -> TuData {
+    let mut data = TuData {
+        labels: HashMap::new(),
+        refs: Vec::new(),
+        defines: HashMap::new(),
+        cells: Vec::new(),
+    };
+    for define in &unit.defines {
+        let file = define
+            .file
+            .and_then(|index| unit.files.get(index as usize))
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        data.defines
+            .entry(define.name.clone())
+            .or_insert((define.value.clone(), file));
+    }
     let mut cursor = doc.tree.root_node().walk();
-    collect_unit_labels(unit, doc, &mut cursor, &mut out);
-    out
+    collect_unit_names(unit, doc, &mut cursor, &mut data);
+    data
 }
 
-fn collect_unit_labels(
+fn collect_unit_names(
     unit: &crate::tu::TuResult,
     doc: &Document,
     cursor: &mut tree_sitter::TreeCursor<'_>,
-    out: &mut HashMap<String, TuLabel>,
+    data: &mut TuData,
 ) {
     loop {
         let node = cursor.node();
-        if node.kind() == "label" {
-            let text = util::node_text(doc, node);
-            let name = text.trim_end_matches(':');
-            if !name.is_empty() {
-                let line = util::byte_to_position(&doc.rope, node.start_byte()).line;
-                if let Some((_, path)) = unit.locate(line) {
+        match node.kind() {
+            "label" => {
+                let text = util::node_text(doc, node);
+                let name = text.trim_end_matches(':');
+                if !name.is_empty()
+                    && let Some((file, range)) = unit_range(unit, doc, node, name.len())
+                {
                     let owner = node.parent().map(|parent| {
                         if parent.kind() == "property" {
                             util::owning_node(parent).unwrap_or(parent)
@@ -357,23 +393,99 @@ fn collect_unit_labels(
                             parent
                         }
                     });
-                    let node_path = owner
+                    let path = owner
                         .map(|owner| crate::analysis::node_path(doc, owner))
                         .unwrap_or_default();
-                    out.entry(name.to_string()).or_insert(TuLabel {
-                        path: node_path,
-                        file: path.to_path_buf(),
+                    data.labels.entry(name.to_string()).or_insert(TuLabel {
+                        path,
+                        file,
+                        range,
                     });
                 }
             }
-        } else if cursor.goto_first_child() {
-            collect_unit_labels(unit, doc, cursor, out);
+            "label_ref" => {
+                let text = util::node_text(doc, node);
+                let name = text.trim_start_matches('&');
+                if !name.is_empty()
+                    && let Some((file, range)) = unit_range(unit, doc, node, text.len())
+                {
+                    data.refs.push(TuRef {
+                        label: name.to_string(),
+                        file,
+                        range,
+                    });
+                }
+            }
+            "property" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = util::node_text(doc, name_node);
+                    if name.starts_with('#')
+                        && name.ends_with("-cells")
+                        && let Some(owner) = util::owning_node(node)
+                    {
+                        let path = crate::analysis::node_path(doc, owner);
+                        if let Some(value) = property_u32(doc, node) {
+                            data.cells.push(index::CellsProp {
+                                path,
+                                name: name.to_string(),
+                                value,
+                            });
+                        }
+                    }
+                }
+                // `&label` references live inside property values, so keep
+                // descending (a property cannot contain another property)
+            }
+            _ => {}
+        }
+        if cursor.goto_first_child() {
+            collect_unit_names(unit, doc, cursor, data);
             cursor.goto_parent();
         }
         if !cursor.goto_next_sibling() {
             break;
         }
     }
+}
+
+fn unit_range(
+    unit: &crate::tu::TuResult,
+    doc: &Document,
+    node: tree_sitter::Node,
+    length: usize,
+) -> Option<(PathBuf, Range)> {
+    let position = util::byte_to_position(&doc.rope, node.start_byte());
+    let (source, path) = unit.locate(position.line)?;
+    Some((
+        path.to_path_buf(),
+        Range {
+            start: Position {
+                line: source.line,
+                character: position.character,
+            },
+            end: Position {
+                line: source.line,
+                character: position.character + length as u32,
+            },
+        },
+    ))
+}
+
+fn property_u32(doc: &Document, property: tree_sitter::Node) -> Option<u32> {
+    for i in 0..property.child_count() {
+        let child = property.child(i as u32)?;
+        if child.kind() == "prop_data" {
+            let text = util::node_text(doc, child);
+            return text
+                .split(|c: char| !c.is_ascii_hexdigit() && c != 'x' && c != 'X')
+                .find(|piece| !piece.is_empty())
+                .and_then(|piece| {
+                    let piece = piece.trim_start_matches(['x', 'X']);
+                    u32::from_str_radix(piece, 16).ok().or_else(|| piece.parse().ok())
+                });
+        }
+    }
+    None
 }
 
 /// Diagnostics produced for a preprocessed unit, grouped by the file they
@@ -482,14 +594,6 @@ impl LanguageServer for Backend {
         // Whole-feature status: unavailable = ERROR, degraded = WARNING, both
         // reported at the top of every file. A feature never fails silently.
         let mut issues = Vec::new();
-        if !self.cpp_available {
-            issues.push(FeatureIssue::degraded(
-                "translation units",
-                "cpp not found — cross-file checks (duplicate labels/properties \
-                 across includes) fall back to per-file analysis; install a C \
-                 preprocessor",
-            ));
-        }
         if !had_client_root {
             issues.push(FeatureIssue::degraded(
                 "workspace index",
@@ -609,7 +713,7 @@ impl LanguageServer for Backend {
         let td = params.text_document;
         info!(uri = %td.uri, version = td.version, bytes = td.text.len(), "did_open");
         let tu_roots = self.tu_roots_for(&td.uri);
-        info!(tu_roots = tu_roots.len(), cpp = self.cpp_available, "tu roots for did_open");
+        debug!(tu_roots = tu_roots.len(), "tu roots for did_open");
         let (diags, version) = {
             let mut docs = self.documents.write().unwrap();
             docs.insert(td.uri.clone(), Document::open(&td.text, td.version));
@@ -719,11 +823,19 @@ impl LanguageServer for Backend {
                 completion::Context::Labels(prefix) => {
                     self.label_items(&uri, doc, &prefix)
                 },
-                completion::Context::Defines(prefix) => index
-                    .with_file(&uri, |fi| {
-                        fi.map(|f| completion::items_from_defines(&f.defines, &prefix))
-                    })
-                    .unwrap_or_default(),
+                completion::Context::Defines(prefix) => {
+                    if let Some(data) = self.unit_for(&uri) {
+                        completion::items_from_defines(&data.defines, &prefix)
+                    } else {
+                        index
+                            .with_file(&uri, |file| {
+                                file.map(|file| {
+                                    completion::items_from_defines(&file.defines, &prefix)
+                                })
+                            })
+                            .unwrap_or_default()
+                    }
+                }
                 completion::Context::Properties(prefix) => {
                     let byte = util::position_to_byte(&doc.rope, position);
                     property_completion(doc, byte, &prefix, &self.bindings)
@@ -809,6 +921,32 @@ impl LanguageServer for Backend {
         let Some(label) = label else {
             return Ok(None);
         };
+        if let Some(data) = self.unit_for(&uri) {
+            let mut locations = Vec::new();
+            if params.context.include_declaration
+                && let Some(def) = data.labels.get(&label)
+                && let Ok(def_uri) = Url::from_file_path(&def.file)
+            {
+                locations.push(Location {
+                    uri: def_uri,
+                    range: def.range,
+                });
+            }
+            for reference in data.refs.iter().filter(|reference| reference.label == label) {
+                if let Ok(ref_uri) = Url::from_file_path(&reference.file) {
+                    locations.push(Location {
+                        uri: ref_uri,
+                        range: reference.range,
+                    });
+                }
+                if locations.len() >= 500 {
+                    break;
+                }
+            }
+            if !locations.is_empty() {
+                return Ok(Some(locations));
+            }
+        }
         let mut locations = Vec::new();
         if params.context.include_declaration {
             for (def_uri, def) in self.index.all_label_defs(&label) {
@@ -836,7 +974,14 @@ impl LanguageServer for Backend {
         let Some(doc) = docs.get(&uri) else {
             return Ok(None);
         };
-        let hints = hints::inlay_hints(doc, &uri, &self.index, &params.range);
+        let unit = self.unit_for(&uri);
+        let hints = hints::inlay_hints(
+            doc,
+            &uri,
+            &self.index,
+            unit.as_deref(),
+            &params.range,
+        );
         Ok((!hints.is_empty()).then_some(hints))
     }
 
@@ -875,6 +1020,15 @@ impl Backend {
         let doc = docs.get(&uri)?;
         let byte = util::position_to_byte(&doc.rope, position);
         if let Some(label) = completion::label_at_cursor(doc, byte) {
+            if let Some(data) = self.unit_for(&uri)
+                && let Some(def) = data.labels.get(&label)
+                && let Ok(target) = Url::from_file_path(&def.file)
+            {
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: target,
+                    range: def.range,
+                }));
+            }
             let (target_uri, def) = index::resolve_label(&self.index, &uri, &label)?;
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: target_uri,
@@ -1126,5 +1280,77 @@ mod tests {
         let items = property_completion(&doc, byte, "c", &nested_bindings());
         let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["child-prop"], "items: {labels:?}");
+    }
+}
+
+#[cfg(test)]
+mod tu_bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_tu_phases() {
+        let root = std::path::Path::new("/linux-7.2.2/arch/arm64/boot/dts/qcom/sm8650-qrd.dts");
+        let include_dirs = [
+            PathBuf::from("/linux-7.2.2/include"),
+            PathBuf::from("/linux-7.2.2/scripts/dtc/include-prefixes"),
+        ];
+        let overlays = BTreeMap::new();
+        let t = std::time::Instant::now();
+        let unit = crate::tu::preprocess(&crate::tu::TuInput {
+            root,
+            include_dirs: &include_dirs,
+            overlays: &overlays,
+        });
+        println!("preprocess: {:?} ({} bytes)", t.elapsed(), unit.text.len());
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = Document::open(&unit.text, 0);
+            println!("parse #{round}: {:?}", t.elapsed());
+        }
+        let doc = Document::open(&unit.text, 0);
+        let t = std::time::Instant::now();
+        let diags = diagnostics::structural(&doc);
+        println!("structural: {:?} ({} diags)", t.elapsed(), diags.len());
+        for diag in diags.iter().take(6) {
+            println!(
+                "  diag: {}:{} {}",
+                diag.range.start.line, diag.range.start.character, diag.message
+            );
+        }
+        let t = std::time::Instant::now();
+        let data = tu_data(&unit, &doc);
+        println!(
+            "names: {:?} ({} labels, {} refs, {} cells, {} defines)",
+            t.elapsed(),
+            data.labels.len(),
+            data.refs.len(),
+            data.cells.len(),
+            data.defines.len()
+        );
+        let t = std::time::Instant::now();
+        let grouped = group_diagnostics(&unit, &doc);
+        println!("group: {:?} ({} files)", t.elapsed(), grouped.len());
+
+        // simulate one localized edit in the preprocessed text
+        let mut edited = unit.text.clone();
+        let pivot = edited.len() / 2;
+        let pivot = (pivot..edited.len())
+            .find(|index| edited.is_char_boundary(*index))
+            .unwrap_or(edited.len());
+        edited.insert(pivot, ' ');
+        let t = std::time::Instant::now();
+        let doc = {
+            let mut doc = doc;
+            doc.update_text(&edited);
+            doc
+        };
+        println!("incremental update+parse: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let diags = diagnostics::structural(&doc);
+        println!("structural after edit: {:?} ({} diags)", t.elapsed(), diags.len());
+        let t = std::time::Instant::now();
+        let _ = tu_data(&unit, &doc);
+        println!("names after edit: {:?}", t.elapsed());
     }
 }

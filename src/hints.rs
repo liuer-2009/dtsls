@@ -29,11 +29,18 @@ struct Unit {
 /// directions, matching dtc's merged view. Entry boundaries come from the
 /// phandle target's `#*-cells` when resolvable, else from dividing the units
 /// evenly among the names.
-pub fn inlay_hints(doc: &Document, uri: &Url, index: &Index, range: &Range) -> Vec<InlayHint> {
+pub fn inlay_hints(
+    doc: &Document,
+    uri: &Url,
+    index: &Index,
+    unit: Option<&crate::backend::TuData>,
+    range: &Range,
+) -> Vec<InlayHint> {
     let ctx = HintCtx {
         doc,
         uri,
         index,
+        unit,
         range,
         range_start: util::position_to_byte(&doc.rope, range.start),
         range_end: util::position_to_byte(&doc.rope, range.end),
@@ -47,6 +54,7 @@ struct HintCtx<'a> {
     doc: &'a Document,
     uri: &'a Url,
     index: &'a Index,
+    unit: Option<&'a crate::backend::TuData>,
     range: &'a Range,
     range_start: usize,
     range_end: usize,
@@ -60,7 +68,7 @@ fn collect(node: Node, ctx: &HintCtx, out: &mut Vec<InlayHint>) {
     if node.end_byte() < ctx.range_start || node.start_byte() > ctx.range_end {
         return;
     }
-    let (doc, uri, index, range) = (ctx.doc, ctx.uri, ctx.index, ctx.range);
+    let (doc, uri, index, unit, range) = (ctx.doc, ctx.uri, ctx.index, ctx.unit, ctx.range);
     if node.kind() == "node_def" {
         let mut props: HashMap<String, Node> = HashMap::new();
         for i in 0..node.child_count() {
@@ -81,7 +89,7 @@ fn collect(node: Node, ctx: &HintCtx, out: &mut Vec<InlayHint>) {
                 .into_iter()
                 .find_map(|candidate| props.get(&candidate).copied());
             if let Some(x_prop) = companion {
-                emit_pair(x_prop, *names_prop, doc, uri, index, range, out);
+                emit_pair(x_prop, *names_prop, doc, uri, index, unit, range, out);
                 if out.len() >= MAX_HINTS {
                     return;
                 }
@@ -168,12 +176,14 @@ fn push_unit(node: Node, doc: &Document, units: &mut Vec<Unit>, hint_after: usiz
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_pair(
     x_prop: Node,
     names_prop: Node,
     doc: &Document,
     uri: &Url,
     index: &Index,
+    unit: Option<&crate::backend::TuData>,
     range: &Range,
     out: &mut Vec<InlayHint>,
 ) {
@@ -228,19 +238,19 @@ fn emit_pair(
                 .ref_label
                 .as_ref()
                 .and_then(|label| {
-                    cells_of_target(index, uri, doc, label, &cells_name)
+                    cells_of_target(index, unit, uri, doc, label, &cells_name)
                 })
                 .map(|c| 1 + c)
                 .or_else(|| {
                     if interrupt_parent {
-                        interrupt_cells(doc, uri, index, x_prop)
+                        interrupt_cells(doc, uri, index, unit, x_prop)
                     } else {
                         None
                     }
                 })
                 .or_else(|| {
                     if prop_name == "reg" {
-                        reg_cells(doc, x_prop, uri, index)
+                        reg_cells(doc, x_prop, uri, index, unit)
                     } else {
                         None
                     }
@@ -310,11 +320,28 @@ fn cells_prop_name(prop_name: &str) -> String {
 
 fn cells_of_target(
     index: &Index,
+    unit: Option<&crate::backend::TuData>,
     uri: &Url,
     doc: &Document,
     label: &str,
     cells_name: &str,
 ) -> Option<u32> {
+    if let Some(unit) = unit
+        && let Some(def) = unit.labels.get(label)
+    {
+        if uri.to_file_path().ok().as_deref() == Some(def.file.as_path())
+            && let Some(value) = cells_from_doc(doc, &def.path, cells_name)
+        {
+            return Some(value);
+        }
+        if let Some(cell) = unit
+            .cells
+            .iter()
+            .find(|cell| cell.path == def.path && cell.name == cells_name)
+        {
+            return Some(cell.value);
+        }
+    }
     let (target_uri, def) = index::resolve_label(index, uri, label)?;
     if target_uri == *uri
         && let Some(value) = cells_from_doc(doc, &def.path, cells_name) {
@@ -325,7 +352,13 @@ fn cells_of_target(
 
 /// `reg` entries are `#address-cells + #size-cells` wide, as advertised by
 /// the parent bus node (spec defaults: 2 and 2).
-fn reg_cells(doc: &Document, x_prop: Node, uri: &Url, index: &Index) -> Option<u32> {
+fn reg_cells(
+    doc: &Document,
+    x_prop: Node,
+    uri: &Url,
+    index: &Index,
+    unit: Option<&crate::backend::TuData>,
+) -> Option<u32> {
     let owner = util::owning_node(x_prop)?;
     // the bus is the parent node: a subnode or the root devicetree
     let bus = owner
@@ -333,12 +366,17 @@ fn reg_cells(doc: &Document, x_prop: Node, uri: &Url, index: &Index) -> Option<u
         .and_then(|p| p.parent())
         .filter(|p| p.kind() == "subnode" || p.kind() == "devicetree")?;
     let path = analysis_node_path(doc, bus);
-    let address = index
-        .cells_at(uri, &path, "#address-cells")
-        .unwrap_or(DEFAULT_ADDRESS_CELLS);
-    let size = index
-        .cells_at(uri, &path, "#size-cells")
-        .unwrap_or(DEFAULT_SIZE_CELLS);
+    let cell = |name: &str| {
+        unit.and_then(|unit| {
+            unit.cells
+                .iter()
+                .find(|cell| cell.path == path && cell.name == name)
+                .map(|cell| cell.value)
+        })
+        .or_else(|| index.cells_at(uri, &path, name))
+    };
+    let address = cell("#address-cells").unwrap_or(DEFAULT_ADDRESS_CELLS);
+    let size = cell("#size-cells").unwrap_or(DEFAULT_SIZE_CELLS);
     Some(address + size)
 }
 
@@ -348,7 +386,13 @@ fn analysis_node_path(doc: &Document, node: Node) -> String {
 
 /// `interrupts` takes its stride from the interrupt-parent's
 /// `#interrupt-cells`, which may be inherited from an ancestor.
-fn interrupt_cells(doc: &Document, uri: &Url, index: &Index, x_prop: Node) -> Option<u32> {
+fn interrupt_cells(
+    doc: &Document,
+    uri: &Url,
+    index: &Index,
+    unit: Option<&crate::backend::TuData>,
+    x_prop: Node,
+) -> Option<u32> {
     let mut owner = util::owning_node(x_prop)?;
     loop {
         if let Some(prop) = child_property(&owner, "interrupt-parent", doc) {
@@ -364,6 +408,25 @@ fn interrupt_cells(doc: &Document, uri: &Url, index: &Index, x_prop: Node) -> Op
                             .to_string()
                     })
                     .unwrap_or_default();
+                if let Some(unit) = unit
+                    && let Some(def) = unit.labels.get(&label)
+                {
+                    if uri.to_file_path().ok().as_deref() == Some(def.file.as_path())
+                        && let Some(value) =
+                            cells_from_doc(doc, &def.path, "#interrupt-cells")
+                    {
+                        return Some(value);
+                    }
+                    if let Some(cell) = unit
+                        .cells
+                        .iter()
+                        .find(|cell| {
+                            cell.path == def.path && cell.name == "#interrupt-cells"
+                        })
+                    {
+                        return Some(cell.value);
+                    }
+                }
                 let (target_uri, def) = index::resolve_label(index, uri, &label)?;
                 if target_uri == *uri
                     && let Some(value) =
@@ -481,7 +544,7 @@ mod tests {
             start: Position { line: 0, character: 0 },
             end: Position { line: u32::MAX, character: 0 },
         };
-        inlay_hints(&doc, &"file:///t.dts".parse().unwrap(), &index, &full)
+        inlay_hints(&doc, &"file:///t.dts".parse().unwrap(), &index, None, &full)
             .into_iter()
             .map(|h| (h.position.line + 1, match h.label {
                 InlayHintLabel::String(s) => s,

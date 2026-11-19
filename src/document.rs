@@ -94,6 +94,59 @@ impl Document {
         self.version = version;
     }
 
+    /// Replace the whole text, reusing the previous tree. The common prefix
+    /// and suffix are kept, so a localized edit (the usual case for a
+    /// preprocessed unit) reparses incrementally instead of from scratch.
+    pub fn update_text(&mut self, new_text: &str) -> bool {
+        if self.text == new_text {
+            return false;
+        }
+        let old = &self.text;
+        let max = old.len().min(new_text.len());
+        let mut prefix = 0;
+        while prefix < max && old.as_bytes()[prefix] == new_text.as_bytes()[prefix] {
+            prefix += 1;
+        }
+        while prefix > 0 && (!old.is_char_boundary(prefix) || !new_text.is_char_boundary(prefix)) {
+            prefix -= 1;
+        }
+        let mut suffix = 0;
+        while suffix < max - prefix
+            && old.as_bytes()[old.len() - 1 - suffix] == new_text.as_bytes()[new_text.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        while suffix > 0
+            && (!old.is_char_boundary(old.len() - suffix)
+                || !new_text.is_char_boundary(new_text.len() - suffix))
+        {
+            suffix -= 1;
+        }
+        let start_byte = prefix;
+        let old_end_byte = old.len() - suffix;
+        let new_end_byte = new_text.len() - suffix;
+        let start_point = util::byte_to_point(&self.rope, start_byte);
+        let old_end_point = util::byte_to_point(&self.rope, old_end_byte);
+        let start_char = self.rope.byte_to_char(start_byte);
+        let old_end_char = self.rope.byte_to_char(old_end_byte);
+        self.rope.remove(start_char..old_end_char);
+        self.rope.insert(start_char, &new_text[prefix..new_end_byte]);
+        let new_end_point = util::byte_to_point(&self.rope, new_end_byte);
+        self.text = new_text.to_string();
+        self.tree.edit(&InputEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_position: start_point,
+            old_end_position: old_end_point,
+            new_end_position: new_end_point,
+        });
+        if let Some(tree) = Self::parse(&self.rope, Some(&self.tree)) {
+            self.tree = tree;
+        }
+        true
+    }
+
     /// Byte-range text slice, from the mirrored plain-text copy.
     pub fn slice(&self, range: std::ops::Range<usize>) -> &str {
         self.text.get(range).unwrap_or("")

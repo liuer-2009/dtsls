@@ -6,6 +6,7 @@ mod diagnostics;
 mod document;
 mod hints;
 mod index;
+mod preproc;
 mod semantic_tokens;
 mod status;
 mod symbols;

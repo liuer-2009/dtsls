@@ -71,17 +71,21 @@ cargo build --release
   workspace root → warning). Nothing degrades silently.
 - **Cross-file checks as translation units** — like clangd, a file is checked
   in the context of the root board that includes it: the board `.dts` plus its
-  include closure is run through `cpp` (same flags as the kernel build), open
-  buffers override the on-disk files, and the preprocessor's line markers map
-  results back to each source file. Duplicate labels, duplicate properties,
+  include closure is preprocessed **in-process** (object/function-like macros,
+  `#if`/`#elif`, includes, `#pragma once`, comments), open buffers override the
+  on-disk files, and a source map ties every expanded line back to its file and
+  line. No `cpp` process is spawned per edit; the preprocessed text is reparsed
+  incrementally (common prefix/suffix), so a localized edit only reshapes the
+  changed region. Duplicate labels, duplicate properties,
   duplicate node names and syntax errors are therefore judged on the merged
   tree, exactly like dtc; `#ifdef` branches are resolved by the preprocessor
   instead of being guessed. Re-runs are coalesced (200 ms) and only happen for
-  open or affected boards. `&` label completion uses the unit's labels, so
-  macro-expanded labels are offered and labels from disabled `#ifdef` branches
-  are not; the live buffer is merged on top so a label just typed appears
-  before the next run. Without `cpp` the feature reports a `translation units`
-  warning and falls back to per-file analysis / the workspace index.
+  open or affected boards. Labels, `&label` references, macro definitions and
+  `#*-cells` come from the unit, so completion, go-to-definition, references,
+  macro completion and `*-names` hints all see macro-expanded names and the
+  branches the preprocessor actually kept; the live buffer is merged on top for
+  labels so a name just typed appears before the next run. The workspace index
+  remains the fallback for files no unit covers yet.
 - **Fast state updates** — diagnostics only touch structural nodes (property
   values are never entered), syntax recovery is skipped unless the tree has
   errors, and per-subtree results are memoized by subtree text: a keystroke
