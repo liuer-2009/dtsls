@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dashmap = "6.2.1"
 regex = "1.13.1"
 ropey = "1.6.1"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "io-std", "io-util", "macros", "sync"] }
+rustc-hash = "2.1.3"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "io-std", "io-util", "macros", "sync", "time"] }
 tower-lsp = "0.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -69,6 +69,12 @@ cargo build --release
   error), `dtschema` (pip package missing → warning), `dt-bindings headers`
   (kernel tree without include/dt-bindings → warning), `workspace index` (no
   workspace root → warning). Nothing degrades silently.
+- **Fast state updates** — diagnostics only touch structural nodes (property
+  values are never entered), syntax recovery is skipped unless the tree has
+  errors, and per-subtree results are memoized by subtree text: a keystroke
+  rechecks just the node it touched. Workspace index rebuilds are coalesced
+  and run ~200 ms after typing pauses. On a 200 KB dtsi an edit plus its full
+  diagnostics takes ~2 ms server-side (~440 edits/s end to end, 1 s window).
 - **M3: goto binding** — with the cursor on a node (not on a label), `gd`
   jumps to the YAML binding of the node's `compatible`
 - **M3: property completion** — typing a property name inside a node whose

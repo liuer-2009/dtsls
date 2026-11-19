@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use rustc_hash::FxHashMap;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use tree_sitter::Node;
 
@@ -23,7 +24,6 @@ const CAT_ALL: u8 = CAT_SYNTAX | CAT_DUPLICATES | CAT_INCLUDES | CAT_BINDINGS;
 /// Node-kind ids resolved once: comparing ids beats comparing kind strings on
 /// every node of every traversal.
 struct Kinds {
-    source_file: u16,
     subnode: u16,
     devicetree: u16,
     property: u16,
@@ -53,7 +53,6 @@ fn kinds() -> &'static Kinds {
             }
         }
         Kinds {
-            source_file: id("source_file"),
             subnode: id("subnode"),
             devicetree: id("devicetree"),
             property: id("property"),
@@ -72,30 +71,104 @@ fn kinds() -> &'static Kinds {
     })
 }
 
-struct DiagCtx<'a> {
+/// Diagnostic before position conversion: byte offsets only. Subtree results
+/// are cached in this form so they can be re-based when the subtree moves.
+#[derive(Clone)]
+struct RawDiag {
+    start: u32,
+    end: u32,
+    severity: DiagnosticSeverity,
+    message: String,
+}
+
+impl RawDiag {
+    fn shifted(&self, base: u32) -> RawDiag {
+        RawDiag {
+            start: self.start + base,
+            end: self.end + base,
+            severity: self.severity,
+            message: self.message.clone(),
+        }
+    }
+
+    fn rebase(&self, base: u32) -> RawDiag {
+        RawDiag {
+            start: self.start - base,
+            end: self.end - base,
+            severity: self.severity,
+            message: self.message.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CacheKey {
+    file: u64,
+    text: u64,
+    len: u32,
+    cats: u8,
+}
+
+const CACHE_LIMIT: usize = 200_000;
+
+/// Per-subtree result cache: a keystroke only changes one small subtree, so
+/// everything else is served from here. Keyed by the subtree's text, which
+/// also survives the positions of the whole file shifting.
+#[derive(Default)]
+pub struct DiagCache {
+    entries: dashmap::DashMap<CacheKey, std::sync::Arc<Vec<RawDiag>>>,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl DiagCache {
+    fn sync(&self, bindings: &BindingIndex) {
+        use std::sync::atomic::Ordering;
+        let current = bindings.generation();
+        let previous = self.generation.load(Ordering::Relaxed);
+        if previous != current {
+            // binding index grew (background scan) or was re-scanned
+            if previous != 0 {
+                self.entries.clear();
+            }
+            self.generation.store(current, Ordering::Relaxed);
+        }
+        if self.entries.len() > CACHE_LIMIT {
+            self.entries.clear();
+        }
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<std::sync::Arc<Vec<RawDiag>>> {
+        self.entries.get(key).map(|entry| entry.clone())
+    }
+
+    fn insert(&self, key: CacheKey, value: Vec<RawDiag>) {
+        self.entries.insert(key, std::sync::Arc::new(value));
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+/// Everything needed to check one subtree, minus the output vector.
+struct CheckCtx<'a> {
     doc: &'a Document,
     file_path: Option<&'a Path>,
     include_dirs: &'a [PathBuf],
     bindings: &'a BindingIndex,
+    cache: Option<&'a DiagCache>,
+    file_hash: u64,
     cats: u8,
-    out: Vec<Diagnostic>,
-}
-
-impl DiagCtx<'_> {
-    fn push(&mut self, range: Range, severity: DiagnosticSeverity, message: String) {
-        self.out.push(Diagnostic {
-            range,
-            severity: Some(severity),
-            source: Some(SOURCE.to_string()),
-            message,
-            ..Default::default()
-        });
-    }
 }
 
 /// Syntax errors, duplicate nodes, unresolved includes and binding violations
-/// in one traversal, sorted by position. Whole-feature issues (`status`) are
-/// reported at the top of the file.
+/// sorted by position. Whole-feature issues (`status`) are reported at the top
+/// of the file.
+/// Uncached entry point (tests and one-off callers).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn all(
     doc: &Document,
     file_path: Option<&Path>,
@@ -103,7 +176,38 @@ pub fn all(
     bindings: &BindingIndex,
     status: &[FeatureIssue],
 ) -> Vec<Diagnostic> {
-    run(doc, file_path, include_dirs, bindings, status, CAT_ALL)
+    run(doc, file_path, include_dirs, bindings, status, CAT_ALL, None)
+}
+
+/// Same, reusing per-subtree results across edits.
+pub fn all_cached(
+    doc: &Document,
+    file_path: Option<&Path>,
+    include_dirs: &[PathBuf],
+    bindings: &BindingIndex,
+    status: &[FeatureIssue],
+    cache: &DiagCache,
+) -> Vec<Diagnostic> {
+    let cached = run(
+        doc,
+        file_path,
+        include_dirs,
+        bindings,
+        status,
+        CAT_ALL,
+        Some(cache),
+    );
+    if std::env::var_os("DTSLS_VERIFY_CACHE").is_some() {
+        let full = run(doc, file_path, include_dirs, bindings, status, CAT_ALL, None);
+        if cached != full {
+            tracing::error!(
+                cached = cached.len(),
+                full = full.len(),
+                "diagnostics cache diverged from a full recompute"
+            );
+        }
+    }
+    cached
 }
 
 fn run(
@@ -113,6 +217,7 @@ fn run(
     bindings: &BindingIndex,
     status: &[FeatureIssue],
     cats: u8,
+    cache: Option<&DiagCache>,
 ) -> Vec<Diagnostic> {
     // without a populated binding index, binding checks are pointless work —
     // but the feature notices must still get through
@@ -121,17 +226,12 @@ fn run(
     } else {
         cats
     };
+    if let Some(cache) = cache {
+        cache.sync(bindings);
+    }
     if cats == 0 && status.is_empty() {
         return Vec::new();
     }
-    let mut ctx = DiagCtx {
-        doc,
-        file_path,
-        include_dirs,
-        bindings,
-        cats,
-        out: Vec::new(),
-    };
     // one synthetic diagnostic per unusable/degraded feature, right at the
     // top of the file; the message shape is `feature: state — detail`
     let top = Range {
@@ -144,74 +244,193 @@ fn run(
             character: 0,
         },
     };
+    let mut out: Vec<Diagnostic> = Vec::new();
     for issue in status {
-        ctx.push(top.clone(), issue.severity, issue.message());
+        out.push(Diagnostic {
+            range: top.clone(),
+            severity: Some(issue.severity),
+            source: Some(SOURCE.to_string()),
+            message: issue.message(),
+            ..Default::default()
+        });
     }
-    if cats != 0 {
-        walk(doc.tree.root_node(), &mut ctx, false);
+    if cats == 0 {
+        return out;
     }
-    let mut out = ctx.out;
+    let root = doc.tree.root_node();
+    // error recovery is the only source of syntax diagnostics, and
+    // `has_error` is a flag: clean files skip the whole scan
+    if cats & CAT_SYNTAX != 0 && root.has_error() {
+        collect_errors(doc, root, &mut out);
+    }
+    let ctx = CheckCtx {
+        doc,
+        file_path,
+        include_dirs,
+        bindings,
+        cache,
+        file_hash: hash_bytes(
+            file_path
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default()
+                .as_bytes(),
+        ),
+        cats,
+    };
+    let mut raws: Vec<RawDiag> = Vec::new();
+    if cats & CAT_DUPLICATES != 0 {
+        check_duplicate_roots(root, doc, &mut out);
+    }
+    check_node(&ctx, root, false, &mut raws);
+    out.extend(raws.iter().map(|raw| Diagnostic {
+        range: Range {
+            start: util::byte_to_position(&doc.rope, raw.start as usize),
+            end: util::byte_to_position(&doc.rope, raw.end as usize),
+        },
+        severity: Some(raw.severity),
+        source: Some(SOURCE.to_string()),
+        message: raw.message.clone(),
+        ..Default::default()
+    }));
     out.sort_by_key(|d| (d.range.start, d.range.end));
+    out.truncate(MAX_DIAGNOSTICS);
     out
 }
 
-fn walk(node: Node, ctx: &mut DiagCtx, in_alternative: bool) {
-    if ctx.out.len() >= MAX_DIAGNOSTICS {
+/// Check one structural node and everything below it. Property subtrees are
+/// skipped: they can never contain subnodes, duplicates or includes.
+fn check_node(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<RawDiag>) {
+    let k = kinds();
+    let kind = node.kind_id();
+    if kind == k.property {
         return;
     }
-    let kind = node.kind_id();
-    if ctx.cats & CAT_SYNTAX != 0 {
-        if node.is_error() {
-            let range = error_range(ctx.doc, node);
-            ctx.push(
-                range,
-                DiagnosticSeverity::ERROR,
-                format!("syntax error near {}", snippet(ctx.doc, node)),
-            );
-            // the ERROR node covers the whole malformed region; recursing
-            // would only produce noise about the same span
-            return;
+    if node.is_error() || node.is_missing() {
+        // malformed region: its contents are not trustworthy
+        return;
+    }
+    let alternative = in_alternative || k.alternatives.contains(&kind);
+    if kind == k.subnode {
+        check_subnode(ctx, node, alternative, out);
+        return;
+    }
+    if kind == k.preproc_include {
+        if ctx.cats & CAT_INCLUDES != 0 {
+            include_into(ctx, node, out);
         }
-        if node.is_missing() {
-            let range = node_range(ctx.doc, node);
-            ctx.push(
-                range,
-                DiagnosticSeverity::ERROR,
-                format!("missing '{}'", node.kind()),
-            );
-            return;
+        return;
+    }
+    if k.containers.contains(&kind) && ctx.cats & CAT_DUPLICATES != 0 && !alternative {
+        duplicate_children_into(ctx.doc, node, out);
+    }
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.is_named() {
+                check_node(ctx, child, alternative, out);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
-    if ctx.cats & CAT_BINDINGS != 0 && kind == kinds().subnode {
-        check_binding_node(node, ctx);
+}
+
+/// A subnode's diagnostics depend only on its own text, so the whole subtree
+/// result is memoized (except inside `#else`/`#elif`, where duplicate checks
+/// must not run).
+fn check_subnode(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<RawDiag>) {
+    let Some(cache) = ctx.cache.filter(|_| !in_alternative) else {
+        check_subnode_uncached(ctx, node, in_alternative, out);
+        return;
+    };
+    let base = node.start_byte() as u32;
+    let text = &ctx.doc.text[node.start_byte()..node.end_byte()];
+    let key = CacheKey {
+        file: ctx.file_hash,
+        text: hash_bytes(text.as_bytes()),
+        len: text.len() as u32,
+        cats: ctx.cats,
+    };
+    if let Some(hit) = cache.get(&key) {
+        out.extend(hit.iter().map(|raw| raw.shifted(base)));
+        return;
     }
-    if ctx.cats & CAT_DUPLICATES != 0 && !in_alternative {
-        if kind == kinds().source_file {
-            check_duplicate_roots(node, ctx);
-        }
-        if kinds().containers.contains(&kind) {
-            check_duplicate_children(node, ctx);
-        }
+    let mut local = Vec::new();
+    check_subnode_uncached(ctx, node, in_alternative, &mut local);
+    cache.insert(key, local.iter().map(|raw| raw.rebase(base)).collect());
+    out.extend(local);
+}
+
+fn check_subnode_uncached(
+    ctx: &CheckCtx,
+    node: Node,
+    in_alternative: bool,
+    out: &mut Vec<RawDiag>,
+) {
+    if ctx.cats & CAT_BINDINGS != 0 {
+        check_binding_node(node, ctx.doc, ctx.bindings, out);
     }
-    if ctx.cats & CAT_INCLUDES != 0 && kind == kinds().preproc_include {
-        check_include_node(node, ctx);
+    if let Some(body) = util::node_def_of(node) {
+        check_node(ctx, body, in_alternative, out);
     }
-    let child_alternative = in_alternative || kinds().alternatives.contains(&kind);
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            walk(child, ctx, child_alternative);
+}
+
+/// Walk only the parts of the tree that carry errors: every node knows
+/// whether its subtree has one, so clean subtrees are never entered.
+fn collect_errors(doc: &Document, root: Node, out: &mut Vec<Diagnostic>) {
+    let mut cursor = root.walk();
+    collect_errors_node(doc, &mut cursor, out);
+}
+
+fn collect_errors_node(
+    doc: &Document,
+    cursor: &mut tree_sitter::TreeCursor<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let node = cursor.node();
+    if node.is_error() {
+        out.push(Diagnostic {
+            range: error_range(doc, node),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some(SOURCE.to_string()),
+            message: format!("syntax error near {}", snippet(doc, node)),
+            ..Default::default()
+        });
+        return;
+    }
+    if node.is_missing() {
+        out.push(Diagnostic {
+            range: node_range(doc, node),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some(SOURCE.to_string()),
+            message: format!("missing '{}'", node.kind()),
+            ..Default::default()
+        });
+        return;
+    }
+    if cursor.goto_first_child() {
+        loop {
+            if cursor.node().has_error() {
+                collect_errors_node(doc, cursor, out);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
+        cursor.goto_parent();
     }
 }
 
 #[cfg(test)]
 pub fn compute(doc: &Document) -> Vec<Diagnostic> {
-    run(doc, None, &[], &BindingIndex::default(), &[], CAT_SYNTAX)
+    run(doc, None, &[], &BindingIndex::default(), &[], CAT_SYNTAX, None)
 }
 
 #[cfg(test)]
 pub fn semantic(doc: &Document) -> Vec<Diagnostic> {
-    run(doc, None, &[], &BindingIndex::default(), &[], CAT_DUPLICATES)
+    run(doc, None, &[], &BindingIndex::default(), &[], CAT_DUPLICATES, None)
 }
 
 #[cfg(test)]
@@ -227,6 +446,7 @@ pub fn unresolved_includes(
         &BindingIndex::default(),
         &[],
         CAT_INCLUDES,
+        None,
     )
 }
 
@@ -237,22 +457,65 @@ pub fn binding_diagnostics(
     bindings: &BindingIndex,
     file_path: Option<&Path>,
 ) -> Vec<Diagnostic> {
-    run(doc, file_path, &[], bindings, &[], CAT_BINDINGS)
+    run(doc, file_path, &[], bindings, &[], CAT_BINDINGS, None)
 }
 
 /// Validate one node against its binding: missing required properties and
 /// (for strict, fully resolved bindings) unknown properties are errors; a
 /// `compatible` with no matching binding is a warning.
-fn check_binding_node(node: Node, ctx: &mut DiagCtx) {
-    let (Some(name_node), Some(compatibles)) = (
-        node.child_by_field_name("name"),
-        compatible_strings(ctx.doc, node),
-    ) else {
+fn check_binding_node(
+    node: Node,
+    doc: &Document,
+    bindings: &BindingIndex,
+    out: &mut Vec<RawDiag>,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
-    let Some(binding) = ctx.bindings.lookup(&compatibles) else {
-        ctx.push(
-            node_range(ctx.doc, name_node),
+    // one pass over the body: property name text plus the compatible property,
+    // so nothing is scanned twice
+    let k = kinds();
+    let body = util::node_def_of(node).unwrap_or(node);
+    let mut props: Vec<(Node, &str)> = Vec::with_capacity(body.child_count() / 2);
+    let mut compatible = None;
+    let mut cursor = body.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.kind_id() == k.property
+                && let Some(prop_name) = child.child_by_field_name("name")
+            {
+                let name = util::node_text(doc, prop_name);
+                if name == "compatible" {
+                    compatible = Some(child);
+                }
+                props.push((child, name));
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    let Some(compatible) = compatible else {
+        return;
+    };
+    let Some(compatibles) = compatible_strings_of(doc, compatible) else {
+        return;
+    };
+    let name_start = name_node.start_byte() as u32;
+    let name_end = name_node.end_byte() as u32;
+    let mut push = |start: u32, end: u32, severity: DiagnosticSeverity, message: String| {
+        out.push(RawDiag {
+            start,
+            end,
+            severity,
+            message,
+        });
+    };
+    let Some(binding) = bindings.lookup(&compatibles) else {
+        push(
+            name_start,
+            name_end,
             DiagnosticSeverity::WARNING,
             format!(
                 "no binding found for compatible \"{}\"",
@@ -265,39 +528,32 @@ fn check_binding_node(node: Node, ctx: &mut DiagCtx) {
         .uri
         .path_segments()
         .and_then(|mut s| s.next_back())
-        .unwrap_or("")
-        .to_string();
-    let node_name = util::node_text(ctx.doc, name_node);
+        .unwrap_or("");
+    let node_name = util::node_text(doc, name_node);
     let mut count = 0;
     for required in &binding.required {
-        if node_property(node, required, ctx.doc).is_none() {
-            ctx.push(
-                node_range(ctx.doc, name_node),
-                DiagnosticSeverity::ERROR,
-                format!(
-                    "missing required property '{required}' for node \
-                     '{node_name}' (binding: {file})"
-                ),
-            );
-            count += 1;
+        if props.iter().any(|(_, name)| *name == required) {
+            continue;
         }
+        push(
+            name_start,
+            name_end,
+            DiagnosticSeverity::ERROR,
+            format!(
+                "missing required property '{required}' for node \
+                 '{node_name}' (binding: {file})"
+            ),
+        );
+        count += 1;
     }
     if binding.strict && binding.refs_complete {
-        let body = util::node_def_of(node).unwrap_or(node);
-        for i in 0..body.child_count() {
-            let Some(child) = body.child(i as u32) else { continue };
-            if child.kind_id() != kinds().property {
+        for (prop_node, name) in &props {
+            if bindings.is_property_allowed(name, &binding) {
                 continue;
             }
-            let Some(prop_name) = child.child_by_field_name("name") else {
-                continue;
-            };
-            let name = util::node_text(ctx.doc, prop_name);
-            if ctx.bindings.is_property_allowed(name, &binding) {
-                continue;
-            }
-            ctx.push(
-                node_range(ctx.doc, prop_name),
+            push(
+                prop_node.start_byte() as u32,
+                prop_node.end_byte() as u32,
                 DiagnosticSeverity::ERROR,
                 format!("property '{name}' is not allowed by binding {file} (node '{node_name}')"),
             );
@@ -312,6 +568,11 @@ fn check_binding_node(node: Node, ctx: &mut DiagCtx) {
 /// All `compatible` strings declared by this node's `compatible` property.
 pub fn compatible_strings(doc: &Document, node: Node) -> Option<Vec<String>> {
     let prop = node_property(node, "compatible", doc)?;
+    compatible_strings_of(doc, prop)
+}
+
+/// `compatible` strings of an already-located property node.
+fn compatible_strings_of(doc: &Document, prop: Node) -> Option<Vec<String>> {
     let k = kinds();
     let mut out = Vec::new();
     for i in 0..prop.child_count() {
@@ -353,12 +614,13 @@ fn node_property<'a>(node: Node<'a>, name: &str, doc: &Document) -> Option<Node<
     None
 }
 
-fn check_include_node(node: Node, ctx: &mut DiagCtx) {
+fn include_into(ctx: &CheckCtx, node: Node, out: &mut Vec<RawDiag>) {
+    let doc = ctx.doc;
     let Some(path_node) = node.child_by_field_name("path") else {
         return;
     };
     let kind = path_node.kind_id();
-    let raw = util::node_text(ctx.doc, path_node);
+    let raw = util::node_text(doc, path_node);
     let (target, quoted) = if kind == kinds().preproc_string_literal {
         (raw.trim_matches('"'), true)
     } else if kind == kinds().system_lib_string {
@@ -373,21 +635,23 @@ fn check_include_node(node: Node, ctx: &mut DiagCtx) {
         quoted,
         ctx.include_dirs,
     );
-    if resolved.is_none() {
-        ctx.push(
-            node_range(ctx.doc, node),
-            DiagnosticSeverity::ERROR,
-            format!(
-                "unresolved #include \"{target}\" — no include dir matches; \
-                 open the workspace at the kernel root or set \
-                 initializationOptions.includePaths"
-            ),
-        );
+    if resolved.is_some() {
+        return;
     }
+    out.push(RawDiag {
+        start: node.start_byte() as u32,
+        end: node.end_byte() as u32,
+        severity: DiagnosticSeverity::ERROR,
+        message: format!(
+            "unresolved #include \"{target}\" — no include dir matches; \
+             open the workspace at the kernel root or set \
+             initializationOptions.includePaths"
+        ),
+    });
 }
 
 /// Multiple `/ { }` roots in one file are silently merged by dtc.
-fn check_duplicate_roots(node: Node, ctx: &mut DiagCtx) {
+fn check_duplicate_roots(node: Node, doc: &Document, out: &mut Vec<Diagnostic>) {
     let mut seen_root = false;
     for i in 0..node.child_count() {
         let Some(child) = node.child(i as u32) else { continue };
@@ -398,11 +662,17 @@ fn check_duplicate_roots(node: Node, ctx: &mut DiagCtx) {
             continue;
         }
         let range = Range {
-            start: util::byte_to_position(&ctx.doc.rope, child.start_byte()),
-            end: util::byte_to_position(&ctx.doc.rope, child.start_byte() + 1),
+            start: util::byte_to_position(&doc.rope, child.start_byte()),
+            end: util::byte_to_position(&doc.rope, child.start_byte() + 1),
         };
         if seen_root {
-            ctx.push(range, DiagnosticSeverity::ERROR, "duplicate node '/'".to_string());
+            out.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some(SOURCE.to_string()),
+                message: "duplicate node '/'".to_string(),
+                ..Default::default()
+            });
         } else {
             seen_root = true;
         }
@@ -411,47 +681,53 @@ fn check_duplicate_roots(node: Node, ctx: &mut DiagCtx) {
 
 /// Flag sibling nodes that define the same name (dtc would silently merge
 /// them) or that claim the same unit address under one parent.
-fn check_duplicate_children(node: Node, ctx: &mut DiagCtx) {
-    let mut seen_names: HashMap<String, String> = HashMap::new();
-    let mut seen_addresses: HashMap<String, String> = HashMap::new();
-    for i in 0..node.child_count() {
-        let Some(child) = node.child(i as u32) else { continue };
-        if child.kind_id() != kinds().subnode {
-            continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        let full = util::node_text(ctx.doc, name_node).to_string();
-        let (name, address) = match full.split_once('@') {
-            Some((name, addr)) => (name.to_string(), Some(addr.to_string())),
-            None => (full.clone(), None),
-        };
-        if seen_names.contains_key(&full) {
-            ctx.push(
-                node_range(ctx.doc, name_node),
-                DiagnosticSeverity::ERROR,
-                format!("duplicate node '{full}'"),
-            );
-        } else {
-            seen_names.insert(full.clone(), name.clone());
-        }
-        if let Some(addr) = &address {
-            match seen_addresses.get(addr) {
-                Some(first_name) if first_name != &name => {
-                    // Legitimate on some SoCs (e.g. Qualcomm GENI: one serial
-                    // engine, several protocol nodes per address), so this is
-                    // a warning, not an error.
-                    ctx.push(
-                        node_range(ctx.doc, name_node),
-                        DiagnosticSeverity::WARNING,
-                        format!("node '{full}' shares address with '{first_name}@{addr}'"),
-                    );
+fn duplicate_children_into(doc: &Document, node: Node, out: &mut Vec<RawDiag>) {
+    let mut seen_names: FxHashMap<&str, ()> = FxHashMap::default();
+    let mut seen_addresses: FxHashMap<&str, &str> = FxHashMap::default();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.kind_id() == kinds().subnode
+                && let Some(name_node) = child.child_by_field_name("name")
+            {
+                let full = util::node_text(doc, name_node);
+                let (name, address) = match full.split_once('@') {
+                    Some((name, addr)) => (name, Some(addr)),
+                    None => (full, None),
+                };
+                if seen_names.insert(full, ()).is_some() {
+                    out.push(RawDiag {
+                        start: name_node.start_byte() as u32,
+                        end: name_node.end_byte() as u32,
+                        severity: DiagnosticSeverity::ERROR,
+                        message: format!("duplicate node '{full}'"),
+                    });
                 }
-                None => {
-                    seen_addresses.insert(addr.clone(), name.clone());
+                if let Some(addr) = address {
+                    match seen_addresses.get(addr) {
+                        Some(first_name) if *first_name != name => {
+                            // Legitimate on some SoCs (e.g. Qualcomm GENI: one
+                            // serial engine, several protocol nodes per
+                            // address), so this is a warning, not an error.
+                            out.push(RawDiag {
+                                start: name_node.start_byte() as u32,
+                                end: name_node.end_byte() as u32,
+                                severity: DiagnosticSeverity::WARNING,
+                                message: format!(
+                                    "node '{full}' shares address with '{first_name}@{addr}'"
+                                ),
+                            });
+                        }
+                        None => {
+                            seen_addresses.insert(addr, name);
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
+            }
+            if !cursor.goto_next_sibling() {
+                break;
             }
         }
     }
@@ -521,23 +797,25 @@ fn line_range_at_line(doc: &Document, line: u32) -> Range {
 /// shallower one is the likely culprit. Plain greedy pairing would blame the
 /// outermost node instead (everything below an unclosed `{` shifts one level).
 fn last_unmatched_open_brace(doc: &Document, start_byte: usize) -> Option<usize> {
-    let start_line = doc.rope.byte_to_line(start_byte);
+    // scan the mirrored text directly: ropey random access is O(log n) and
+    // an unterminated file makes this region span everything up to EOF
+    let bytes = doc.text.as_bytes();
+    let start_byte = start_byte.min(bytes.len());
+    let line_start = doc.text[..start_byte].rfind('\n').map_or(0, |pos| pos + 1);
     let mut stack: Vec<(usize, usize)> = Vec::new(); // (byte, indent width)
     let mut suspects: Vec<usize> = Vec::new();
     let mut in_comment = false;
+    let mut line_begin = line_start;
 
-    for line_idx in start_line..doc.rope.len_lines() {
-        let line_start = doc.rope.line_to_byte(line_idx);
-        let line_end = if line_idx + 1 < doc.rope.len_lines() {
-            doc.rope.line_to_byte(line_idx + 1)
-        } else {
-            doc.rope.len_bytes()
-        };
+    while line_begin < bytes.len() {
+        let line_end = doc.text[line_begin..]
+            .find('\n')
+            .map_or(bytes.len(), |pos| line_begin + pos);
 
         let mut indent = 0;
-        let mut byte = line_start;
+        let mut byte = line_begin;
         while byte < line_end {
-            match doc.rope.byte(byte) {
+            match bytes[byte] {
                 b'\t' => indent += 8 - (indent % 8),
                 b' ' => indent += 1,
                 _ => break,
@@ -547,9 +825,9 @@ fn last_unmatched_open_brace(doc: &Document, start_byte: usize) -> Option<usize>
 
         let mut in_string = false;
         while byte < line_end {
-            let b = doc.rope.byte(byte);
+            let b = bytes[byte];
             if in_comment {
-                if b == b'*' && byte + 1 < line_end && doc.rope.byte(byte + 1) == b'/' {
+                if b == b'*' && byte + 1 < line_end && bytes[byte + 1] == b'/' {
                     in_comment = false;
                     byte += 1;
                 }
@@ -561,11 +839,11 @@ fn last_unmatched_open_brace(doc: &Document, start_byte: usize) -> Option<usize>
                 }
             } else {
                 match b {
-                    b'/' if byte + 1 < line_end && doc.rope.byte(byte + 1) == b'*' => {
+                    b'/' if byte + 1 < line_end && bytes[byte + 1] == b'*' => {
                         in_comment = true;
                         byte += 1;
                     }
-                    b'/' if byte + 1 < line_end && doc.rope.byte(byte + 1) == b'/' => break,
+                    b'/' if byte + 1 < line_end && bytes[byte + 1] == b'/' => break,
                     b'"' => in_string = true,
                     b'{' => stack.push((byte, indent)),
                     b'}' => loop {
@@ -587,6 +865,7 @@ fn last_unmatched_open_brace(doc: &Document, start_byte: usize) -> Option<usize>
             }
             byte += 1;
         }
+        line_begin = line_end + 1;
     }
 
     suspects.extend(stack.into_iter().map(|(pos, _)| pos));
@@ -594,7 +873,9 @@ fn last_unmatched_open_brace(doc: &Document, start_byte: usize) -> Option<usize>
 }
 
 fn snippet(doc: &Document, node: Node) -> String {
-    let text = doc.slice(node.start_byte()..node.end_byte());
+    let start = node.start_byte();
+    let end = (start + 80).min(node.end_byte()).min(doc.text.len());
+    let text = &doc.text[start..end];
     let first_line = text.lines().next().unwrap_or("");
     let short: String = first_line.chars().take(32).collect();
     format!("{short:?}")
@@ -603,6 +884,7 @@ fn snippet(doc: &Document, node: Node) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::scan;
     use crate::document::Document;
 
     fn diagnostics_for(text: &str) -> Vec<Diagnostic> {
@@ -850,6 +1132,115 @@ mod tests {
         let text = "/dts-v1/;\n\n/ {\n    widget@0 {\n        compatible = \"acme,widget\";\n        reg = <0 1>;\n        clocks = <&c 0>;\n        status_probe;\n    };\n};\n";
         let doc = Document::open(text, 0);
         assert!(binding_diagnostics(&doc, &bindings, None).is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_diagnostics() {
+        let path = Path::new("/linux-7.2.2/arch/arm64/boot/dts/qcom/sm8650.dtsi");
+        let text = std::fs::read_to_string(path).unwrap();
+        let doc = Document::open(&text, 1);
+        let includes = vec![PathBuf::from("/linux-7.2.2/include")];
+        let iterations = 200;
+
+        let bindings = BindingIndex::default();
+        let started = std::time::Instant::now();
+        scan(
+            &bindings,
+            Path::new("/linux-7.2.2/Documentation/devicetree/bindings"),
+        );
+        println!(
+            "bindings: {} scanned in {:?}",
+            bindings.len(),
+            started.elapsed()
+        );
+
+        let empty = BindingIndex::default();
+        for (label, index, cats) in [
+            ("walk only (no checks)", &empty, 0u8),
+            ("syntax", &empty, CAT_SYNTAX),
+            ("duplicates", &empty, CAT_DUPLICATES),
+            ("includes", &empty, CAT_INCLUDES),
+            ("bindings (empty index)", &empty, CAT_BINDINGS),
+            ("bindings (kernel index)", &bindings, CAT_BINDINGS),
+            ("all (kernel index)", &bindings, CAT_ALL),
+        ] {
+            let diags = run(&doc, Some(path), &includes, index, &[], cats, None);
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(run(&doc, Some(path), &includes, index, &[], cats, None));
+            }
+            println!(
+                "{label}: {:?}/iter, {} diagnostics",
+                started.elapsed() / iterations,
+                diags.len()
+            );
+        }
+    }
+
+    #[test]
+    fn cached_diagnostics_match_full_recompute() {
+        use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier};
+        let text = "/dts-v1/;\n\n/ {\n    widget@1000 {\n        compatible = \"acme,widget\";\n        reg = <0x0 0x1000>;\n        bogus = <1>;\n    };\n\n    widget@2000 {\n        compatible = \"acme,widget\";\n        reg = <0x0 0x2000>;\n    };\n};\n";
+        let mut doc = Document::open(text, 0);
+        let cache = DiagCache::default();
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(crate::bindings::Binding {
+            uri: tower_lsp::lsp_types::Url::parse("file:///widget.yaml").unwrap(),
+            singles: vec!["acme,widget".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "reg", "clock-names"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required: vec!["compatible".to_string(), "reg".to_string()],
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        });
+        let check = |doc: &Document| {
+            let cached = all_cached(doc, None, &[], &bindings, &[], &cache);
+            let full = all(doc, None, &[], &bindings, &[]);
+            assert_eq!(cached, full, "cached diagnostics diverged from a full recompute");
+            cached
+        };
+        let initial = check(&doc);
+        assert!(
+            initial.iter().any(|d| d.message.contains("not allowed")),
+            "diags: {initial:?}"
+        );
+
+        let edits: [(&str, VersionedTextDocumentIdentifier, TextDocumentContentChangeEvent); 3] = {
+            let change = |line: u32, character: u32, text: &str| TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position { line, character },
+                    end: Position { line, character },
+                }),
+                range_length: None,
+                text: text.to_string(),
+            };
+            let id = |version| VersionedTextDocumentIdentifier {
+                uri: tower_lsp::lsp_types::Url::parse("file:///t.dts").unwrap(),
+                version,
+            };
+            [
+                ("insert property", id(1), change(6, 0, "        clock-names = \"a\";\n")),
+                ("insert duplicate node", id(2), change(9, 0, "    widget@1000 {\n    };\n\n")),
+                ("remove required", id(3), change(4, 0, "")),
+            ]
+        };
+        for (label, id, edit) in edits {
+            doc.apply_changes(
+                &[TextDocumentContentChangeEvent {
+                    range: edit.range,
+                    range_length: None,
+                    text: edit.text,
+                }],
+                id.version,
+            );
+            let diags = check(&doc);
+            println!("{label}: {} diagnostics", diags.len());
+        }
     }
 
     #[test]

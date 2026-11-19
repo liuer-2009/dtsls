@@ -18,7 +18,7 @@ use crate::{diagnostics, semantic_tokens, symbols};
 
 pub struct Backend {
     client: Client,
-    documents: RwLock<HashMap<Url, Document>>,
+    documents: Arc<RwLock<HashMap<Url, Document>>>,
     root_dirs: RwLock<Vec<PathBuf>>,
     /// Workspace-wide contribution tables (labels, refs, includes), built in
     /// background; requests read finished entries only.
@@ -28,17 +28,25 @@ pub struct Backend {
     /// Whole-feature conditions (unavailable = error, degraded = warning),
     /// reported at the top of every file.
     status: RwLock<Vec<FeatureIssue>>,
+    /// Per-subtree diagnostic results, so a keystroke only rechecks the
+    /// subtree it touched.
+    diag_cache: diagnostics::DiagCache,
+    /// Latest scheduled index rebuild per document; older ones are dropped,
+    /// so typing does not queue one full re-index per keystroke.
+    pending_index: Arc<RwLock<HashMap<Url, u64>>>,
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            documents: RwLock::new(HashMap::new()),
+            documents: Arc::new(RwLock::new(HashMap::new())),
             root_dirs: RwLock::new(Vec::new()),
             index: Arc::new(Index::default()),
             bindings: Arc::new(BindingIndex::default()),
             status: RwLock::new(Vec::new()),
+            diag_cache: diagnostics::DiagCache::default(),
+            pending_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -51,33 +59,46 @@ impl Backend {
     /// tables of every file that includes it (directly or transitively) —
     /// their merged completion data caches this file's contributions.
     fn schedule_file_index(&self, uri: Url, text: String, version: i32) {
+        // Coalesce: bump a generation and let a delayed task do the work only
+        // if it is still the newest request for this document. Continuous
+        // typing then triggers one rebuild, not one per keystroke.
+        let generation = {
+            let mut pending = self.pending_index.write().unwrap();
+            let slot = pending.entry(uri.clone()).or_insert(0);
+            *slot += 1;
+            *slot
+        };
         let index = Arc::clone(&self.index);
         let roots = self.root_dirs.read().unwrap().clone();
-        // capture live text of open dependents before leaving the request
-        let dependents: Vec<(Url, Option<(String, i32)>)> = {
-            let docs = self.documents.read().unwrap();
-            self.index
-                .dependents_transitive(&uri)
-                .into_iter()
-                .map(|dependent| {
-                    let live = docs
-                        .get(&dependent)
-                        .map(|doc| (doc.text.clone(), doc.version));
-                    (dependent, live)
-                })
-                .collect()
-        };
-        tokio::task::spawn_blocking(move || {
-            index::build_and_insert(&index, &uri, &text, version, &roots, 0);
-            // Closed dependents keep their own (unchanged) label/include data;
-            // only their *merged* completion view would be stale, and that is
-            // only consumed while they are open. Rebuilding every closed board
-            // file that includes this dtsi on every keystroke is not worth it.
-            for (dependent, live) in dependents {
-                if let Some((text, version)) = live {
+        let pending = Arc::clone(&self.pending_index);
+        let documents = Arc::clone(&self.documents);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if pending.read().unwrap().get(&uri) != Some(&generation) {
+                return;
+            }
+            tokio::task::spawn_blocking(move || {
+                index::build_and_insert(&index, &uri, &text, version, &roots, 0);
+                // Closed dependents keep their own (unchanged) label/include
+                // data; only their *merged* completion view would be stale,
+                // and that is only consumed while they are open.
+                let dependents: Vec<(Url, String, i32)> = {
+                    let docs = documents.read().unwrap();
+                    index
+                        .dependents_transitive(&uri)
+                        .into_iter()
+                        .filter_map(|dependent| {
+                            docs.get(&dependent)
+                                .map(|doc| (dependent.clone(), doc.text.clone(), doc.version))
+                        })
+                        .collect()
+                };
+                for (dependent, text, version) in dependents {
                     index::build_and_insert(&index, &dependent, &text, version, &roots, 0);
                 }
-            }
+            })
+            .await
+            .ok();
         });
     }
 }
@@ -248,12 +269,13 @@ impl LanguageServer for Backend {
             docs.insert(td.uri.clone(), Document::open(&td.text, td.version));
             match docs.get(&td.uri) {
                 Some(doc) => (
-                    diagnostics::all(
+                    diagnostics::all_cached(
                         doc,
                         td.uri.to_file_path().ok().as_deref(),
                         &self.include_dirs(),
                         &self.bindings,
                         &self.status.read().unwrap(),
+                        &self.diag_cache,
                     ),
                     doc.version,
                 ),
@@ -275,12 +297,13 @@ impl LanguageServer for Backend {
                 Some(doc) => {
                     doc.apply_changes(&params.content_changes, params.text_document.version);
                     let parse_done = started.elapsed();
-                    let diags = diagnostics::all(
+                    let diags = diagnostics::all_cached(
                         doc,
                         uri.to_file_path().ok().as_deref(),
                         &self.include_dirs(),
                         &self.bindings,
                         &self.status.read().unwrap(),
+                        &self.diag_cache,
                     );
                     debug!(
                         parse_us = parse_done.as_micros() as u64,
@@ -299,6 +322,7 @@ impl LanguageServer for Backend {
         self.client
             .publish_diagnostics(uri, diags, Some(version))
             .await;
+        debug!(total_us = started.elapsed().as_micros() as u64, "did_change done");
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {

@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
@@ -41,7 +43,7 @@ impl CompatibleIndex {
 type CompoundPattern = Vec<Vec<String>>;
 
 /// Compound patterns bucketed by their first compatible value.
-type CompoundBucket = HashMap<String, Vec<(CompoundPattern, Arc<Binding>)>>;
+type CompoundBucket = FxHashMap<String, Vec<(CompoundPattern, Arc<Binding>)>>;
 
 /// The subset of a devicetree binding this server validates against.
 pub struct Binding {
@@ -51,7 +53,7 @@ pub struct Binding {
     /// compound compatibles (`items:`): per position, the allowed values
     pub compounds: Vec<CompoundPattern>,
     /// property names allowed on matching nodes (own + `$ref`-resolved)
-    pub properties: HashSet<String>,
+    pub properties: FxHashSet<String>,
     /// required property names
     pub required: Vec<String>,
     /// `additionalProperties: false` / `unevaluatedProperties: false`
@@ -67,16 +69,21 @@ pub struct Binding {
 /// lookups are deterministic.
 #[derive(Default)]
 pub struct BindingIndex {
-    by_single: RwLock<HashMap<String, Arc<Binding>>>,
+    by_single: RwLock<FxHashMap<String, Arc<Binding>>>,
     /// first compatible string -> compound patterns
     by_compound: RwLock<CompoundBucket>,
     count: RwLock<usize>,
     /// meta-schema properties every node may carry (`pinctrl-*`, ...)
-    implicit_properties: RwLock<HashSet<String>>,
+    implicit_properties: RwLock<FxHashSet<String>>,
     /// meta-schema property patterns (`-supply$`, `.*-names$`, ...)
     implicit_patterns: RwLock<Vec<regex::Regex>>,
     /// vendors/devices/vendor-less compatibles for `compatible = "…"`
     compat: RwLock<CompatibleIndex>,
+    /// `binding pointer -> property name -> allowed`
+    allowed_cache: dashmap::DashMap<usize, dashmap::DashMap<String, bool>>,
+    /// bumped whenever the index contents change, so diagnostics caches keyed
+    /// on binding answers can be dropped
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl BindingIndex {
@@ -121,11 +128,30 @@ impl BindingIndex {
     }
 
     /// May the node carry this property according to the binding and the
-    /// meta-schemas?
+    /// meta-schemas? Answers are memoized per (binding, property): bindings
+    /// live in the index for the whole process, so the pointer key is stable.
     pub fn is_property_allowed(&self, name: &str, binding: &Binding) -> bool {
+        // fast path: no locks and no memoization for the common cases
         if is_common_property(name) || binding.properties.contains(name) {
             return true;
         }
+        let ptr = binding as *const Binding as usize;
+        {
+            if let Some(per_binding) = self.allowed_cache.get(&ptr) {
+                if let Some(allowed) = per_binding.get(name) {
+                    return *allowed;
+                }
+            }
+        }
+        let allowed = self.compute_property_allowed(name, binding);
+        self.allowed_cache
+            .entry(ptr)
+            .or_default()
+            .insert(name.to_string(), allowed);
+        allowed
+    }
+
+    fn compute_property_allowed(&self, name: &str, binding: &Binding) -> bool {
         if self
             .implicit_properties
             .read()
@@ -144,9 +170,20 @@ impl BindingIndex {
             .any(|re| re.is_match(name))
     }
 
-    fn set_implicit(&self, properties: HashSet<String>, patterns: Vec<regex::Regex>) {
+    fn set_implicit(&self, properties: FxHashSet<String>, patterns: Vec<regex::Regex>) {
         *self.implicit_properties.write().unwrap() = properties;
         *self.implicit_patterns.write().unwrap() = patterns;
+        self.bump_generation();
+    }
+
+    /// Changes whenever binding answers may have changed.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Match a node's full compatible list: singles match if the list
@@ -236,6 +273,7 @@ impl BindingIndex {
             }
         }
         *self.count.write().unwrap() += 1;
+        self.bump_generation();
     }
 
     fn set_vendor_names(&self, names: BTreeMap<String, String>) {
@@ -281,7 +319,7 @@ pub fn scan(index: &BindingIndex, dir: &Path) {
     let started = std::time::Instant::now();
     let package = dtschema_package_dir();
     if let Some(package) = package {
-        let mut properties = HashSet::new();
+        let mut properties = FxHashSet::default();
         let mut patterns = Vec::new();
         collect_meta_allowlist(
             &package.join("meta-schemas"),
@@ -462,7 +500,7 @@ fn build_binding(
     singles: Vec<String>,
     compounds: Vec<CompoundPattern>,
 ) -> Binding {
-    let mut properties: HashSet<String> = HashSet::new();
+    let mut properties: FxHashSet<String> = FxHashSet::default();
     if let Some(props) = yaml_get(schema, "properties").and_then(Yaml::as_hash) {
         for key in props.keys() {
             if let Some(name) = key.as_str() {
@@ -696,7 +734,7 @@ fn resolve_refs(
     doc: &Yaml,
     binding_path: &Path,
     binding_dir: Option<&Path>,
-    properties: &mut HashSet<String>,
+    properties: &mut FxHashSet<String>,
     visited: &mut HashSet<PathBuf>,
     depth: usize,
 ) -> bool {
@@ -913,7 +951,7 @@ fn local_schema_roots() -> Vec<PathBuf> {
 
 /// Union of `properties` keys and `patternProperties` from every
 /// meta-schema document: properties any node may carry.
-fn collect_meta_allowlist(dir: &Path, properties: &mut HashSet<String>, patterns: &mut Vec<regex::Regex>) {
+fn collect_meta_allowlist(dir: &Path, properties: &mut FxHashSet<String>, patterns: &mut Vec<regex::Regex>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -936,7 +974,7 @@ fn collect_meta_allowlist(dir: &Path, properties: &mut HashSet<String>, patterns
 
 fn collect_property_declarations(
     node: &Yaml,
-    properties: &mut HashSet<String>,
+    properties: &mut FxHashSet<String>,
     patterns: &mut Vec<regex::Regex>,
 ) {
     match node {
@@ -1084,7 +1122,7 @@ properties:
             uri: Url::parse("file:///t.yaml").unwrap(),
             singles,
             compounds,
-            properties: HashSet::new(),
+            properties: FxHashSet::default(),
             required: Vec::new(),
             strict: false,
             refs_complete: true,
@@ -1110,7 +1148,7 @@ properties:
                 uri: Url::parse(&format!("file:///{file}")).unwrap(),
                 singles: singles.into_iter().map(str::to_string).collect(),
                 compounds: Vec::new(),
-                properties: HashSet::new(),
+                properties: FxHashSet::default(),
                 required: Vec::new(),
                 strict: false,
                 refs_complete: true,
