@@ -575,7 +575,16 @@ fn node_view(doc: &Document, byte: usize, bindings: &BindingIndex) -> NodeView {
     let mut existing = HashSet::new();
     let mut compatibles = None;
     let mut endpoint = None;
-    if let Some(node) = completion::enclosing_node(doc, byte) {
+    // A node starting on the cursor's own line is not the one being typed
+    // inside: error recovery glues the partial line onto the *following*
+    // node, so its compatible would win. Only nodes whose header is above the
+    // cursor are trusted; the text reader handles the rest.
+    let line_start = doc
+        .rope
+        .line_to_byte(doc.rope.byte_to_line(byte.min(doc.rope.len_bytes())));
+    if let Some(node) = completion::enclosing_node(doc, byte)
+        && node.start_byte() < line_start
+    {
         compatibles = node_compatibles(doc, node);
         endpoint = Some(completion::is_endpoint_or_port(doc, node));
         if let Some(body) = util::node_def_of(node) {
@@ -593,18 +602,20 @@ fn node_view(doc: &Document, byte: usize, bindings: &BindingIndex) -> NodeView {
         // incomplete node: read compatible/properties from the text
         if let Some(text_node) = completion::text_node(doc, byte) {
             endpoint.get_or_insert_with(|| text_node.is_endpoint_or_port());
+            existing.extend(text_node.properties);
             if !text_node.compatibles.is_empty() {
                 compatibles = Some(text_node.compatibles);
-                existing.extend(text_node.properties);
             }
         }
     }
     let endpoint = endpoint.unwrap_or_else(|| completion::in_endpoint_or_port(doc, byte));
     let binding = compatibles.as_ref().and_then(|list| bindings.lookup(list));
+    let can_add_compatible =
+        !endpoint && compatibles.is_none() && !existing.contains("compatible");
     NodeView {
         binding,
         existing,
-        can_add_compatible: !endpoint && compatibles.is_none(),
+        can_add_compatible,
     }
 }
 
@@ -701,6 +712,54 @@ mod tests {
         let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["clock-names", "clocks"], "items: {labels:?}");
     }
+
+    fn nested_bindings() -> BindingIndex {
+        let bindings = BindingIndex::default();
+        let make = |single: &str, props: &[&str]| Binding {
+            uri: Url::parse(&format!("file:///{single}.yaml")).unwrap(),
+            singles: vec![single.to_string()],
+            compounds: Vec::new(),
+            properties: props.iter().map(|p| p.to_string()).collect(),
+            required: vec!["compatible".to_string()],
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        };
+        bindings.insert_for_test(make("acme,parent", &["compatible", "parent-prop", "parent-extra"]));
+        bindings.insert_for_test(make("acme,child", &["compatible", "child-prop"]));
+        bindings
+    }
+
+    #[test]
+    fn completion_above_a_node_uses_the_parent() {
+        // cursor on the blank line between the parent's last property and the
+        // child node header: the child's compatible must not leak in
+        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        compatible = \"acme,parent\";\n        parent-prop = <1>;\n        p\n        child@2000 {\n            compatible = \"acme,child\";\n        };\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let byte = text.find("        p\n").unwrap() + 9;
+        let items = property_completion(&doc, byte, "p", &nested_bindings());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        // parent-prop is already written in the node, so only the other one
+        assert_eq!(labels, vec!["parent-extra"], "items: {labels:?}");
+    }
+
+    #[test]
+    fn completion_above_a_node_offers_compatible_for_the_parent() {
+        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        reg = <1>;\n        c\n        child@2000 {\n            compatible = \"acme,child\";\n        };\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let byte = text.find("        c\n").unwrap() + 9;
+        let items = property_completion(&doc, byte, "c", &nested_bindings());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["compatible"], "items: {labels:?}");
+    }
+
+    #[test]
+    fn completion_inside_a_node_still_uses_that_node() {
+        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        compatible = \"acme,parent\";\n        child@2000 {\n            compatible = \"acme,child\";\n            c\n        };\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let byte = text.find("            c\n").unwrap() + 13;
+        let items = property_completion(&doc, byte, "c", &nested_bindings());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["child-prop"], "items: {labels:?}");
+    }
 }
-
-
