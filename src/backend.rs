@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -34,6 +34,14 @@ pub struct Backend {
     /// Latest scheduled index rebuild per document; older ones are dropped,
     /// so typing does not queue one full re-index per keystroke.
     pending_index: Arc<RwLock<HashMap<Url, u64>>>,
+    /// Last per-file diagnostics, so translation-unit results can be merged
+    /// with them instead of replacing them.
+    file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
+    /// Coalesced translation-unit re-runs, per root.
+    tu_pending: Arc<RwLock<HashMap<Url, u64>>>,
+    /// false when no C preprocessor is installed: cross-file checks fall back
+    /// to the per-file path.
+    cpp_available: bool,
 }
 
 impl Backend {
@@ -47,6 +55,12 @@ impl Backend {
             status: RwLock::new(Vec::new()),
             diag_cache: diagnostics::DiagCache::default(),
             pending_index: Arc::new(RwLock::new(HashMap::new())),
+            file_diags: Arc::new(RwLock::new(HashMap::new())),
+            tu_pending: Arc::new(RwLock::new(HashMap::new())),
+            cpp_available: std::process::Command::new("cpp")
+                .arg("--version")
+                .output()
+                .is_ok(),
         }
     }
 
@@ -101,6 +115,201 @@ impl Backend {
             .ok();
         });
     }
+
+    /// Roots whose translation unit contains `uri`: a `.dts` is its own root,
+    /// anything else is looked up through the reverse include edges (falling
+    /// back to the file itself so a lone `.dtsi` still gets its closure
+    /// checked).
+    fn tu_roots_for(&self, uri: &Url) -> Vec<(Url, PathBuf)> {
+        if !self.cpp_available {
+            return Vec::new();
+        }
+        let Ok(path) = uri.to_file_path() else {
+            return Vec::new();
+        };
+        if path.extension().and_then(|ext| ext.to_str()) == Some("dts") {
+            return vec![(uri.clone(), path)];
+        }
+        let open = self.documents.read().unwrap();
+        let mut roots: Vec<(Url, PathBuf)> = self
+            .index
+            .dependents_transitive(uri)
+            .into_iter()
+            .filter_map(|dependent| {
+                let path = dependent.to_file_path().ok()?;
+                (path.extension().and_then(|ext| ext.to_str()) == Some("dts"))
+                    .then_some((dependent, path))
+            })
+            .collect();
+        // prefer boards that are currently open, then a stable order
+        roots.sort_by_key(|(root, path)| (!open.contains_key(root), path.clone()));
+        drop(open);
+        roots.truncate(4);
+        if roots.is_empty() {
+            roots.push((uri.clone(), path));
+        }
+        roots
+    }
+
+    /// Re-check a translation unit off the main loop. Coalesced like the index
+    /// rebuild: typing only triggers one run once the edits settle.
+    fn schedule_tu(&self, root_uri: Url, root_path: PathBuf) {
+        info!(root = %root_uri, "tu scheduled");
+        let generation = {
+            let mut pending = self.tu_pending.write().unwrap();
+            let slot = pending.entry(root_uri.clone()).or_insert(0);
+            *slot += 1;
+            *slot
+        };
+        let documents = Arc::clone(&self.documents);
+        let file_diags = Arc::clone(&self.file_diags);
+        let pending = Arc::clone(&self.tu_pending);
+        let include_dirs = self.include_dirs();
+        let client = self.client.clone();
+        let task_root = root_uri.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if pending.read().unwrap().get(&task_root) != Some(&generation) {
+                return;
+            }
+            let overlays_docs = Arc::clone(&documents);
+            let root_path_task = root_path.clone();
+            let started = std::time::Instant::now();
+            let tu_result = tokio::task::spawn_blocking(move || {
+                // clangd's VFS equivalent: every open buffer overrides the
+                // on-disk file inside the preprocessor run
+                let overlays: BTreeMap<PathBuf, String> = {
+                    let docs = overlays_docs.read().unwrap();
+                    docs.iter()
+                        .filter_map(|(uri, doc)| {
+                            let path = uri.to_file_path().ok()?;
+                            let path = std::fs::canonicalize(&path).unwrap_or(path);
+                            Some((path, doc.text.clone()))
+                        })
+                        .collect()
+                };
+                let work = std::env::temp_dir()
+                    .join("dtsls-tu")
+                    .join(format!("{:016x}", crate::tu::hash_path(&root_path_task)));
+                let result = crate::tu::preprocess(
+                    &crate::tu::TuInput {
+                        root: &root_path_task,
+                        include_dirs: &include_dirs,
+                        overlays: &overlays,
+                    },
+                    &work,
+                )?;
+                Some(tu_diagnostics(&result))
+            })
+            .await
+            .ok()
+            .flatten();
+            debug!(
+                root = %task_root,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                files = tu_result.as_ref().map(|map| map.len()).unwrap_or(0),
+                "translation unit checked"
+            );
+            let Some(per_file) = tu_result else {
+                warn!(root = %task_root, "translation unit check could not run");
+                return;
+            };
+            for (path, structural) in per_file {
+                let Ok(uri) = Url::from_file_path(&path) else {
+                    continue;
+                };
+                let (open, version) = {
+                    let docs = documents.read().unwrap();
+                    match docs.get(&uri) {
+                        Some(doc) => (true, Some(doc.version)),
+                        None => (false, None),
+                    }
+                };
+                if !open {
+                    continue;
+                }
+                let mut merged = file_diags
+                    .read()
+                    .unwrap()
+                    .get(&uri)
+                    .cloned()
+                    .unwrap_or_default();
+                // the per-file pass already reports what it can see; only add
+                // what the merged unit found (cross-file duplicates, ...)
+                for diag in structural {
+                    let known = merged.iter().any(|existing| {
+                        existing.range.start == diag.range.start
+                            && existing.message == diag.message
+                    });
+                    if !known {
+                        merged.push(diag);
+                    }
+                }
+                client.publish_diagnostics(uri, merged, version).await;
+            }
+        });
+    }
+}
+
+/// Diagnostics produced for a preprocessed unit, grouped by the file they
+/// belong to (positions mapped back through the preprocessor line markers).
+fn tu_diagnostics(unit: &crate::tu::TuResult) -> HashMap<PathBuf, Vec<Diagnostic>> {
+    let doc = Document::open(&unit.text, 0);
+    let mut out: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
+    for diag in diagnostics::structural(&doc) {
+        let Some((source, path)) = unit.locate(diag.range.start.line) else {
+            continue;
+        };
+        let end = unit
+            .locate(diag.range.end.line)
+            .map(|(source, _)| source)
+            .unwrap_or(source);
+        let start = Position {
+            line: source.line,
+            character: diag.range.start.character,
+        };
+        let end = if end.file == source.file && end.line >= source.line {
+            Position {
+                line: end.line,
+                character: diag.range.end.character,
+            }
+        } else {
+            Position {
+                line: start.line,
+                character: start.character + 1,
+            }
+        };
+        out.entry(path.to_path_buf())
+            .or_default()
+            .push(Diagnostic {
+                range: Range { start, end },
+                severity: diag.severity,
+                source: diag.source,
+                message: diag.message,
+                ..Default::default()
+            });
+    }
+    for error in &unit.errors {
+        let Some(file) = error.file else { continue };
+        let path = unit.files[file as usize].clone();
+        out.entry(path).or_default().push(Diagnostic {
+            range: Range {
+                start: Position {
+                    line: error.line,
+                    character: error.column,
+                },
+                end: Position {
+                    line: error.line,
+                    character: error.column + 1,
+                },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("dtsls".to_string()),
+            message: format!("preprocessor: {}", error.message),
+            ..Default::default()
+        });
+    }
+    out
 }
 
 #[tower_lsp::async_trait]
@@ -146,6 +355,14 @@ impl LanguageServer for Backend {
         // Whole-feature status: unavailable = ERROR, degraded = WARNING, both
         // reported at the top of every file. A feature never fails silently.
         let mut issues = Vec::new();
+        if !self.cpp_available {
+            issues.push(FeatureIssue::degraded(
+                "translation units",
+                "cpp not found — cross-file checks (duplicate labels/properties \
+                 across includes) fall back to per-file analysis; install a C \
+                 preprocessor",
+            ));
+        }
         if !had_client_root {
             issues.push(FeatureIssue::degraded(
                 "workspace index",
@@ -264,6 +481,8 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let td = params.text_document;
         info!(uri = %td.uri, version = td.version, bytes = td.text.len(), "did_open");
+        let tu_roots = self.tu_roots_for(&td.uri);
+        info!(tu_roots = tu_roots.len(), cpp = self.cpp_available, "tu roots for did_open");
         let (diags, version) = {
             let mut docs = self.documents.write().unwrap();
             docs.insert(td.uri.clone(), Document::open(&td.text, td.version));
@@ -282,15 +501,23 @@ impl LanguageServer for Backend {
                 None => return,
             }
         };
+        self.file_diags
+            .write()
+            .unwrap()
+            .insert(td.uri.clone(), diags.clone());
         self.schedule_file_index(td.uri.clone(), td.text, version);
         self.client
-            .publish_diagnostics(td.uri, diags, Some(version))
+            .publish_diagnostics(td.uri.clone(), diags, Some(version))
             .await;
+        for (root_uri, root_path) in tu_roots {
+            self.schedule_tu(root_uri, root_path);
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let started = std::time::Instant::now();
         let uri = params.text_document.uri;
+        let tu_roots = self.tu_roots_for(&uri);
         let (diags, version, text) = {
             let mut docs = self.documents.write().unwrap();
             match docs.get_mut(&uri) {
@@ -318,10 +545,17 @@ impl LanguageServer for Backend {
                 }
             }
         };
+        self.file_diags
+            .write()
+            .unwrap()
+            .insert(uri.clone(), diags.clone());
         self.schedule_file_index(uri.clone(), text, version);
         self.client
-            .publish_diagnostics(uri, diags, Some(version))
+            .publish_diagnostics(uri.clone(), diags, Some(version))
             .await;
+        for (root_uri, root_path) in tu_roots {
+            self.schedule_tu(root_uri, root_path);
+        }
         debug!(total_us = started.elapsed().as_micros() as u64, "did_change done");
     }
 

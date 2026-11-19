@@ -9,6 +9,7 @@ mod index;
 mod semantic_tokens;
 mod status;
 mod symbols;
+mod tu;
 mod util;
 
 use tower_lsp::{LspService, Server};

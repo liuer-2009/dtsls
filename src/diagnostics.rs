@@ -180,6 +180,22 @@ struct CheckCtx<'a> {
 /// Syntax errors, duplicate nodes, unresolved includes and binding violations
 /// sorted by position. Whole-feature issues (`status`) are reported at the top
 /// of the file.
+/// Structural checks on a preprocessed translation unit: syntax errors,
+/// duplicate labels, duplicate properties and duplicate node names. Positions
+/// are in the preprocessed text; the caller maps them back via the
+/// preprocessor's line markers.
+pub fn structural(doc: &Document) -> Vec<Diagnostic> {
+    run(
+        doc,
+        None,
+        &[],
+        &BindingIndex::default(),
+        &[],
+        CAT_SYNTAX | CAT_DUPLICATES,
+        None,
+    )
+}
+
 /// Uncached entry point (tests and one-off callers).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn all(
@@ -292,9 +308,6 @@ fn run(
     };
     let mut raws: Vec<RawDiag> = Vec::new();
     let mut labels: Vec<(u32, u32)> = Vec::new();
-    if cats & CAT_DUPLICATES != 0 {
-        check_duplicate_roots(root, doc, &mut out);
-    }
     check_node(
         &ctx,
         root,
@@ -829,35 +842,6 @@ fn include_into(ctx: &CheckCtx, node: Node, out: &mut Vec<RawDiag>) {
              initializationOptions.includePaths"
         ),
     });
-}
-
-/// Multiple `/ { }` roots in one file are silently merged by dtc.
-fn check_duplicate_roots(node: Node, doc: &Document, out: &mut Vec<Diagnostic>) {
-    let mut seen_root = false;
-    for i in 0..node.child_count() {
-        let Some(child) = node.child(i as u32) else { continue };
-        if child.kind_id() != kinds().devicetree {
-            continue;
-        }
-        if util::find_child(child, "reference").is_some() {
-            continue;
-        }
-        let range = Range {
-            start: util::byte_to_position(&doc.rope, child.start_byte()),
-            end: util::byte_to_position(&doc.rope, child.start_byte() + 1),
-        };
-        if seen_root {
-            out.push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                source: Some(SOURCE.to_string()),
-                message: "duplicate node '/'".to_string(),
-                ..Default::default()
-            });
-        } else {
-            seen_root = true;
-        }
-    }
 }
 
 /// Flag sibling nodes that define the same name (dtc would silently merge

@@ -69,6 +69,16 @@ cargo build --release
   error), `dtschema` (pip package missing → warning), `dt-bindings headers`
   (kernel tree without include/dt-bindings → warning), `workspace index` (no
   workspace root → warning). Nothing degrades silently.
+- **Cross-file checks as translation units** — like clangd, a file is checked
+  in the context of the root board that includes it: the board `.dts` plus its
+  include closure is run through `cpp` (same flags as the kernel build), open
+  buffers override the on-disk files, and the preprocessor's line markers map
+  results back to each source file. Duplicate labels, duplicate properties,
+  duplicate node names and syntax errors are therefore judged on the merged
+  tree, exactly like dtc; `#ifdef` branches are resolved by the preprocessor
+  instead of being guessed. Re-runs are coalesced (200 ms) and only happen for
+  open or affected boards. Without `cpp` the feature reports a `translation
+  units` warning and falls back to per-file analysis.
 - **Fast state updates** — diagnostics only touch structural nodes (property
   values are never entered), syntax recovery is skipped unless the tree has
   errors, and per-subtree results are memoized by subtree text: a keystroke
@@ -99,6 +109,7 @@ cargo test                          # unit tests (incl. testdata fixtures)
 cargo test -- --ignored             # parses a real kernel dtsi (path baked in test)
 python3 scripts/smoke_test.py       # end-to-end LSP session over stdio
 python3 scripts/compat_test.py      # two-stage compatible completion
+python3 scripts/tu_test.py          # cross-file checks via cpp + line markers
 python3 scripts/diagnostics_test.py # broken/valid fixtures -> publishDiagnostics
 python3 scripts/bench.py            # state update / jump / completion latencies
 python3 scripts/bench_rate.py       # throughput: ops per fixed >=100 ms window
