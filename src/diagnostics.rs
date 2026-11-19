@@ -250,7 +250,7 @@ fn run(
 ) -> Vec<Diagnostic> {
     // without a populated binding index, binding checks are pointless work —
     // but the feature notices must still get through
-    let cats = if cats & CAT_BINDINGS != 0 && bindings.is_empty() {
+    let cats = if cats & CAT_BINDINGS != 0 && (bindings.is_empty() || !bindings.is_ready()) {
         cats & !CAT_BINDINGS
     } else {
         cats
@@ -1463,6 +1463,30 @@ mod tests {
             refs_complete: true,
             patterns: Vec::new(),
         }
+    }
+
+    #[test]
+    fn binding_checks_wait_for_the_scan() {
+        // a partially built index would report "no binding" for every node
+        let text = "/dts-v1/;\n\n/ {\n    mmc@1000 {\n        compatible = \"acme,mmc\";\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(crate::bindings::Binding {
+            uri: tower_lsp::lsp_types::Url::parse("file:///mmc.yaml").unwrap(),
+            singles: vec!["acme,mmc".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "reg"].into_iter().map(str::to_string).collect(),
+            required: vec!["compatible".to_string(), "reg".to_string()],
+            required_any: Vec::new(),
+            strict: true,
+            refs_complete: true,
+            patterns: Vec::new(),
+        });
+        bindings.mark_ready(false);
+        assert!(binding_diagnostics(&doc, &bindings, None).is_empty());
+        bindings.mark_ready(true);
+        let diags = binding_diagnostics(&doc, &bindings, None);
+        assert!(diags.iter().any(|diag| diag.message.contains("missing required property 'reg'")), "{diags:?}");
     }
 
     #[test]

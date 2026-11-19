@@ -70,7 +70,6 @@ pub struct Binding {
 
 /// compatible string -> binding. First file wins (sorted scan order), so
 /// lookups are deterministic.
-#[derive(Default)]
 pub struct BindingIndex {
     by_single: RwLock<FxHashMap<String, Arc<Binding>>>,
     /// first compatible string -> compound patterns
@@ -87,6 +86,25 @@ pub struct BindingIndex {
     /// bumped whenever the index contents change, so diagnostics caches keyed
     /// on binding answers can be dropped
     generation: std::sync::atomic::AtomicU64,
+    /// false while the background scan is running: a partially filled index
+    /// would otherwise report "no binding" for every node
+    ready: std::sync::atomic::AtomicBool,
+}
+
+impl Default for BindingIndex {
+    fn default() -> Self {
+        Self {
+            by_single: Default::default(),
+            by_compound: Default::default(),
+            count: Default::default(),
+            implicit_properties: Default::default(),
+            implicit_patterns: Default::default(),
+            compat: Default::default(),
+            allowed_cache: Default::default(),
+            generation: Default::default(),
+            ready: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
 }
 
 impl BindingIndex {
@@ -177,6 +195,16 @@ impl BindingIndex {
         *self.implicit_properties.write().unwrap() = properties;
         *self.implicit_patterns.write().unwrap() = patterns;
         self.bump_generation();
+    }
+
+    /// Whether the initial scan has finished; checks are skipped until then.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn mark_ready(&self, ready: bool) {
+        self.ready
+            .store(ready, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Changes whenever binding answers may have changed.
@@ -320,6 +348,7 @@ pub fn is_common_property(name: &str) -> bool {
 /// Scan the kernel bindings tree plus the dtschema package installed on the
 /// host. Runs on a worker thread at startup.
 pub fn scan(index: &BindingIndex, dir: &Path) {
+    index.mark_ready(false);
     let started = std::time::Instant::now();
     let package = dtschema_package_dir();
     if let Some(package) = package {
@@ -341,6 +370,7 @@ pub fn scan(index: &BindingIndex, dir: &Path) {
     }
     // human readable vendor names for completion details
     index.set_vendor_names(parse_vendor_prefixes(&dir.join("vendor-prefixes.yaml")));
+    index.mark_ready(true);
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut scan_dirs = vec![dir.to_path_buf()];

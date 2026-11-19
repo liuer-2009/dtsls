@@ -36,10 +36,12 @@ pub struct Backend {
     status: RwLock<Vec<FeatureIssue>>,
     /// Per-subtree diagnostic results, so a keystroke only rechecks the
     /// subtree it touched.
-    diag_cache: diagnostics::DiagCache,
+    diag_cache: Arc<diagnostics::DiagCache>,
     /// Last per-file diagnostics, so translation-unit results can be merged
     /// with them instead of replacing them.
     file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
+    /// Structural diagnostics produced by the unit covering each file.
+    tu_file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Coalesced translation-unit re-runs, per root.
     tu_pending: Arc<RwLock<HashMap<Url, u64>>>,
     /// Line of `compatible:` per binding file (go-to-binding target).
@@ -64,8 +66,9 @@ impl Backend {
             workspace: Arc::new(Workspace::default()),
             bindings: Arc::new(BindingIndex::default()),
             status: RwLock::new(Vec::new()),
-            diag_cache: diagnostics::DiagCache::default(),
+            diag_cache: Arc::new(diagnostics::DiagCache::default()),
             file_diags: Arc::new(RwLock::new(HashMap::new())),
+            tu_file_diags: Arc::new(RwLock::new(HashMap::new())),
             tu_pending: Arc::new(RwLock::new(HashMap::new())),
             binding_lines: Arc::new(RwLock::new(HashMap::new())),
             active_board: RwLock::new(None),
@@ -234,6 +237,7 @@ impl Backend {
         };
         let documents = Arc::clone(&self.documents);
         let file_diags = Arc::clone(&self.file_diags);
+        let tu_file_diags = Arc::clone(&self.tu_file_diags);
         let pending = Arc::clone(&self.tu_pending);
         let workspace = Arc::clone(&self.workspace);
         let doc_context = Arc::clone(&self.doc_context);
@@ -299,55 +303,66 @@ impl Backend {
             let protected: HashSet<PathBuf> =
                 doc_context.read().unwrap().values().cloned().collect();
             workspace.prune(MAX_CONTEXTS, &protected);
-            for (path, structural) in output.per_file {
-                let Ok(uri) = Url::from_file_path(&path) else {
-                    continue;
-                };
-                let (open, version) = {
-                    let docs = documents.read().unwrap();
-                    match docs.get(&uri) {
-                        Some(doc) => (true, Some(doc.version)),
-                        None => (false, None),
-                    }
-                };
-                if !open {
-                    continue;
-                }
-                // only publish into documents analysed in this context
+            let per_file = output.per_file;
+            let root_canonical = std::fs::canonicalize(&publish_root)
+                .unwrap_or_else(|_| publish_root.clone());
+            let open_docs: Vec<(Url, i32)> = {
+                let docs = documents.read().unwrap();
+                docs.iter().map(|(uri, doc)| (uri.clone(), doc.version)).collect()
+            };
+            for (uri, version) in open_docs {
                 let in_context = {
                     let contexts = doc_context.read().unwrap();
-                    match contexts.get(&uri) {
-                        Some(context) => {
+                    contexts
+                        .get(&uri)
+                        .map(|context| {
                             std::fs::canonicalize(context).unwrap_or_else(|_| context.clone())
-                                == std::fs::canonicalize(&publish_root)
-                                    .unwrap_or_else(|_| publish_root.clone())
-                        }
-                        None => false,
-                    }
+                                == root_canonical
+                        })
+                        .unwrap_or(false)
                 };
                 if !in_context {
                     continue;
                 }
+                let structural = uri
+                    .to_file_path()
+                    .ok()
+                    .map(|path| {
+                        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+                        per_file
+                            .get(&canonical)
+                            .or_else(|| per_file.get(&canonical))
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
                 let mut merged = file_diags
                     .read()
                     .unwrap()
                     .get(&uri)
                     .cloned()
                     .unwrap_or_default();
-                // the per-file pass already reports what it can see; only add
-                // what the merged unit found (cross-file duplicates, ...)
-                for diag in structural {
-                    let known = merged.iter().any(|existing| {
-                        existing.range.start == diag.range.start
-                            && existing.message == diag.message
-                    });
-                    if !known {
-                        merged.push(diag);
-                    }
-                }
-                client.publish_diagnostics(uri, merged, version).await;
+                merge_extra(&mut merged, structural.clone());
+                tu_file_diags
+                    .write()
+                    .unwrap()
+                    .insert(uri.clone(), structural);
+                client.publish_diagnostics(uri, merged, Some(version)).await;
             }
         });
+    }
+}
+
+/// Append diagnostics the per-file pass could not see (cross-file duplicates,
+/// preprocessor errors), skipping ones already reported at the same position.
+fn merge_extra(base: &mut Vec<Diagnostic>, extra: Vec<Diagnostic>) {
+    for diag in extra {
+        let known = base.iter().any(|existing| {
+            existing.range.start == diag.range.start && existing.message == diag.message
+        });
+        if !known {
+            base.push(diag);
+        }
     }
 }
 
@@ -636,6 +651,7 @@ impl LanguageServer for Backend {
         // Whole-feature status: unavailable = ERROR, degraded = WARNING, both
         // reported at the top of every file. A feature never fails silently.
         let mut issues = Vec::new();
+        let mut scan_dir: Option<PathBuf> = None;
         if !had_client_root {
             issues.push(FeatureIssue::degraded(
                 "workspace index",
@@ -659,9 +675,7 @@ impl LanguageServer for Backend {
                     dtschema = ?bindings::dtschema_package_dir(),
                     "binding configuration"
                 );
-                let bindings = Arc::clone(&self.bindings);
-                let dir = dir.clone();
-                tokio::task::spawn_blocking(move || bindings::scan(&bindings, &dir));
+                scan_dir = Some(dir.clone());
             }
             None => {
                 issues.push(FeatureIssue::unavailable(
@@ -687,8 +701,60 @@ impl LanguageServer for Backend {
                  cannot be resolved",
             ));
         }
-        *self.status.write().unwrap() = issues;
+        *self.status.write().unwrap() = issues.clone();
         *self.root_dirs.write().unwrap() = roots;
+        if let Some(dir) = scan_dir {
+            // Scan bindings, then refresh every open document: during the scan
+            // binding checks are disabled, so the first diagnostics would
+            // otherwise keep stale (or missing) binding results until an edit.
+            let bindings = Arc::clone(&self.bindings);
+            let documents = Arc::clone(&self.documents);
+            let include_dirs = self.include_dirs();
+            let client = self.client.clone();
+            let diag_cache = Arc::clone(&self.diag_cache);
+            let file_diags = Arc::clone(&self.file_diags);
+            let tu_file_diags = Arc::clone(&self.tu_file_diags);
+            tokio::spawn(async move {
+                let scan_bindings = Arc::clone(&bindings);
+                let _ = tokio::task::spawn_blocking(move || {
+                    bindings::scan(&scan_bindings, &dir);
+                })
+                .await;
+                let computed: Vec<(Url, i32, Vec<Diagnostic>)> = {
+                    let docs = documents.read().unwrap();
+                    docs.iter()
+                        .map(|(uri, doc)| {
+                            let diags = diagnostics::all_cached(
+                                doc,
+                                uri.to_file_path().ok().as_deref(),
+                                &include_dirs,
+                                &bindings,
+                                &issues,
+                                &diag_cache,
+                            );
+                            (uri.clone(), doc.version, diags)
+                        })
+                        .collect()
+                };
+                for (uri, version, diags) in computed {
+                    file_diags
+                        .write()
+                        .unwrap()
+                        .insert(uri.clone(), diags.clone());
+                    let mut merged = diags;
+                    let structural = tu_file_diags
+                        .read()
+                        .unwrap()
+                        .get(&uri)
+                        .cloned()
+                        .unwrap_or_default();
+                    merge_extra(&mut merged, structural);
+                    client
+                        .publish_diagnostics(uri, merged, Some(version))
+                        .await;
+                }
+            });
+        }
         // Background workspace scan: `.dts` roots plus the include graph, so a
         // file can be mapped to the boards that contain it. Only `#include`
         // lines are read; parsing happens per unit when a board is checked.
@@ -1219,14 +1285,6 @@ impl Backend {
     }
 }
 
-fn enclosing_node(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
-    loop {
-        if node.kind() == "subnode" {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
 
 fn node_compatibles(doc: &Document, node: tree_sitter::Node) -> Option<Vec<String>> {
     diagnostics::compatible_strings(doc, node)
