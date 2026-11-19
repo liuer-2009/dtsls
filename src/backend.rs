@@ -12,6 +12,11 @@ use crate::completion;
 use crate::document::Document;
 use crate::hints;
 use crate::workspace::{self, TuData, Workspace};
+
+/// How many board contexts keep their unit and preprocessed snapshot. The
+/// least recently used one is evicted beyond this (its files are re-analysed
+/// when it is next used).
+const MAX_CONTEXTS: usize = 8;
 use crate::util;
 use crate::status::FeatureIssue;
 use crate::{diagnostics, semantic_tokens, symbols};
@@ -36,6 +41,15 @@ pub struct Backend {
     file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Coalesced translation-unit re-runs, per root.
     tu_pending: Arc<RwLock<HashMap<Url, u64>>>,
+    /// Board whose unit is the active analysis context (dts-lsp's
+    /// `activeContext`): a file included by it is analysed in its context.
+    active_board: RwLock<Option<PathBuf>>,
+    /// Analysis context per open document (the board root, or the file itself
+    /// when it is opened as a standalone dts).
+    doc_context: Arc<RwLock<HashMap<Url, PathBuf>>>,
+    /// Live-buffer labels per document version (analysing the tree on every
+    /// completion request costs milliseconds on large files).
+    same_file_labels: Arc<RwLock<HashMap<Url, (i32, Arc<Vec<CompletionItem>>)>>>,
 }
 
 impl Backend {
@@ -50,6 +64,9 @@ impl Backend {
             diag_cache: diagnostics::DiagCache::default(),
             file_diags: Arc::new(RwLock::new(HashMap::new())),
             tu_pending: Arc::new(RwLock::new(HashMap::new())),
+            active_board: RwLock::new(None),
+            doc_context: Arc::new(RwLock::new(HashMap::new())),
+            same_file_labels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -62,30 +79,87 @@ impl Backend {
     /// anything else is looked up through the reverse include edges (falling
     /// back to the file itself so a lone `.dtsi` still gets its closure
     /// checked).
-    fn tu_roots_for(&self, uri: &Url) -> Vec<(Url, PathBuf)> {
-        let Ok(path) = uri.to_file_path() else {
-            return Vec::new();
-        };
-        let open = self.documents.read().unwrap();
-        let mut roots: Vec<(Url, PathBuf)> = self
-            .workspace
-            .roots_for(&path)
-            .into_iter()
-            .filter_map(|root| {
-                let uri = Url::from_file_path(&root).ok()?;
-                Some((uri, root))
-            })
+    /// Context of a document: the board whose unit contains it, or the file
+    /// itself when it was not opened inside a board (dts-lsp's ad-hoc
+    /// context). A board opened later adopts standalone documents that are in
+    /// its include closure.
+    fn context_path(&self, uri: &Url) -> Option<PathBuf> {
+        let path = uri.to_file_path().ok()?;
+        if path.extension().and_then(|ext| ext.to_str()) == Some("dts") {
+            return Some(path);
+        }
+        if let Some(board) = self.active_board.read().unwrap().clone()
+            && self.workspace.closure_contains(&board, &path)
+        {
+            return Some(board);
+        }
+        Some(path)
+    }
+
+    /// Contexts that must not be evicted: every open document's context plus
+    /// the active board.
+    fn protected_contexts(&self) -> HashSet<PathBuf> {
+        let mut protected: HashSet<PathBuf> = self
+            .doc_context
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
             .collect();
-        // prefer boards that are currently open, then a stable order
-        roots.sort_by_key(|(root, path)| (!open.contains_key(root), path.clone()));
-        drop(open);
+        if let Some(board) = self.active_board.read().unwrap().clone() {
+            protected.insert(board);
+        }
+        protected
+    }
+
+    fn prune_contexts(&self) {
+        let protected = self.protected_contexts();
+        self.workspace.prune(MAX_CONTEXTS, &protected);
+    }
+
+    /// Units to (re)check for an edit of `uri`: its own context, plus open
+    /// boards that include it so their diagnostics stay fresh.
+    fn analysis_roots(&self, uri: &Url) -> Vec<(Url, PathBuf)> {
+        let mut roots: Vec<(Url, PathBuf)> = Vec::new();
+        let context = self
+            .doc_context
+            .read()
+            .unwrap()
+            .get(uri)
+            .cloned()
+            .or_else(|| self.context_path(uri));
+        if let Some(context) = context
+            && let Ok(root_uri) = Url::from_file_path(&context)
+        {
+            roots.push((root_uri, context));
+        }
+        if let Some(path) = uri.to_file_path().ok() {
+            let open = self.documents.read().unwrap();
+            for root in self.workspace.roots_for(&path) {
+                let Ok(root_uri) = Url::from_file_path(&root) else {
+                    continue;
+                };
+                if roots.iter().any(|(uri, _)| *uri == root_uri) || !open.contains_key(&root_uri) {
+                    continue;
+                }
+                roots.push((root_uri, root));
+            }
+        }
+        roots.truncate(4);
         roots
     }
 
     /// The unit that covers `uri`, when one has been checked already.
     fn unit_for(&self, uri: &Url) -> Option<Arc<TuData>> {
-        let (root, _) = self.tu_roots_for(uri).into_iter().next()?;
-        self.workspace.unit_for_uri(&root)
+        let context = self
+            .doc_context
+            .read()
+            .unwrap()
+            .get(uri)
+            .cloned()
+            .or_else(|| self.context_path(uri))?;
+        let root_uri = Url::from_file_path(&context).ok()?;
+        self.workspace.unit_for_uri(&root_uri)
     }
 
     /// `&label` completion. A checked unit is authoritative (it is what the
@@ -93,37 +167,54 @@ impl Backend {
     /// present and labels in disabled `#ifdef` branches are not. The live
     /// buffer is merged on top so a label just typed in this file is offered
     /// before the next run.
+    fn same_file_label_items(&self, uri: &Url, doc: &Document) -> Arc<Vec<CompletionItem>> {
+        if let Some((version, items)) = self.same_file_labels.read().unwrap().get(uri)
+            && *version == doc.version
+        {
+            return Arc::clone(items);
+        }
+        let items = Arc::new(completion::same_file_items(doc));
+        self.same_file_labels
+            .write()
+            .unwrap()
+            .insert(uri.clone(), (doc.version, Arc::clone(&items)));
+        items
+    }
+
     fn label_items(&self, uri: &Url, doc: &Document, prefix: &str) -> Vec<CompletionItem> {
         if let Some(data) = self.unit_for(uri) {
-            let labels = &data.labels;
             let current = uri.to_file_path().ok();
-            let mut map: completion::LabelMap = HashMap::new();
-            for (name, label) in labels {
-                let file = match &current {
-                    Some(path) if path == &label.file => String::new(),
-                    _ => label
-                        .file
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                };
-                map.insert(name.clone(), (label.path.clone(), file));
-            }
-            let mut items = completion::items_from_index(&map, prefix);
+            let mut items: Vec<CompletionItem> = data
+                .labels
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .map(|(name, label)| {
+                    let file = match &current {
+                        Some(path) if path == &label.file => String::new(),
+                        _ => label
+                            .file
+                            .file_name()
+                            .map(|file| file.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    };
+                    completion::label_item(name, &label.path, &file)
+                })
+                .collect();
             let mut seen: HashSet<String> =
                 items.iter().map(|item| item.label.clone()).collect();
-            for item in completion::same_file_items(doc) {
+            for item in self.same_file_label_items(uri, doc).iter() {
                 if item.label.starts_with(prefix) && seen.insert(item.label.clone()) {
-                    items.push(item);
+                    items.push(item.clone());
                 }
             }
             items.sort_by(|a, b| a.label.cmp(&b.label));
             return items;
         }
         // no unit checked yet: the live buffer is all we can offer
-        completion::same_file_items(doc)
-            .into_iter()
+        self.same_file_label_items(uri, doc)
+            .iter()
             .filter(|item| item.label.starts_with(prefix))
+            .cloned()
             .collect()
     }
 
@@ -141,6 +232,7 @@ impl Backend {
         let file_diags = Arc::clone(&self.file_diags);
         let pending = Arc::clone(&self.tu_pending);
         let workspace = Arc::clone(&self.workspace);
+        let doc_context = Arc::clone(&self.doc_context);
         let include_dirs = self.include_dirs();
         let client = self.client.clone();
         let task_root = root_uri.clone();
@@ -151,6 +243,7 @@ impl Backend {
             }
             let overlays_docs = Arc::clone(&documents);
             let blocking_workspace = Arc::clone(&workspace);
+            let publish_root = root_path.clone();
             let blocking_root = task_root.clone();
             let root_path_task = root_path.clone();
             let started = std::time::Instant::now();
@@ -199,6 +292,9 @@ impl Backend {
                 return;
             };
             workspace.store_unit_uri(task_root.clone(), Arc::new(output.data));
+            let protected: HashSet<PathBuf> =
+                doc_context.read().unwrap().values().cloned().collect();
+            workspace.prune(MAX_CONTEXTS, &protected);
             for (path, structural) in output.per_file {
                 let Ok(uri) = Url::from_file_path(&path) else {
                     continue;
@@ -211,6 +307,21 @@ impl Backend {
                     }
                 };
                 if !open {
+                    continue;
+                }
+                // only publish into documents analysed in this context
+                let in_context = {
+                    let contexts = doc_context.read().unwrap();
+                    match contexts.get(&uri) {
+                        Some(context) => {
+                            std::fs::canonicalize(context).unwrap_or_else(|_| context.clone())
+                                == std::fs::canonicalize(&publish_root)
+                                    .unwrap_or_else(|_| publish_root.clone())
+                        }
+                        None => false,
+                    }
+                };
+                if !in_context {
                     continue;
                 }
                 let mut merged = file_diags
@@ -233,6 +344,45 @@ impl Backend {
                 client.publish_diagnostics(uri, merged, version).await;
             }
         });
+    }
+}
+
+/// `#include` paths become clickable links, so "go to file" lands in the
+/// included source with the board still the active context.
+fn collect_include_links(
+    doc: &Document,
+    node: tree_sitter::Node,
+    file_dir: Option<&std::path::Path>,
+    include_dirs: &[PathBuf],
+    out: &mut Vec<DocumentLink>,
+) {
+    if node.kind() == "preproc_include"
+        && let Some(path_node) = node.child_by_field_name("path")
+    {
+        let raw = util::node_text(doc, path_node);
+        let (target, quoted) = match path_node.kind() {
+            "preproc_string_literal" => (raw.trim_matches('"'), true),
+            "system_lib_string" => (raw.trim_matches(|c| c == '<' || c == '>'), false),
+            _ => return,
+        };
+        if let Some(resolved) = workspace::resolve_include(file_dir, target, quoted, include_dirs)
+            && let Ok(url) = Url::from_file_path(&resolved)
+        {
+            out.push(DocumentLink {
+                range: Range {
+                    start: util::byte_to_position(&doc.rope, path_node.start_byte()),
+                    end: util::byte_to_position(&doc.rope, path_node.end_byte()),
+                },
+                target: Some(url),
+                tooltip: Some(resolved.display().to_string()),
+                data: None,
+            });
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            collect_include_links(doc, child, file_dir, include_dirs, out);
+        }
     }
 }
 
@@ -555,6 +705,10 @@ impl LanguageServer for Backend {
                 resolve_provider: Some(false),
                 ..Default::default()
             }),
+            document_link_provider: Some(DocumentLinkOptions {
+                resolve_provider: Some(false),
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            }),
             definition_provider: Some(OneOf::Left(true)),
             references_provider: Some(OneOf::Left(true)),
             inlay_hint_provider: Some(OneOf::Left(true)),
@@ -600,7 +754,46 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let td = params.text_document;
         info!(uri = %td.uri, version = td.version, bytes = td.text.len(), "did_open");
-        let tu_roots = self.tu_roots_for(&td.uri);
+        let path = td.uri.to_file_path().ok();
+        let is_board = path
+            .as_ref()
+            .is_some_and(|p| p.extension().and_then(|e| e.to_str()) == Some("dts"));
+        if is_board {
+            *self.active_board.write().unwrap() = path.clone();
+        }
+        if let Some(context) = path.clone().map(|path| {
+            if is_board {
+                path
+            } else {
+                match self.active_board.read().unwrap().clone() {
+                    Some(board) if self.workspace.closure_contains(&board, &path) => board,
+                    _ => path,
+                }
+            }
+        }) {
+            self.doc_context
+                .write()
+                .unwrap()
+                .insert(td.uri.clone(), context);
+        }
+        // a board opened after its includes adopts those standalone documents
+        if is_board && let Some(board) = path.clone() {
+            let open: Vec<Url> = self.documents.read().unwrap().keys().cloned().collect();
+            let mut contexts = self.doc_context.write().unwrap();
+            for other in open {
+                let Ok(other_path) = other.to_file_path() else {
+                    continue;
+                };
+                if other_path == board {
+                    continue;
+                }
+                let standalone = contexts.get(&other) == Some(&other_path);
+                if standalone && self.workspace.closure_contains(&board, &other_path) {
+                    contexts.insert(other, board.clone());
+                }
+            }
+        }
+        let tu_roots = self.analysis_roots(&td.uri);
         debug!(tu_roots = tu_roots.len(), "tu roots for did_open");
         let (diags, version) = {
             let mut docs = self.documents.write().unwrap();
@@ -630,12 +823,14 @@ impl LanguageServer for Backend {
         for (root_uri, root_path) in tu_roots {
             self.schedule_tu(root_uri, root_path);
         }
+        let protected = self.protected_contexts();
+        self.workspace.prune(MAX_CONTEXTS, &protected);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let started = std::time::Instant::now();
         let uri = params.text_document.uri;
-        let tu_roots = self.tu_roots_for(&uri);
+        let tu_roots = self.analysis_roots(&uri);
         let (diags, version) = {
             let mut docs = self.documents.write().unwrap();
             match docs.get_mut(&uri) {
@@ -677,10 +872,17 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents
-            .write()
-            .unwrap()
-            .remove(&params.text_document.uri);
+        let uri = params.text_document.uri.clone();
+        self.documents.write().unwrap().remove(&uri);
+        self.doc_context.write().unwrap().remove(&uri);
+        if let Ok(path) = uri.to_file_path()
+            && self.active_board.read().unwrap().as_ref() == Some(&path)
+        {
+            *self.active_board.write().unwrap() = None;
+        }
+        self.file_diags.write().unwrap().remove(&uri);
+        self.same_file_labels.write().unwrap().remove(&uri);
+        self.prune_contexts();
         // The index entry is intentionally kept (stale until the next scan):
         // goto definition into a closed file must keep working.
         self.client
@@ -857,6 +1059,32 @@ impl LanguageServer for Backend {
         let unit = self.unit_for(&uri);
         let hints = hints::inlay_hints(doc, &uri, unit.as_deref(), &params.range);
         Ok((!hints.is_empty()).then_some(hints))
+    }
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> Result<Option<Vec<DocumentLink>>> {
+        let docs = self.documents.read().unwrap();
+        let Some(doc) = docs.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let file_dir = params
+            .text_document
+            .uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(|dir| dir.to_path_buf()));
+        let include_dirs = self.include_dirs();
+        let mut links = Vec::new();
+        collect_include_links(
+            doc,
+            doc.tree.root_node(),
+            file_dir.as_deref(),
+            &include_dirs,
+            &mut links,
+        );
+        Ok(Some(links))
     }
 
     async fn document_symbol(

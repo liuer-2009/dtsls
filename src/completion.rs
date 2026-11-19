@@ -12,6 +12,7 @@ use crate::util;
 
 /// label -> (node path, defining file name). An empty file name means the
 /// label is defined in the file the index entry belongs to.
+#[cfg_attr(not(test), allow(dead_code))]
 pub type LabelMap = HashMap<String, (String, String)>;
 
 /// What kind of completion the cursor is in.
@@ -811,6 +812,13 @@ pub fn items_from_binding(
 
 /// Items straight from the background index: no tree walk, no IO. This is the
 /// steady-state path and must stay well under a millisecond.
+/// One `&label` completion item (path, plus the defining file when foreign).
+pub fn label_item(label: &str, path: &str, file: &str) -> CompletionItem {
+    let detail = detail(path, file);
+    item(label, &detail, CompletionItemKind::VARIABLE)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn items_from_index(labels: &LabelMap, prefix: &str) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = labels
         .iter()

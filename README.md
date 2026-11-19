@@ -33,6 +33,17 @@ cargo build --release
     properties removed by `/delete-property/`, and — for same-file overlays —
     base properties overridden by `&label { }` / `&{/path} { }` extensions
     (last definition wins, matching dtc merge order)
+- **Analysis context (dts-lsp's `activeContext`)** — an active board claims
+  the files in its include closure: a `.dtsi` opened from the board (goto
+  definition, or a `#include` link) is analysed inside the board's unit, while
+  a `.dtsi` opened on its own is treated as a standalone dts with its own
+  closure. Opening a board later adopts standalone documents that it includes.
+  Diagnostics are only published into documents analysed in that context.
+  At most 8 contexts keep their unit and preprocessed snapshot; the least
+  recently used one is evicted (open documents and the active board are never
+  evicted) and re-analysed when it is next used.
+- **`#include` links** — include paths are document links, so "go to file" on
+  an include lands in the included source with the board still active
 - **M1: `&label` completion** — trigger on `&`; the active translation unit
   provides the labels (own labels first-free, cross-file items show
   `path — file`), and the live buffer is merged so a label just typed appears

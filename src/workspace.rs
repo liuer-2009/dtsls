@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tower_lsp::lsp_types::{Range, Url};
@@ -58,15 +59,65 @@ pub struct TuData {
 pub struct Workspace {
     /// every `.dts` found by the scan
     roots: RwLock<Vec<PathBuf>>,
+    /// file -> files it includes (forward edges, for closure membership)
+    includes: RwLock<HashMap<PathBuf, Vec<PathBuf>>>,
     /// included file -> files that include it
     includers: RwLock<HashMap<PathBuf, HashSet<PathBuf>>>,
     /// last checked unit per root
     units: RwLock<HashMap<PathBuf, Arc<TuData>>>,
     /// preprocessed text per root, kept so edits reparse incrementally
     snapshots: Mutex<HashMap<PathBuf, (Document, Vec<PathBuf>)>>,
+    /// last use of each context, for LRU eviction
+    last_used: Mutex<HashMap<PathBuf, u64>>,
+    clock: AtomicU64,
 }
 
 impl Workspace {
+    fn touch(&self, root: &Path) {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        self.last_used.lock().unwrap().insert(root, tick);
+    }
+
+    /// Drop the least recently used contexts beyond `limit`, keeping the ones
+    /// in `protected` (open documents and the active board).
+    pub fn prune(&self, limit: usize, protected: &HashSet<PathBuf>) {
+        let contexts: HashSet<PathBuf> = {
+            let units = self.units.read().unwrap();
+            let snapshots = self.snapshots.lock().unwrap();
+            units.keys().chain(snapshots.keys()).cloned().collect()
+        };
+        if contexts.len() <= limit {
+            return;
+        }
+        let protected: HashSet<PathBuf> = protected
+            .iter()
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+            .collect();
+        let mut order: Vec<(u64, PathBuf)> = {
+            let last_used = self.last_used.lock().unwrap();
+            contexts
+                .into_iter()
+                .map(|path| (last_used.get(&path).copied().unwrap_or(0), path))
+                .collect()
+        };
+        order.sort();
+        let mut remaining = order.len();
+        for (_, path) in order {
+            if remaining <= limit {
+                break;
+            }
+            if protected.contains(&path) {
+                continue;
+            }
+            self.units.write().unwrap().remove(&path);
+            self.snapshots.lock().unwrap().remove(&path);
+            self.last_used.lock().unwrap().remove(&path);
+            remaining -= 1;
+            tracing::debug!(root = %path.display(), "evicted translation-unit context");
+        }
+    }
+
     /// Discover `.dts` roots and the include graph. Only `#include` lines are
     /// read: no parsing, no macro expansion, so this stays a cheap scan.
     pub fn scan(&self, search_roots: &[PathBuf], include_dirs: &[PathBuf]) {
@@ -98,12 +149,14 @@ impl Workspace {
             .min(files.len().max(1));
         let chunk = files.len().div_ceil(workers).max(1);
         let mut roots: Vec<PathBuf> = Vec::new();
+        let mut includes: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         let mut includers: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
             for slice in files.chunks(chunk) {
                 handles.push(scope.spawn(move || {
                     let mut local_roots = Vec::new();
+                    let mut local_includes: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
                     let mut local_includers: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
                     for path in slice {
                         let Ok(text) = std::fs::read_to_string(path) else {
@@ -121,18 +174,26 @@ impl Workspace {
                             };
                             let resolved =
                                 std::fs::canonicalize(&resolved).unwrap_or(resolved);
+                            local_includes
+                                .entry(path.clone())
+                                .or_default()
+                                .push(resolved.clone());
                             local_includers
                                 .entry(resolved)
                                 .or_default()
                                 .insert(path.clone());
                         }
                     }
-                    (local_roots, local_includers)
+                    (local_roots, local_includes, local_includers)
                 }));
             }
             for handle in handles {
-                let (local_roots, local_includers) = handle.join().expect("scan worker");
+                let (local_roots, local_includes, local_includers) =
+                    handle.join().expect("scan worker");
                 roots.extend(local_roots);
+                for (file, children) in local_includes {
+                    includes.entry(file).or_default().extend(children);
+                }
                 for (file, set) in local_includers {
                     includers.entry(file).or_default().extend(set);
                 }
@@ -148,7 +209,35 @@ impl Workspace {
             "workspace scan"
         );
         *self.roots.write().unwrap() = roots;
+        *self.includes.write().unwrap() = includes;
         *self.includers.write().unwrap() = includers;
+    }
+
+    /// Whether `file` is the board itself or reachable from it through
+    /// `#include` lines (this is what decides "analyze in board context").
+    pub fn closure_contains(&self, board: &Path, file: &Path) -> bool {
+        let board = std::fs::canonicalize(board).unwrap_or_else(|_| board.to_path_buf());
+        let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        if board == file {
+            return true;
+        }
+        let includes = self.includes.read().unwrap();
+        let mut seen: HashSet<PathBuf> = HashSet::from([board.clone()]);
+        let mut queue = vec![board];
+        while let Some(current) = queue.pop() {
+            let Some(children) = includes.get(&current) else {
+                continue;
+            };
+            for child in children {
+                if *child == file {
+                    return true;
+                }
+                if seen.insert(child.clone()) {
+                    queue.push(child.clone());
+                }
+            }
+        }
+        false
     }
 
     /// Boards whose unit contains `path`, preferring nothing here (the caller
@@ -208,11 +297,13 @@ impl Workspace {
     }
 
     pub fn unit(&self, root: &Path) -> Option<Arc<TuData>> {
+        self.touch(root);
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         self.units.read().unwrap().get(&root).cloned()
     }
 
     pub fn store_unit(&self, root: PathBuf, data: Arc<TuData>) {
+        self.touch(&root);
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         self.units.write().unwrap().insert(root, data);
     }
@@ -220,11 +311,13 @@ impl Workspace {
     /// Take the previous preprocessed snapshot so the unit run can reparse it
     /// incrementally instead of from scratch.
     pub fn take_snapshot(&self, root: &Path) -> Option<(Document, Vec<PathBuf>)> {
+        self.touch(root);
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         self.snapshots.lock().unwrap().remove(&root)
     }
 
     pub fn put_snapshot(&self, root: PathBuf, doc: Document, files: Vec<PathBuf>) {
+        self.touch(&root);
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         self.snapshots
             .lock()
@@ -367,6 +460,22 @@ mod tests {
             workspace.roots_for(&std::fs::canonicalize(&board).unwrap()),
             vec![std::fs::canonicalize(&board).unwrap()]
         );
+    }
+
+    #[test]
+    fn closure_membership_follows_includes() {
+        let base = dir("closure");
+        let board = base.join("board.dts");
+        let soc = base.join("soc.dtsi");
+        let deep = base.join("deep.dtsi");
+        write(&soc, "#include \"deep.dtsi\"\n");
+        write(&deep, "/ { };\n");
+        write(&board, "#include \"soc.dtsi\"\n");
+        let workspace = Workspace::default();
+        workspace.scan(&[base.clone()], &[base.clone()]);
+        assert!(workspace.closure_contains(&board, &deep));
+        assert!(workspace.closure_contains(&board, &board));
+        assert!(!workspace.closure_contains(&deep, &board));
     }
 
     #[test]
