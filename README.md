@@ -77,8 +77,11 @@ cargo build --release
   duplicate node names and syntax errors are therefore judged on the merged
   tree, exactly like dtc; `#ifdef` branches are resolved by the preprocessor
   instead of being guessed. Re-runs are coalesced (200 ms) and only happen for
-  open or affected boards. Without `cpp` the feature reports a `translation
-  units` warning and falls back to per-file analysis.
+  open or affected boards. `&` label completion uses the unit's labels, so
+  macro-expanded labels are offered and labels from disabled `#ifdef` branches
+  are not; the live buffer is merged on top so a label just typed appears
+  before the next run. Without `cpp` the feature reports a `translation units`
+  warning and falls back to per-file analysis / the workspace index.
 - **Fast state updates** — diagnostics only touch structural nodes (property
   values are never entered), syntax recovery is skipped unless the tree has
   errors, and per-subtree results are memoized by subtree text: a keystroke

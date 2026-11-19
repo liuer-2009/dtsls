@@ -39,6 +39,9 @@ pub struct Backend {
     file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Coalesced translation-unit re-runs, per root.
     tu_pending: Arc<RwLock<HashMap<Url, u64>>>,
+    /// Labels visible in each root's preprocessed unit (completion/goto use
+    /// this instead of the raw index once a unit has been checked).
+    tu_labels: Arc<RwLock<HashMap<Url, HashMap<String, TuLabel>>>>,
     /// false when no C preprocessor is installed: cross-file checks fall back
     /// to the per-file path.
     cpp_available: bool,
@@ -57,6 +60,7 @@ impl Backend {
             pending_index: Arc::new(RwLock::new(HashMap::new())),
             file_diags: Arc::new(RwLock::new(HashMap::new())),
             tu_pending: Arc::new(RwLock::new(HashMap::new())),
+            tu_labels: Arc::new(RwLock::new(HashMap::new())),
             cpp_available: std::process::Command::new("cpp")
                 .arg("--version")
                 .output()
@@ -151,6 +155,50 @@ impl Backend {
         roots
     }
 
+    /// `&label` completion. A checked unit is authoritative (it is what cpp
+    /// actually produced): labels expanded from macros are present and labels
+    /// in disabled `#ifdef` branches are not. The live buffer is merged on top
+    /// so a label just typed in this file is offered before the next run.
+    fn label_items(&self, uri: &Url, doc: &Document, prefix: &str) -> Vec<CompletionItem> {
+        if let Some((root, _)) = self.tu_roots_for(uri).into_iter().next()
+            && let Some(labels) = self.tu_labels.read().unwrap().get(&root)
+        {
+            let current = uri.to_file_path().ok();
+            let mut map: completion::LabelMap = HashMap::new();
+            for (name, label) in labels {
+                let file = match &current {
+                    Some(path) if path == &label.file => String::new(),
+                    _ => label
+                        .file
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                };
+                map.insert(name.clone(), (label.path.clone(), file));
+            }
+            let mut items = completion::items_from_index(&map, prefix);
+            let mut seen: HashSet<String> =
+                items.iter().map(|item| item.label.clone()).collect();
+            for item in completion::same_file_items(doc) {
+                if item.label.starts_with(prefix) && seen.insert(item.label.clone()) {
+                    items.push(item);
+                }
+            }
+            items.sort_by(|a, b| a.label.cmp(&b.label));
+            return items;
+        }
+        // no unit yet (or no cpp): fall back to the index's merged views
+        match self.index.with_file(uri, |file| {
+            file.map(|file| completion::items_from_index(&file.completion_labels, prefix))
+        }) {
+            Some(items) => items,
+            None => completion::same_file_items(doc)
+                .into_iter()
+                .filter(|item| item.label.starts_with(prefix))
+                .collect(),
+        }
+    }
+
     /// Re-check a translation unit off the main loop. Coalesced like the index
     /// rebuild: typing only triggers one run once the edits settle.
     fn schedule_tu(&self, root_uri: Url, root_path: PathBuf) {
@@ -164,6 +212,7 @@ impl Backend {
         let documents = Arc::clone(&self.documents);
         let file_diags = Arc::clone(&self.file_diags);
         let pending = Arc::clone(&self.tu_pending);
+        let tu_labels = Arc::clone(&self.tu_labels);
         let include_dirs = self.include_dirs();
         let client = self.client.clone();
         let task_root = root_uri.clone();
@@ -199,7 +248,7 @@ impl Backend {
                     },
                     &work,
                 )?;
-                Some(tu_diagnostics(&result))
+                Some(tu_output(&result))
             })
             .await
             .ok()
@@ -207,14 +256,18 @@ impl Backend {
             debug!(
                 root = %task_root,
                 elapsed_us = started.elapsed().as_micros() as u64,
-                files = tu_result.as_ref().map(|map| map.len()).unwrap_or(0),
+                files = tu_result.as_ref().map(|out| out.per_file.len()).unwrap_or(0),
                 "translation unit checked"
             );
-            let Some(per_file) = tu_result else {
+            let Some(output) = tu_result else {
                 warn!(root = %task_root, "translation unit check could not run");
                 return;
             };
-            for (path, structural) in per_file {
+            tu_labels
+                .write()
+                .unwrap()
+                .insert(task_root.clone(), output.labels);
+            for (path, structural) in output.per_file {
                 let Ok(uri) = Url::from_file_path(&path) else {
                     continue;
                 };
@@ -251,10 +304,84 @@ impl Backend {
     }
 }
 
+/// A label defined in a preprocessed unit.
+struct TuLabel {
+    /// node path, for the completion detail
+    path: String,
+    /// file the label is defined in
+    file: PathBuf,
+}
+
+/// Everything the unit tells us: diagnostics grouped by source file, plus the
+/// labels that exist after preprocessing.
+struct TuOutput {
+    per_file: HashMap<PathBuf, Vec<Diagnostic>>,
+    labels: HashMap<String, TuLabel>,
+}
+
+fn tu_output(unit: &crate::tu::TuResult) -> TuOutput {
+    let doc = Document::open(&unit.text, 0);
+    TuOutput {
+        per_file: group_diagnostics(unit, &doc),
+        labels: tu_label_map(unit, &doc),
+    }
+}
+
+/// Labels of the preprocessed tree: names expanded by the preprocessor, with
+/// the node path and the file each one came from.
+fn tu_label_map(unit: &crate::tu::TuResult, doc: &Document) -> HashMap<String, TuLabel> {
+    let mut out = HashMap::new();
+    let mut cursor = doc.tree.root_node().walk();
+    collect_unit_labels(unit, doc, &mut cursor, &mut out);
+    out
+}
+
+fn collect_unit_labels(
+    unit: &crate::tu::TuResult,
+    doc: &Document,
+    cursor: &mut tree_sitter::TreeCursor<'_>,
+    out: &mut HashMap<String, TuLabel>,
+) {
+    loop {
+        let node = cursor.node();
+        if node.kind() == "label" {
+            let text = util::node_text(doc, node);
+            let name = text.trim_end_matches(':');
+            if !name.is_empty() {
+                let line = util::byte_to_position(&doc.rope, node.start_byte()).line;
+                if let Some((_, path)) = unit.locate(line) {
+                    let owner = node.parent().map(|parent| {
+                        if parent.kind() == "property" {
+                            util::owning_node(parent).unwrap_or(parent)
+                        } else {
+                            parent
+                        }
+                    });
+                    let node_path = owner
+                        .map(|owner| crate::analysis::node_path(doc, owner))
+                        .unwrap_or_default();
+                    out.entry(name.to_string()).or_insert(TuLabel {
+                        path: node_path,
+                        file: path.to_path_buf(),
+                    });
+                }
+            }
+        } else if cursor.goto_first_child() {
+            collect_unit_labels(unit, doc, cursor, out);
+            cursor.goto_parent();
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
 /// Diagnostics produced for a preprocessed unit, grouped by the file they
 /// belong to (positions mapped back through the preprocessor line markers).
-fn tu_diagnostics(unit: &crate::tu::TuResult) -> HashMap<PathBuf, Vec<Diagnostic>> {
-    let doc = Document::open(&unit.text, 0);
+fn group_diagnostics(
+    unit: &crate::tu::TuResult,
+    doc: &Document,
+) -> HashMap<PathBuf, Vec<Diagnostic>> {
     let mut out: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
     for diag in diagnostics::structural(&doc) {
         let Some((source, path)) = unit.locate(diag.range.start.line) else {
@@ -589,14 +716,8 @@ impl LanguageServer for Backend {
             // prebuilt index (no tree walk) and stays well under 1 ms.
             let index = &self.index;
             match context {
-                completion::Context::Labels(prefix) => match index.with_file(&uri, |fi| {
-                    fi.map(|f| completion::items_from_index(&f.completion_labels, &prefix))
-                }) {
-                    Some(items) => items,
-                    None => completion::same_file_items(doc)
-                        .into_iter()
-                        .filter(|item| item.label.starts_with(&prefix))
-                        .collect(),
+                completion::Context::Labels(prefix) => {
+                    self.label_items(&uri, doc, &prefix)
                 },
                 completion::Context::Defines(prefix) => index
                     .with_file(&uri, |fi| {
