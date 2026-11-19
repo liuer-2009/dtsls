@@ -11,7 +11,7 @@ use crate::bindings::{self, BindingIndex};
 use crate::completion;
 use crate::document::Document;
 use crate::hints;
-use crate::index::{self, Index};
+use crate::workspace::{self, TuData, Workspace};
 use crate::util;
 use crate::status::FeatureIssue;
 use crate::{diagnostics, semantic_tokens, symbols};
@@ -20,9 +20,9 @@ pub struct Backend {
     client: Client,
     documents: Arc<RwLock<HashMap<Url, Document>>>,
     root_dirs: RwLock<Vec<PathBuf>>,
-    /// Workspace-wide contribution tables (labels, refs, includes), built in
-    /// background; requests read finished entries only.
-    index: Arc<Index>,
+    /// Boards, include edges and the last checked unit per root (the old
+    /// workspace index, now derived from translation units).
+    workspace: Arc<Workspace>,
     /// compatible -> devicetree binding, built in background at startup.
     bindings: Arc<BindingIndex>,
     /// Whole-feature conditions (unavailable = error, degraded = warning),
@@ -31,20 +31,11 @@ pub struct Backend {
     /// Per-subtree diagnostic results, so a keystroke only rechecks the
     /// subtree it touched.
     diag_cache: diagnostics::DiagCache,
-    /// Latest scheduled index rebuild per document; older ones are dropped,
-    /// so typing does not queue one full re-index per keystroke.
-    pending_index: Arc<RwLock<HashMap<Url, u64>>>,
     /// Last per-file diagnostics, so translation-unit results can be merged
     /// with them instead of replacing them.
     file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Coalesced translation-unit re-runs, per root.
     tu_pending: Arc<RwLock<HashMap<Url, u64>>>,
-    /// Names visible in each root's preprocessed unit (labels, references,
-    /// macros, `#*-cells`); completion/goto/hints prefer this over the index.
-    tu_data: Arc<RwLock<HashMap<Url, Arc<TuData>>>>,
-    /// Preprocessed text of each root, parsed incrementally across edits
-    /// (clangd's preamble equivalent: only the changed region reparses).
-    tu_snapshots: Arc<std::sync::Mutex<HashMap<Url, (Document, Vec<PathBuf>)>>>,
 }
 
 impl Backend {
@@ -53,68 +44,18 @@ impl Backend {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
             root_dirs: RwLock::new(Vec::new()),
-            index: Arc::new(Index::default()),
+            workspace: Arc::new(Workspace::default()),
             bindings: Arc::new(BindingIndex::default()),
             status: RwLock::new(Vec::new()),
             diag_cache: diagnostics::DiagCache::default(),
-            pending_index: Arc::new(RwLock::new(HashMap::new())),
             file_diags: Arc::new(RwLock::new(HashMap::new())),
             tu_pending: Arc::new(RwLock::new(HashMap::new())),
-            tu_data: Arc::new(RwLock::new(HashMap::new())),
-            tu_snapshots: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     /// Include dirs for diagnostics (file-relative resolution is separate).
     fn include_dirs(&self) -> Vec<PathBuf> {
         self.root_dirs.read().unwrap().clone()
-    }
-
-    /// Rebuild one document's contribution table off the main loop, then the
-    /// tables of every file that includes it (directly or transitively) —
-    /// their merged completion data caches this file's contributions.
-    fn schedule_file_index(&self, uri: Url, text: String, version: i32) {
-        // Coalesce: bump a generation and let a delayed task do the work only
-        // if it is still the newest request for this document. Continuous
-        // typing then triggers one rebuild, not one per keystroke.
-        let generation = {
-            let mut pending = self.pending_index.write().unwrap();
-            let slot = pending.entry(uri.clone()).or_insert(0);
-            *slot += 1;
-            *slot
-        };
-        let index = Arc::clone(&self.index);
-        let roots = self.root_dirs.read().unwrap().clone();
-        let pending = Arc::clone(&self.pending_index);
-        let documents = Arc::clone(&self.documents);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if pending.read().unwrap().get(&uri) != Some(&generation) {
-                return;
-            }
-            tokio::task::spawn_blocking(move || {
-                index::build_and_insert(&index, &uri, &text, version, &roots, 0);
-                // Closed dependents keep their own (unchanged) label/include
-                // data; only their *merged* completion view would be stale,
-                // and that is only consumed while they are open.
-                let dependents: Vec<(Url, String, i32)> = {
-                    let docs = documents.read().unwrap();
-                    index
-                        .dependents_transitive(&uri)
-                        .into_iter()
-                        .filter_map(|dependent| {
-                            docs.get(&dependent)
-                                .map(|doc| (dependent.clone(), doc.text.clone(), doc.version))
-                        })
-                        .collect()
-                };
-                for (dependent, text, version) in dependents {
-                    index::build_and_insert(&index, &dependent, &text, version, &roots, 0);
-                }
-            })
-            .await
-            .ok();
-        });
     }
 
     /// Roots whose translation unit contains `uri`: a `.dts` is its own root,
@@ -125,34 +66,26 @@ impl Backend {
         let Ok(path) = uri.to_file_path() else {
             return Vec::new();
         };
-        if path.extension().and_then(|ext| ext.to_str()) == Some("dts") {
-            return vec![(uri.clone(), path)];
-        }
         let open = self.documents.read().unwrap();
         let mut roots: Vec<(Url, PathBuf)> = self
-            .index
-            .dependents_transitive(uri)
+            .workspace
+            .roots_for(&path)
             .into_iter()
-            .filter_map(|dependent| {
-                let path = dependent.to_file_path().ok()?;
-                (path.extension().and_then(|ext| ext.to_str()) == Some("dts"))
-                    .then_some((dependent, path))
+            .filter_map(|root| {
+                let uri = Url::from_file_path(&root).ok()?;
+                Some((uri, root))
             })
             .collect();
         // prefer boards that are currently open, then a stable order
         roots.sort_by_key(|(root, path)| (!open.contains_key(root), path.clone()));
         drop(open);
-        roots.truncate(4);
-        if roots.is_empty() {
-            roots.push((uri.clone(), path));
-        }
         roots
     }
 
     /// The unit that covers `uri`, when one has been checked already.
     fn unit_for(&self, uri: &Url) -> Option<Arc<TuData>> {
         let (root, _) = self.tu_roots_for(uri).into_iter().next()?;
-        self.tu_data.read().unwrap().get(&root).cloned()
+        self.workspace.unit_for_uri(&root)
     }
 
     /// `&label` completion. A checked unit is authoritative (it is what the
@@ -187,16 +120,11 @@ impl Backend {
             items.sort_by(|a, b| a.label.cmp(&b.label));
             return items;
         }
-        // no unit yet (or no cpp): fall back to the index's merged views
-        match self.index.with_file(uri, |file| {
-            file.map(|file| completion::items_from_index(&file.completion_labels, prefix))
-        }) {
-            Some(items) => items,
-            None => completion::same_file_items(doc)
-                .into_iter()
-                .filter(|item| item.label.starts_with(prefix))
-                .collect(),
-        }
+        // no unit checked yet: the live buffer is all we can offer
+        completion::same_file_items(doc)
+            .into_iter()
+            .filter(|item| item.label.starts_with(prefix))
+            .collect()
     }
 
     /// Re-check a translation unit off the main loop. Coalesced like the index
@@ -212,8 +140,7 @@ impl Backend {
         let documents = Arc::clone(&self.documents);
         let file_diags = Arc::clone(&self.file_diags);
         let pending = Arc::clone(&self.tu_pending);
-        let tu_data = Arc::clone(&self.tu_data);
-        let snapshots = Arc::clone(&self.tu_snapshots);
+        let workspace = Arc::clone(&self.workspace);
         let include_dirs = self.include_dirs();
         let client = self.client.clone();
         let task_root = root_uri.clone();
@@ -223,6 +150,7 @@ impl Backend {
                 return;
             }
             let overlays_docs = Arc::clone(&documents);
+            let blocking_workspace = Arc::clone(&workspace);
             let blocking_root = task_root.clone();
             let root_path_task = root_path.clone();
             let started = std::time::Instant::now();
@@ -244,17 +172,18 @@ impl Backend {
                     include_dirs: &include_dirs,
                     overlays: &overlays,
                 });
-                let previous = snapshots.lock().unwrap().remove(&blocking_root);
+                let previous = blocking_workspace.take_snapshot_uri(&blocking_root);
                 let mut doc = match previous {
                     Some((doc, _files)) => doc,
                     None => Document::open(&result.text, 0),
                 };
                 doc.update_text(&result.text);
                 let output = tu_output(&result, &doc);
-                snapshots
-                    .lock()
-                    .unwrap()
-                    .insert(blocking_root.clone(), (doc, result.files.clone()));
+                blocking_workspace.put_snapshot_uri(
+                    blocking_root.clone(),
+                    doc,
+                    result.files.clone(),
+                );
                 output
             })
             .await
@@ -269,10 +198,7 @@ impl Backend {
                 warn!(root = %task_root, "translation unit check could not run");
                 return;
             };
-            tu_data
-                .write()
-                .unwrap()
-                .insert(task_root.clone(), Arc::new(output.data));
+            workspace.store_unit_uri(task_root.clone(), Arc::new(output.data));
             for (path, structural) in output.per_file {
                 let Ok(uri) = Url::from_file_path(&path) else {
                     continue;
@@ -310,32 +236,6 @@ impl Backend {
     }
 }
 
-/// A label defined in a preprocessed unit.
-pub(crate) struct TuLabel {
-    /// node path, for the completion detail
-    pub(crate) path: String,
-    /// file the label is defined in
-    pub(crate) file: PathBuf,
-    /// range of the label in that file
-    pub(crate) range: Range,
-}
-
-/// An `&label` use in a preprocessed unit.
-struct TuRef {
-    label: String,
-    file: PathBuf,
-    range: Range,
-}
-
-/// Everything the unit tells us besides diagnostics: the names that exist
-/// after preprocessing (so macros and conditionals are already resolved).
-pub(crate) struct TuData {
-    pub(crate) labels: HashMap<String, TuLabel>,
-    refs: Vec<TuRef>,
-    pub(crate) defines: index::DefineMap,
-    pub(crate) cells: Vec<index::CellsProp>,
-}
-
 struct TuOutput {
     per_file: HashMap<PathBuf, Vec<Diagnostic>>,
     data: TuData,
@@ -348,8 +248,8 @@ fn tu_output(unit: &crate::tu::TuResult, doc: &Document) -> TuOutput {
     }
 }
 
-fn tu_data(unit: &crate::tu::TuResult, doc: &Document) -> TuData {
-    let mut data = TuData {
+fn tu_data(unit: &crate::tu::TuResult, doc: &Document) -> workspace::TuData {
+    let mut data = workspace::TuData {
         labels: HashMap::new(),
         refs: Vec::new(),
         defines: HashMap::new(),
@@ -386,17 +286,8 @@ fn collect_unit_names(
                 if !name.is_empty()
                     && let Some((file, range)) = unit_range(unit, doc, node, name.len())
                 {
-                    let owner = node.parent().map(|parent| {
-                        if parent.kind() == "property" {
-                            util::owning_node(parent).unwrap_or(parent)
-                        } else {
-                            parent
-                        }
-                    });
-                    let path = owner
-                        .map(|owner| crate::analysis::node_path(doc, owner))
-                        .unwrap_or_default();
-                    data.labels.entry(name.to_string()).or_insert(TuLabel {
+                    let path = crate::analysis::node_path(doc, node);
+                    data.labels.entry(name.to_string()).or_insert(workspace::TuLabel {
                         path,
                         file,
                         range,
@@ -409,7 +300,7 @@ fn collect_unit_names(
                 if !name.is_empty()
                     && let Some((file, range)) = unit_range(unit, doc, node, text.len())
                 {
-                    data.refs.push(TuRef {
+                    data.refs.push(workspace::TuRef {
                         label: name.to_string(),
                         file,
                         range,
@@ -419,13 +310,10 @@ fn collect_unit_names(
             "property" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = util::node_text(doc, name_node);
-                    if name.starts_with('#')
-                        && name.ends_with("-cells")
-                        && let Some(owner) = util::owning_node(node)
-                    {
-                        let path = crate::analysis::node_path(doc, owner);
+                    if name.starts_with('#') && name.ends_with("-cells") {
+                        let path = crate::analysis::node_path(doc, node);
                         if let Some(value) = property_u32(doc, node) {
-                            data.cells.push(index::CellsProp {
+                            data.cells.push(workspace::CellsProp {
                                 path,
                                 name: name.to_string(),
                                 value,
@@ -569,8 +457,8 @@ impl LanguageServer for Backend {
         let had_client_root = !roots.is_empty();
         // `<dt-bindings/...>` resolution: auto-detect a kernel tree by walking
         // up for the kernel layout, plus client-supplied includePaths.
-        let kernel_root = index::detect_kernel_root(&roots);
-        roots.extend(index::detect_include_dirs(&roots));
+        let kernel_root = workspace::detect_kernel_root(&roots);
+        roots.extend(workspace::detect_include_dirs(&roots));
         let mut bindings_dir = kernel_root
             .as_ref()
             .map(|root| root.join("Documentation/devicetree/bindings"))
@@ -647,12 +535,12 @@ impl LanguageServer for Backend {
         }
         *self.status.write().unwrap() = issues;
         *self.root_dirs.write().unwrap() = roots;
-        // Background workspace scan: index every dts file under the roots so
-        // goto definition / references work for files never opened.
-        let index = Arc::clone(&self.index);
+        // Background workspace scan: `.dts` roots plus the include graph, so a
+        // file can be mapped to the boards that contain it. Only `#include`
+        // lines are read; parsing happens per unit when a board is checked.
+        let workspace = Arc::clone(&self.workspace);
         let scan_roots = self.root_dirs.read().unwrap().clone();
-        let open: HashSet<Url> = self.documents.read().unwrap().keys().cloned().collect();
-        tokio::task::spawn_blocking(move || index::scan_workspace(&index, &scan_roots, &open));
+        tokio::task::spawn_blocking(move || workspace.scan(&scan_roots, &scan_roots));
         let capabilities = ServerCapabilities {
             position_encoding: Some(PositionEncodingKind::UTF16),
             text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -736,7 +624,6 @@ impl LanguageServer for Backend {
             .write()
             .unwrap()
             .insert(td.uri.clone(), diags.clone());
-        self.schedule_file_index(td.uri.clone(), td.text, version);
         self.client
             .publish_diagnostics(td.uri.clone(), diags, Some(version))
             .await;
@@ -749,7 +636,7 @@ impl LanguageServer for Backend {
         let started = std::time::Instant::now();
         let uri = params.text_document.uri;
         let tu_roots = self.tu_roots_for(&uri);
-        let (diags, version, text) = {
+        let (diags, version) = {
             let mut docs = self.documents.write().unwrap();
             match docs.get_mut(&uri) {
                 Some(doc) => {
@@ -768,7 +655,7 @@ impl LanguageServer for Backend {
                         diagnostics_us = started.elapsed().as_micros() as u64,
                         "did_change handled"
                     );
-                    (diags, doc.version, doc.text.clone())
+                    (diags, doc.version)
                 }
                 None => {
                     warn!(uri = %uri, "did_change for unknown document");
@@ -780,7 +667,6 @@ impl LanguageServer for Backend {
             .write()
             .unwrap()
             .insert(uri.clone(), diags.clone());
-        self.schedule_file_index(uri.clone(), text, version);
         self.client
             .publish_diagnostics(uri.clone(), diags, Some(version))
             .await;
@@ -816,9 +702,6 @@ impl LanguageServer for Backend {
             else {
                 return Ok(None);
             };
-            // Read-only, in-memory, no awaits: steady state reads the
-            // prebuilt index (no tree walk) and stays well under 1 ms.
-            let index = &self.index;
             match context {
                 completion::Context::Labels(prefix) => {
                     self.label_items(&uri, doc, &prefix)
@@ -827,13 +710,7 @@ impl LanguageServer for Backend {
                     if let Some(data) = self.unit_for(&uri) {
                         completion::items_from_defines(&data.defines, &prefix)
                     } else {
-                        index
-                            .with_file(&uri, |file| {
-                                file.map(|file| {
-                                    completion::items_from_defines(&file.defines, &prefix)
-                                })
-                            })
-                            .unwrap_or_default()
+                        completion::same_file_define_items(doc, &prefix)
                     }
                 }
                 completion::Context::Properties(prefix) => {
@@ -947,25 +824,28 @@ impl LanguageServer for Backend {
                 return Ok(Some(locations));
             }
         }
-        let mut locations = Vec::new();
-        if params.context.include_declaration {
-            for (def_uri, def) in self.index.all_label_defs(&label) {
-                locations.push(Location {
-                    uri: def_uri,
-                    range: def.range,
-                });
-                if locations.len() >= 500 {
-                    return Ok(Some(locations));
+        // no unit yet: everything visible is this buffer
+        let mut ranges = Vec::new();
+        {
+            let docs = self.documents.read().unwrap();
+            if let Some(doc) = docs.get(&uri) {
+                if params.context.include_declaration
+                    && let Some(range) = completion::label_definition(doc, &label)
+                {
+                    ranges.push(range);
                 }
+                ranges.extend(completion::label_references(doc, &label));
             }
         }
-        for (ref_uri, range) in self.index.label_references(&label, 500) {
-            locations.push(Location {
-                uri: ref_uri,
-                range,
-            });
-        }
-        Ok(Some(locations))
+        Ok(Some(
+            ranges
+                .into_iter()
+                .map(|range| Location {
+                    uri: uri.clone(),
+                    range,
+                })
+                .collect(),
+        ))
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
@@ -975,13 +855,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let unit = self.unit_for(&uri);
-        let hints = hints::inlay_hints(
-            doc,
-            &uri,
-            &self.index,
-            unit.as_deref(),
-            &params.range,
-        );
+        let hints = hints::inlay_hints(doc, &uri, unit.as_deref(), &params.range);
         Ok((!hints.is_empty()).then_some(hints))
     }
 
@@ -1029,10 +903,10 @@ impl Backend {
                     range: def.range,
                 }));
             }
-            let (target_uri, def) = index::resolve_label(&self.index, &uri, &label)?;
+            let range = completion::label_definition(doc, &label)?;
             return Some(GotoDefinitionResponse::Scalar(Location {
-                uri: target_uri,
-                range: def.range,
+                uri: uri.clone(),
+                range,
             }));
         }
         // not on a label: jump to the binding of the enclosing node

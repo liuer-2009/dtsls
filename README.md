@@ -33,17 +33,18 @@ cargo build --release
     properties removed by `/delete-property/`, and — for same-file overlays —
     base properties overridden by `&label { }` / `&{/path} { }` extensions
     (last definition wins, matching dtc merge order)
-- **M1: `&label` completion** — trigger on `&`, items from the
-  current file plus a background-built index of quoted `#include`s (own labels
-  preferred, cross-file items show `path — file`). Steady state reads a
-  prebuilt index: sub-millisecond, no tree walk on the request path
-- **M1: workspace index** — on initialize, all `.dts/.dtsi/.dtso` under the
-  workspace roots are parsed in parallel into per-file contribution tables
-  (label defs with spans, `&label` usages, include edges). Open buffers are
-  re-indexed on every change with version-guarded insertion
-- **M1: goto definition / find references** — resolves `&label` through the
-  translation unit (own file → transitive includes) with a workspace-wide
-  fallback; references search every indexed file. Both are pure index lookups
+- **M1: `&label` completion** — trigger on `&`; the active translation unit
+  provides the labels (own labels first-free, cross-file items show
+  `path — file`), and the live buffer is merged so a label just typed appears
+  before the next unit run. Before the first unit run only the buffer's own
+  labels are offered
+- **M1: workspace scan** — on initialize only `.dts`/`.dtsi` files are visited
+  and just their `#include` lines are read to build the root list and the
+  include graph (no parsing). That is what maps a file to the boards whose
+  unit contains it; all name tables come from the units themselves
+- **M1: goto definition / find references** — resolved from the unit's labels
+  and `&label` references (exact, post-preprocessor); without a unit the
+  current buffer is searched
 - **M1: macro completion** — object-like `#define`s (no function-like macros)
   from the file, its `#include`s and the workspace; `<dt-bindings/...>` angle
   includes resolve against auto-detected kernel include dirs (walks up for
@@ -67,7 +68,7 @@ cargo build --release
   reports a WARNING. Message shape is always `<feature>: unavailable|degraded
   — <detail>`. Current notices: `devicetree bindings` (no bindings dir found →
   error), `dtschema` (pip package missing → warning), `dt-bindings headers`
-  (kernel tree without include/dt-bindings → warning), `workspace index` (no
+  (kernel tree without include/dt-bindings → warning), `workspace` (no
   workspace root → warning). Nothing degrades silently.
 - **Cross-file checks as translation units** — like clangd, a file is checked
   in the context of the root board that includes it: the board `.dts` plus its
@@ -84,13 +85,14 @@ cargo build --release
   `#*-cells` come from the unit, so completion, go-to-definition, references,
   macro completion and `*-names` hints all see macro-expanded names and the
   branches the preprocessor actually kept; the live buffer is merged on top for
-  labels so a name just typed appears before the next run. The workspace index
-  remains the fallback for files no unit covers yet.
+  labels so a name just typed appears before the next run. Without a unit the
+  current buffer is the only source, and `&` completion falls back to scanning
+  its `#define`s / labels directly.
 - **Fast state updates** — diagnostics only touch structural nodes (property
   values are never entered), syntax recovery is skipped unless the tree has
   errors, and per-subtree results are memoized by subtree text: a keystroke
-  rechecks just the node it touched. Workspace index rebuilds are coalesced
-  and run ~200 ms after typing pauses. On a 200 KB dtsi an edit plus its full
+  rechecks just the node it touched. Unit re-runs are coalesced and start
+  ~200 ms after typing pauses; the preprocessed text is reparsed incrementally. On a 200 KB dtsi an edit plus its full
   diagnostics takes ~2 ms server-side (~440 edits/s end to end, 1 s window).
 - **M3: goto binding** — with the cursor on a node (not on a label), `gd`
   jumps to the YAML binding of the node's `compatible`

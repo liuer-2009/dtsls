@@ -9,7 +9,7 @@ use tree_sitter::Node;
 use crate::bindings::BindingIndex;
 use crate::document::Document;
 use crate::status::FeatureIssue;
-use crate::{index, util};
+use crate::{util, workspace};
 
 const SOURCE: &str = "dtsls";
 const MAX_DIAGNOSTICS: usize = 500;
@@ -308,13 +308,21 @@ fn run(
     };
     let mut raws: Vec<RawDiag> = Vec::new();
     let mut labels: Vec<(u32, u32)> = Vec::new();
+    let collect_labels_here = cache.is_none() && cats & CAT_DUPLICATES != 0;
     check_node(
         &ctx,
         root,
         false,
         &mut raws,
-        (cats & CAT_DUPLICATES != 0).then_some(&mut labels),
+        if collect_labels_here {
+            None
+        } else {
+            (cats & CAT_DUPLICATES != 0).then_some(&mut labels)
+        },
     );
+    if collect_labels_here {
+        subtree_labels(root, &mut labels);
+    }
     if cats & CAT_DUPLICATES != 0 && !labels.is_empty() {
         labels.sort_unstable();
         let mut seen: FxHashMap<&str, ()> = FxHashMap::default();
@@ -419,15 +427,9 @@ fn check_subnode(
     labels: Option<&mut Vec<(u32, u32)>>,
 ) {
     let Some(cache) = ctx.cache.filter(|_| !in_alternative) else {
+        // Labels are collected once for the whole file by `run` when there is
+        // no cache, so nothing is gathered per subnode here.
         check_subnode_uncached(ctx, node, in_alternative, out);
-        // no cache in this run (or an `#else` branch): labels still count,
-        // but duplicates inside alternatives are not reported
-        if !in_alternative
-            && ctx.cats & CAT_DUPLICATES != 0
-            && let Some(dst) = labels
-        {
-            subtree_labels(node, dst);
-        }
         return;
     };
     let base = node.start_byte() as u32;
@@ -448,9 +450,12 @@ fn check_subnode(
     let mut local = Vec::new();
     check_subnode_uncached(ctx, node, in_alternative, &mut local);
     // labels of the whole subtree: nested units are not visited once this
-    // entry is reused, so they belong to the outermost reachable unit
+    // entry is reused, so they belong to the outermost reachable unit. Only
+    // the outermost caller collects them (nested calls pass no label sink),
+    // which keeps the walk linear.
     let mut abs_labels = Vec::new();
-    if ctx.cats & CAT_DUPLICATES != 0 {
+    let want_labels = labels.is_some() && ctx.cats & CAT_DUPLICATES != 0;
+    if want_labels {
         subtree_labels(node, &mut abs_labels);
     }
     let relative = abs_labels
@@ -823,7 +828,7 @@ fn include_into(ctx: &CheckCtx, node: Node, out: &mut Vec<RawDiag>) {
         // `#include SOME_MACRO` — statically unresolvable, skip.
         return;
     };
-    let resolved = index::resolve_include(
+    let resolved = workspace::resolve_include(
         ctx.file_path.and_then(Path::parent),
         target,
         quoted,

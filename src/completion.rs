@@ -7,7 +7,7 @@ use tree_sitter::Node;
 
 use crate::analysis;
 use crate::document::Document;
-use crate::index::DefineMap;
+use crate::workspace::DefineMap;
 use crate::util;
 
 /// label -> (node path, defining file name). An empty file name means the
@@ -569,6 +569,97 @@ fn collect_strings(value: &str, out: &mut Vec<String>) {
         }
         rest = &rest[end + 1..];
     }
+}
+
+/// Labels defined in the live buffer, for the window before the first unit run.
+fn walk_tree(node: Node, f: &mut impl FnMut(Node)) {
+    f(node);
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            walk_tree(child, f);
+        }
+    }
+}
+
+/// Where a label is defined in this buffer (node span of its owner).
+pub fn label_definition(doc: &Document, label: &str) -> Option<Range> {
+    let mut found = None;
+    walk_tree(doc.tree.root_node(), &mut |node| {
+        if found.is_some() || node.kind() != "label" {
+            return;
+        }
+        let text = util::node_text(doc, node);
+        if text.trim_end_matches(':') != label {
+            return;
+        }
+        let owner = match node.parent() {
+            Some(parent) if parent.kind() == "property" => {
+                util::owning_node(parent).unwrap_or(parent)
+            }
+            Some(parent) => parent,
+            None => node,
+        };
+        found = Some(Range {
+            start: util::byte_to_position(&doc.rope, owner.start_byte()),
+            end: util::byte_to_position(&doc.rope, owner.end_byte()),
+        });
+    });
+    found
+}
+
+/// `&label` uses in this buffer.
+pub fn label_references(doc: &Document, label: &str) -> Vec<Range> {
+    let mut out = Vec::new();
+    walk_tree(doc.tree.root_node(), &mut |node| {
+        if node.kind() != "reference" {
+            return;
+        }
+        let Some(label_ref) = util::find_child(node, "label_ref") else {
+            return;
+        };
+        let text = util::node_text(doc, label_ref);
+        if text.trim_start_matches('&') != label {
+            return;
+        }
+        out.push(Range {
+            start: util::byte_to_position(&doc.rope, node.start_byte()),
+            end: util::byte_to_position(&doc.rope, node.end_byte()),
+        });
+    });
+    out
+}
+
+/// Macro completion from the live buffer (fallback before a unit is checked).
+pub fn same_file_define_items(doc: &Document, prefix: &str) -> Vec<CompletionItem> {
+    let mut defines: DefineMap = HashMap::new();
+    walk_tree(doc.tree.root_node(), &mut |node| match node.kind() {
+        "preproc_def" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let name = util::node_text(doc, name).to_string();
+                let value = node
+                    .child_by_field_name("value")
+                    .map(|value| summarize_value(util::node_text(doc, value)))
+                    .unwrap_or_default();
+                defines.insert(name, (value, String::new()));
+            }
+        }
+        "preproc_undef" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                defines.remove(util::node_text(doc, name));
+            }
+        }
+        _ => {}
+    });
+    items_from_defines(&defines, prefix)
+}
+
+fn summarize_value(value: &str) -> String {
+    let collapsed: String = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = collapsed.chars().take(48).collect();
+    if collapsed.chars().count() > 48 {
+        out.push('…');
+    }
+    out
 }
 
 /// Property-name item that expands to `compatible = ""` with the cursor

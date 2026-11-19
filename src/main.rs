@@ -5,12 +5,12 @@ mod completion;
 mod diagnostics;
 mod document;
 mod hints;
-mod index;
 mod preproc;
 mod semantic_tokens;
 mod status;
 mod symbols;
 mod tu;
+mod workspace;
 mod util;
 
 use tower_lsp::{LspService, Server};

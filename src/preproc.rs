@@ -196,7 +196,35 @@ impl<'a> Expander<'a> {
         if let Some(directive) = trimmed.strip_prefix('#') {
             let directive = directive.trim_start();
             let (name, rest) = split_ident(directive);
-            match name {
+            let is_directive = matches!(
+                name,
+                "include"
+                    | "define"
+                    | "undef"
+                    | "if"
+                    | "ifdef"
+                    | "ifndef"
+                    | "elif"
+                    | "else"
+                    | "endif"
+                    | "error"
+                    | "pragma"
+                    | "warning"
+                    | "line"
+            );
+            // `# 1 "file"` linemarkers, and devicetree properties such as
+            // `#address-cells = <2>;` are not directives: let the latter fall
+            // through as ordinary source.
+            if !is_directive {
+                let linemarker = directive
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit() || c == '"');
+                if linemarker {
+                    return;
+                }
+            } else {
+                match name {
                 "include" => {
                     if !self.active() {
                         return;
@@ -247,8 +275,9 @@ impl<'a> Expander<'a> {
                     }
                 }
                 _ => {}
+                }
+                return;
             }
-            return;
         }
         if !self.active() {
             return;
@@ -1039,6 +1068,19 @@ mod tests {
         for error in expanded.errors.iter().take(5) {
             println!("  error: {}:{}", expanded.files[error.file as usize].display(), error.line);
         }
+    }
+
+    #[test]
+    fn hash_properties_are_not_directives() {
+        let dir = work("hash");
+        let root = dir.join("board.dts");
+        write(
+            &root,
+            "/ {\n\t#address-cells = <1>;\n\t#size-cells = <1>;\n\tnode {\n\t\t#clock-cells = <2>;\n\t};\n};\n",
+        );
+        let expanded = run(&dir, &root, &BTreeMap::new());
+        assert!(expanded.text.contains("#address-cells = <1>;"), "{}", expanded.text);
+        assert!(expanded.text.contains("#clock-cells = <2>;"), "{}", expanded.text);
     }
 
     #[test]
