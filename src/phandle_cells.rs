@@ -81,8 +81,9 @@ struct Cell<'a> {
 /// Check every phandle-argument property of a document against the providers
 /// declared in its unit. Returns (start, end, message) byte spans.
 pub fn check_document(doc: &Document, providers: &UnitProviders<'_>) -> Vec<(u32, u32, String)> {
+    let labels = label_nodes(doc);
     let mut out = Vec::new();
-    check_node(doc, doc.tree.root_node(), providers, &mut out);
+    check_node(doc, doc.tree.root_node(), providers, &labels, &mut out);
     out
 }
 
@@ -90,17 +91,48 @@ fn check_node(
     doc: &Document,
     node: Node<'_>,
     providers: &UnitProviders<'_>,
+    labels: &HashMap<String, Node<'_>>,
     out: &mut Vec<(u32, u32, String)>,
 ) {
     if node.kind() == "property" {
         check_property(doc, node, providers, out);
+        check_interrupts(doc, node, labels, out);
         return;
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            check_node(doc, child, providers, out);
+            check_node(doc, child, providers, labels, out);
         }
     }
+}
+
+/// label -> subnode, for resolving `interrupt-parent` (and other single-label
+/// phandles) to the node itself rather than to its path.
+fn label_nodes(doc: &Document) -> HashMap<String, Node<'_>> {
+    fn walk<'a>(doc: &Document, node: Node<'a>, out: &mut HashMap<String, Node<'a>>) {
+        if node.kind() == "subnode" {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "label"
+                {
+                    let text = util::node_text(doc, child);
+                    let name = text.trim_end_matches(':').trim();
+                    if !name.is_empty() {
+                        out.entry(name.to_string()).or_insert(node);
+                    }
+                }
+            }
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                walk(doc, child, out);
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    walk(doc, doc.tree.root_node(), &mut out);
+    out
 }
 
 /// dtc's `check_property_phandle_args`, run over the source text instead of
@@ -193,6 +225,151 @@ fn check_property(
 
         index += declared + 1;
     }
+}
+
+/// dtc's `check_interrupts_property`: `interrupts` takes no phandle, so its
+/// size must be a whole multiple of the interrupt controller's
+/// `#interrupt-cells`. The controller is found through `interrupt-parent` on
+/// this node or on an ancestor, or by an ancestor that is itself an interrupt
+/// provider — exactly dtc's search order.
+fn check_interrupts(
+    doc: &Document,
+    property: Node<'_>,
+    labels: &HashMap<String, Node<'_>>,
+    out: &mut Vec<(u32, u32, String)>,
+) {
+    let Some(name_node) = property.child_by_field_name("name") else {
+        return;
+    };
+    if util::node_text(doc, name_node) != "interrupts" {
+        return;
+    }
+    let cells = cells(doc, property);
+    if cells.is_empty() {
+        return;
+    }
+    let Some(owner) = util::owning_node(property) else {
+        return;
+    };
+
+    let mut current = Some(owner);
+    let mut controller = None;
+    while let Some(node) = current {
+        if node.id() != owner.id() && is_interrupt_provider(doc, node) {
+            controller = Some(node);
+            break;
+        }
+        if let Some(parent_property) = property_of(doc, node, "interrupt-parent") {
+            if let Some(label) = first_reference_label(doc, parent_property) {
+                controller = labels.get(label).copied();
+            }
+            break;
+        }
+        current = parent_node(node);
+    }
+
+    // an unresolvable parent (`&label` from another unit, a phandle of 0) is
+    // left alone rather than guessed at
+    let Some(controller) = controller else {
+        return;
+    };
+    let Some(declared) = property_of(doc, controller, "#interrupt-cells")
+        .and_then(|declared| property_u32(doc, declared))
+    else {
+        return;
+    };
+    let declared = declared as usize;
+    if declared == 0 || cells.len() % declared == 0 {
+        return;
+    }
+
+    out.push((
+        property.start_byte() as u32,
+        property.end_byte() as u32,
+        format!(
+            "interrupts: size is {} cell(s), expected a multiple of {declared} \
+             (#interrupt-cells = <{declared}>)",
+            cells.len()
+        ),
+    ));
+}
+
+/// The node body that holds this node's properties.
+fn body<'a>(doc: &Document, node: Node<'a>) -> Option<Node<'a>> {
+    match node.kind() {
+        "devicetree" => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "node_def"
+                {
+                    return Some(child);
+                }
+            }
+            None
+        }
+        _ => {
+            let _ = doc;
+            util::node_def_of(node)
+        }
+    }
+}
+
+fn property_of<'a>(doc: &Document, node: Node<'a>, name: &str) -> Option<Node<'a>> {
+    let body = body(doc, node)?;
+    for i in 0..body.child_count() {
+        let Some(child) = body.child(i as u32) else {
+            continue;
+        };
+        if child.kind() != "property" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        if util::node_text(doc, name_node) == name {
+            return Some(child);
+        }
+    }
+    None
+}
+
+/// The enclosing node (subnode, or the root devicetree).
+fn parent_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(node) = current {
+        match node.kind() {
+            "subnode" | "devicetree" => return Some(node),
+            _ => {}
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn is_interrupt_provider(doc: &Document, node: Node<'_>) -> bool {
+    property_of(doc, node, "interrupt-controller").is_some()
+        || property_of(doc, node, "interrupt-map").is_some()
+}
+
+fn first_reference_label<'a>(doc: &'a Document, property: Node<'a>) -> Option<&'a str> {
+    fn walk<'a>(doc: &'a Document, node: Node<'a>, found: &mut Option<&'a str>) {
+        if found.is_some() {
+            return;
+        }
+        if node.kind() == "reference" {
+            *found = reference_label(doc, node);
+            return;
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                walk(doc, child, found);
+            }
+        }
+    }
+
+    let mut found = None;
+    walk(doc, property, &mut found);
+    found
 }
 
 /// Flatten the property value into cells, skipping comments and `/bits/`
@@ -422,6 +599,31 @@ mod tests {
     fn unknown_cell_values_are_not_guessed() {
         // an unexpanded macro may be 0, which dtc skips silently — stay quiet
         let text = "/dts-v1/;\n/ {\n\tphy: phy@1 { #clock-cells = <0>; };\n\tdev {\n\t\tclocks = <&phy SOME_PIPE_CLK>;\n\t};\n};\n";
+        assert!(diags(text).is_empty(), "{:?}", diags(text));
+    }
+
+    #[test]
+    fn interrupts_size_must_be_a_multiple_of_interrupt_cells() {
+        let good = "/dts-v1/;\n/ {\n\tintc: intc@1 { #interrupt-cells = <3>; interrupt-controller; };\n\tdev { interrupt-parent = <&intc>; interrupts = <0 5 4>, <0 6 4>; };\n};\n";
+        assert!(diags(good).is_empty(), "{:?}", diags(good));
+
+        let bad = "/dts-v1/;\n/ {\n\tintc: intc@1 { #interrupt-cells = <3>; interrupt-controller; };\n\tdev { interrupt-parent = <&intc>; interrupts = <0 5 4>, <0 6>; };\n};\n";
+        let messages = diags(bad);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains("multiple of 3"), "{messages:?}");
+    }
+
+    #[test]
+    fn interrupt_parent_is_inherited_from_ancestors() {
+        let text = "/dts-v1/;\n/ {\n\tinterrupt-parent = <&intc>;\n\tintc: intc@1 { #interrupt-cells = <2>; interrupt-controller; };\n\tbus@2 { dev { interrupts = <5>; }; };\n};\n";
+        let messages = diags(text);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains("multiple of 2"), "{messages:?}");
+    }
+
+    #[test]
+    fn interrupts_without_a_resolvable_controller_are_left_alone() {
+        let text = "/dts-v1/;\n/ {\n\tdev { interrupts = <0 5>; };\n};\n";
         assert!(diags(text).is_empty(), "{:?}", diags(text));
     }
 
