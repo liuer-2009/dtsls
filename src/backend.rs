@@ -6,7 +6,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::request::{GotoDeclarationParams, GotoDeclarationResponse};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::bindings::{self, BindingIndex};
 use crate::completion;
@@ -292,17 +292,38 @@ impl Backend {
                 );
                 output
             })
-            .await
-            .ok();
+            .await;
             debug!(
                 root = %task_root,
                 elapsed_us = started.elapsed().as_micros() as u64,
                 files = tu_result.as_ref().map(|out| out.per_file.len()).unwrap_or(0),
                 "translation unit checked"
             );
-            let Some(output) = tu_result else {
-                warn!(root = %task_root, "translation unit check could not run");
-                return;
+            let output = match tu_result {
+                Ok(output) => output,
+                Err(error) => {
+                    // a panic or cancellation inside the analysis must reach
+                    // the user, never disappear
+                    warn!(root = %task_root, %error, "translation unit check failed");
+                    {
+                        client
+                            .publish_diagnostics(
+                                task_root.clone(),
+                                vec![Diagnostic {
+                                    range: Range::default(),
+                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    source: Some("dtsls".to_string()),
+                                    message: format!(
+                                        "internal: translation unit analysis failed ({error});                                          diagnostics for this file are incomplete"
+                                    ),
+                                    ..Default::default()
+                                }],
+                                None,
+                            )
+                            .await;
+                    }
+                    return;
+                }
             };
             workspace.store_unit_uri(task_root.clone(), Arc::new(output.data));
             let protected: HashSet<PathBuf> =
@@ -419,56 +440,137 @@ struct TuOutput {
     data: TuData,
 }
 
+/// Publish an internal failure to every open document. A parser crash must be
+/// visible, never swallowed.
+async fn report_internal(
+    client: &Client,
+    documents: &Arc<RwLock<HashMap<Url, Document>>>,
+    message: String,
+) {
+    let uris: Vec<Url> = documents.read().unwrap().keys().cloned().collect();
+    for uri in uris {
+        client
+            .publish_diagnostics(
+                uri,
+                vec![Diagnostic {
+                    range: Range::default(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("dtsls".to_string()),
+                    message: message.clone(),
+                    ..Default::default()
+                }],
+                None,
+            )
+            .await;
+    }
+}
+
 fn tu_output(unit: &crate::tu::TuResult, doc: &Document) -> TuOutput {
     let data = tu_data(unit, doc);
     let mut per_file = group_diagnostics(unit, doc);
-    // phandle-argument checks need the whole unit's providers
-    let labels: HashMap<String, String> = data
-        .labels
-        .iter()
-        .map(|(name, label)| (name.clone(), label.path.clone()))
-        .collect();
-    let providers = crate::phandle_cells::UnitProviders {
-        labels: &labels,
-        cells: &data.provider_cells,
-    };
-    for (start, end, message) in crate::phandle_cells::check_document(doc, &providers) {
+    let report = crate::phandle_cells::check_document(doc);
+    // phandle and interrupt checks resolve labels from the unit's own text
+    for problem in report.diagnostics {
+        push_problem(unit, doc, &mut per_file, problem);
+    }
+
+    // `&label { }` blocks that extend nodes outside this unit: one diagnostic
+    // per file, listing what could not be resolved
+    let mut unresolved: HashMap<PathBuf, (Vec<String>, u32, u32)> = HashMap::new();
+    for (start, end, label) in report.unresolved_fragments {
         let line = util::byte_to_position(&doc.rope, start as usize).line;
-        let Some((source, path)) = unit.locate(line) else {
+        let Some((_, path)) = unit.locate(line) else {
             continue;
         };
-        let end_line = util::byte_to_position(&doc.rope, end as usize).line;
-        let end_position = if unit
-            .locate(end_line)
-            .map(|(source, _)| source.file)
-            == Some(source.file)
-        {
-            Position {
-                line: end_line,
-                character: util::byte_to_position(&doc.rope, end as usize).character,
-            }
-        } else {
-            Position {
-                line: source.line,
-                character: util::byte_to_position(&doc.rope, start as usize).character + 1,
-            }
-        };
         let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        per_file.entry(path).or_default().push(Diagnostic {
-            range: Range {
-                start: Position {
-                    line: source.line,
-                    character: util::byte_to_position(&doc.rope, start as usize).character,
-                },
-                end: end_position,
-            },
-            severity: Some(DiagnosticSeverity::WARNING),
+        let entry = unresolved.entry(path).or_insert_with(|| (Vec::new(), start, end));
+        entry.0.push(label);
+    }
+    for (_path, (labels, start, end)) in unresolved {
+        let mut names = labels;
+        names.sort();
+        names.dedup();
+        let shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        let more = names.len().saturating_sub(5);
+        let problem = crate::phandle_cells::Problem {
+            start,
+            end,
+            error: true,
+            message: format!(
+                "{} override block(s) extend nodes that are not defined in this file's \
+                 translation unit ({shown}{}); the board file that includes this one must \
+                 provide them, so their contents are not checked",
+                names.len(),
+                if more > 0 { format!(", and {more} more") } else { String::new() }
+            ),
+        };
+        push_problem(unit, doc, &mut per_file, problem);
+    }
+
+    TuOutput { per_file, data }
+}
+
+/// Map a byte-span problem back to the file it came from and publish it there.
+fn push_problem(
+    unit: &crate::tu::TuResult,
+    doc: &Document,
+    per_file: &mut HashMap<PathBuf, Vec<Diagnostic>>,
+    problem: crate::phandle_cells::Problem,
+) {
+    let (start, end) = (problem.start as usize, problem.end as usize);
+    let line = util::byte_to_position(&doc.rope, start).line;
+    let Some((source, path)) = unit.locate(line) else {
+        // the source map is missing this line: a preprocessor bug, never
+        // silently drop the diagnostic
+        let fallback = unit
+            .files
+            .first()
+            .map(|file| std::fs::canonicalize(file).unwrap_or_else(|_| file.clone()))
+            .unwrap_or_default();
+        per_file.entry(fallback).or_default().push(Diagnostic {
+            range: Range::default(),
+            severity: Some(DiagnosticSeverity::ERROR),
             source: Some("dtsls".to_string()),
-            message,
+            message: format!(
+                "internal: cannot map a diagnostic at line {} back to a source file: {}",
+                line + 1,
+                problem.message
+            ),
             ..Default::default()
         });
-    }
-    TuOutput { per_file, data }
+        return;
+    };
+    let end_position = util::byte_to_position(&doc.rope, end);
+    let end_position = if unit
+        .locate(end_position.line)
+        .map(|(source, _)| source.file)
+        == Some(source.file)
+    {
+        end_position
+    } else {
+        Position {
+            line: source.line,
+            character: util::byte_to_position(&doc.rope, start).character + 1,
+        }
+    };
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    per_file.entry(path).or_default().push(Diagnostic {
+        range: Range {
+            start: Position {
+                line: source.line,
+                character: util::byte_to_position(&doc.rope, start).character,
+            },
+            end: end_position,
+        },
+        severity: Some(if problem.error {
+            DiagnosticSeverity::ERROR
+        } else {
+            DiagnosticSeverity::WARNING
+        }),
+        source: Some("dtsls".to_string()),
+        message: problem.message,
+        ..Default::default()
+    });
 }
 
 fn tu_data(unit: &crate::tu::TuResult, doc: &Document) -> workspace::TuData {
@@ -628,8 +730,14 @@ fn group_diagnostics(
             });
     }
     for error in &unit.errors {
-        let Some(file) = error.file else { continue };
-        let path = unit.files[file as usize].clone();
+        // an error without a file must still be shown, not dropped
+        let path = error
+            .file
+            .and_then(|file| unit.files.get(file as usize).cloned())
+            .or_else(|| unit.files.first().cloned());
+        let Some(path) = path else {
+            continue;
+        };
         out.entry(path).or_default().push(Diagnostic {
             range: Range {
                 start: Position {
@@ -762,10 +870,20 @@ impl LanguageServer for Backend {
             tokio::spawn(async move {
                 let scan_started = std::time::Instant::now();
                 let scan_bindings = Arc::clone(&bindings);
-                let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) = tokio::task::spawn_blocking(move || {
                     bindings::scan(&scan_bindings, &dir);
                 })
-                .await;
+                .await
+                {
+                    // a panicking scan leaves every binding check unreliable:
+                    // say so instead of silently serving stale results
+                    error!(%error, "binding scan failed");
+                    report_internal(&client, &documents, format!(
+                        "internal: the binding scan failed ({error}); binding validation \
+                         is disabled for this session"
+                    ))
+                    .await;
+                }
                 let scan_us = scan_started.elapsed().as_micros() as u64;
                 let entries: Vec<(Url, i32)> = {
                     let docs = documents.read().unwrap();
@@ -888,10 +1006,18 @@ impl LanguageServer for Backend {
                 );
                 // workspace scan after the refresh: running both at once just
                 // makes the first post-scan diagnostics slower
-                let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) = tokio::task::spawn_blocking(move || {
                     workspace.scan(&scan_roots, &scan_roots);
                 })
-                .await;
+                .await
+                {
+                    error!(%error, "workspace scan failed");
+                    report_internal(&client, &documents, format!(
+                        "internal: the workspace scan failed ({error}); label and ref \
+                         navigation is incomplete"
+                    ))
+                    .await;
+                }
             });
         } else {
             // no binding scan: go straight to the workspace scan

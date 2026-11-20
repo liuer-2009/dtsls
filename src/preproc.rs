@@ -258,7 +258,7 @@ impl<'a> Expander<'a> {
                     }
                 }
                 "ifdef" | "ifndef" | "if" | "elif" | "else" | "endif" => {
-                    self.conditional(name, rest.trim());
+                    self.conditional(name, rest.trim(), file, line);
                 }
                 "error" => {
                     if self.active() {
@@ -320,12 +320,12 @@ impl<'a> Expander<'a> {
         });
     }
 
-    fn conditional(&mut self, kind: &str, rest: &str) {
+    fn conditional(&mut self, kind: &str, rest: &str, file: u32, line: u32) {
         match kind {
             "if" | "ifdef" | "ifndef" => {
                 let parent_active = self.active();
                 let condition = if kind == "if" {
-                    self.eval_condition(rest)
+                    self.eval_condition(rest, file, line)
                 } else {
                     let (name, _) = split_ident(rest);
                     let defined = self.macros.contains_key(name);
@@ -348,7 +348,7 @@ impl<'a> Expander<'a> {
                     }
                     return;
                 }
-                let condition = self.eval_condition(rest);
+                let condition = self.eval_condition(rest, file, line);
                 if let Some(frame) = self.frames.last_mut() {
                     frame.active = condition;
                     frame.taken = condition;
@@ -384,7 +384,7 @@ impl<'a> Expander<'a> {
         None
     }
 
-    fn eval_condition(&mut self, expression: &str) -> bool {
+    fn eval_condition(&mut self, expression: &str, file: u32, line: u32) -> bool {
         let replaced = replace_defined(expression, &self.macros);
         let expanded = self.expand_text(&replaced, 0, &mut HashSet::new());
         let tokens = tokenize_condition(&expanded);
@@ -392,7 +392,19 @@ impl<'a> Expander<'a> {
             tokens: &tokens,
             pos: 0,
         };
-        parser.parse_or().unwrap_or(0) != 0
+        match parser.parse_or() {
+            Some(value) => value != 0,
+            // an unparseable condition means the preprocessor cannot tell
+            // which branch is live: say so instead of silently taking #else
+            None => {
+                self.out.errors.push(Error {
+                    file,
+                    line,
+                    message: format!("cannot evaluate #if expression: {expression}"),
+                });
+                false
+            }
+        }
     }
 
     fn expand_text(
