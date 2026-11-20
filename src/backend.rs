@@ -420,10 +420,55 @@ struct TuOutput {
 }
 
 fn tu_output(unit: &crate::tu::TuResult, doc: &Document) -> TuOutput {
-    TuOutput {
-        per_file: group_diagnostics(unit, doc),
-        data: tu_data(unit, doc),
+    let data = tu_data(unit, doc);
+    let mut per_file = group_diagnostics(unit, doc);
+    // phandle-argument checks need the whole unit's providers
+    let labels: HashMap<String, String> = data
+        .labels
+        .iter()
+        .map(|(name, label)| (name.clone(), label.path.clone()))
+        .collect();
+    let providers = crate::phandle_cells::UnitProviders {
+        labels: &labels,
+        cells: &data.provider_cells,
+    };
+    for (start, end, message) in crate::phandle_cells::check_document(doc, &providers) {
+        let line = util::byte_to_position(&doc.rope, start as usize).line;
+        let Some((source, path)) = unit.locate(line) else {
+            continue;
+        };
+        let end_line = util::byte_to_position(&doc.rope, end as usize).line;
+        let end_position = if unit
+            .locate(end_line)
+            .map(|(source, _)| source.file)
+            == Some(source.file)
+        {
+            Position {
+                line: end_line,
+                character: util::byte_to_position(&doc.rope, end as usize).character,
+            }
+        } else {
+            Position {
+                line: source.line,
+                character: util::byte_to_position(&doc.rope, start as usize).character + 1,
+            }
+        };
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        per_file.entry(path).or_default().push(Diagnostic {
+            range: Range {
+                start: Position {
+                    line: source.line,
+                    character: util::byte_to_position(&doc.rope, start as usize).character,
+                },
+                end: end_position,
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            source: Some("dtsls".to_string()),
+            message,
+            ..Default::default()
+        });
     }
+    TuOutput { per_file, data }
 }
 
 fn tu_data(unit: &crate::tu::TuResult, doc: &Document) -> workspace::TuData {
@@ -432,6 +477,7 @@ fn tu_data(unit: &crate::tu::TuResult, doc: &Document) -> workspace::TuData {
         refs: Vec::new(),
         defines: HashMap::new(),
         cells: Vec::new(),
+        provider_cells: HashMap::new(),
     };
     for define in &unit.defines {
         let file = define
@@ -490,12 +536,16 @@ fn collect_unit_names(
                     let name = util::node_text(doc, name_node);
                     if name.starts_with('#') && name.ends_with("-cells") {
                         let path = crate::analysis::node_path(doc, node);
-                        if let Some(value) = property_u32(doc, node) {
+                        if let Some(value) = crate::phandle_cells::property_u32(doc, node) {
                             data.cells.push(workspace::CellsProp {
-                                path,
+                                path: path.clone(),
                                 name: name.to_string(),
                                 value,
                             });
+                            data.provider_cells
+                                .entry(path)
+                                .or_default()
+                                .insert(name.to_string(), value);
                         }
                     }
                 }
@@ -535,23 +585,6 @@ fn unit_range(
             },
         },
     ))
-}
-
-fn property_u32(doc: &Document, property: tree_sitter::Node) -> Option<u32> {
-    for i in 0..property.child_count() {
-        let child = property.child(i as u32)?;
-        if child.kind() == "prop_data" {
-            let text = util::node_text(doc, child);
-            return text
-                .split(|c: char| !c.is_ascii_hexdigit() && c != 'x' && c != 'X')
-                .find(|piece| !piece.is_empty())
-                .and_then(|piece| {
-                    let piece = piece.trim_start_matches(['x', 'X']);
-                    u32::from_str_radix(piece, 16).ok().or_else(|| piece.parse().ok())
-                });
-        }
-    }
-    None
 }
 
 /// Diagnostics produced for a preprocessed unit, grouped by the file they
@@ -1744,3 +1777,4 @@ mod refresh_bench {
         println!("refresh serial: {serial:?}, parallel: {parallel:?}");
     }
 }
+

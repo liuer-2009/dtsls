@@ -5,6 +5,7 @@ mod completion;
 mod diagnostics;
 mod document;
 mod hints;
+mod phandle_cells;
 mod preproc;
 mod semantic_tokens;
 mod status;

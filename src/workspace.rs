@@ -53,6 +53,9 @@ pub struct TuData {
     pub refs: Vec<TuRef>,
     pub defines: DefineMap,
     pub cells: Vec<CellsProp>,
+    /// provider node path -> `#X-cells` name -> value, for phandle-argument
+    /// checks across files (dtc's `WARNING_PROPERTY_PHANDLE_CELLS`).
+    pub provider_cells: HashMap<String, HashMap<String, u32>>,
 }
 
 #[derive(Default)]
