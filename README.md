@@ -138,15 +138,11 @@ cargo build --release
 ```sh
 cargo test                          # unit tests (incl. testdata fixtures)
 cargo test -- --ignored             # parses a real kernel dtsi (path baked in test)
-python3 scripts/smoke_test.py       # end-to-end LSP session over stdio
-python3 scripts/compat_test.py      # two-stage compatible completion
-python3 scripts/tu_test.py          # cross-file checks via cpp + line markers
-python3 scripts/diagnostics_test.py # broken/valid fixtures -> publishDiagnostics
-python3 scripts/bench.py            # state update / jump / completion latencies
-python3 scripts/bench_rate.py       # throughput: ops per fixed >=100 ms window
-python3 scripts/bench_startup.py    # binding scan -> refreshed diagnostics gap
-python3 scripts/bench_real.py /path/to/soc.dtsi   # real-world parse timing
 ```
+
+The end-to-end LSP verification harness (smoke / diagnostics / tu / compat
+driven over stdio, plus the latency and throughput benchmarks) is kept out
+of the repository as a local-only workflow.
 
 ## Neovim
 
