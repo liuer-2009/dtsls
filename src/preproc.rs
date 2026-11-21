@@ -760,7 +760,30 @@ struct ExprParser<'a> {
     pos: usize,
 }
 
-impl ExprParser<'_> {
+/// C conditional-expression operators, loosest binding first: (token,
+/// precedence, apply). Every binary operator here is left-associative.
+const OPERATORS: &[(&str, u8, fn(i64, i64) -> i64)] = &[
+    ("||", 1, |a, b| (a != 0 || b != 0) as i64),
+    ("&&", 2, |a, b| (a != 0 && b != 0) as i64),
+    ("|", 3, |a, b| a | b),
+    ("^", 4, |a, b| a ^ b),
+    ("&", 5, |a, b| a & b),
+    ("==", 6, |a, b| (a == b) as i64),
+    ("!=", 6, |a, b| (a != b) as i64),
+    ("<", 7, |a, b| (a < b) as i64),
+    (">", 7, |a, b| (a > b) as i64),
+    ("<=", 7, |a, b| (a <= b) as i64),
+    (">=", 7, |a, b| (a >= b) as i64),
+    ("<<", 8, |a, b| a << b),
+    (">>", 8, |a, b| a >> b),
+    ("+", 9, |a, b| a.wrapping_add(b)),
+    ("-", 9, |a, b| a.wrapping_sub(b)),
+    ("*", 10, |a, b| a.wrapping_mul(b)),
+    ("/", 10, |a, b| if b != 0 { a / b } else { a }),
+    ("%", 10, |a, b| if b != 0 { a % b } else { a }),
+];
+
+impl<'a> ExprParser<'a> {
     fn peek(&self) -> Option<&Tok> {
         self.tokens.get(self.pos)
     }
@@ -775,122 +798,27 @@ impl ExprParser<'_> {
         false
     }
 
+    /// Precedence climbing over [`OPERATORS`]; `min_prec` stops the loop at
+    /// operators that bind looser than the level being parsed.
     fn parse_or(&mut self) -> Option<i64> {
-        let mut value = self.parse_and()?;
-        while self.eat_op("||") {
-            let right = self.parse_and()?;
-            value = (value != 0 || right != 0) as i64;
-        }
-        Some(value)
+        self.parse_at(1)
     }
 
-    fn parse_and(&mut self) -> Option<i64> {
-        let mut value = self.parse_bitor()?;
-        while self.eat_op("&&") {
-            let right = self.parse_bitor()?;
-            value = (value != 0 && right != 0) as i64;
-        }
-        Some(value)
-    }
-
-    fn parse_bitor(&mut self) -> Option<i64> {
-        let mut value = self.parse_bitxor()?;
-        while self.eat_op("|") {
-            value |= self.parse_bitxor()?;
-        }
-        Some(value)
-    }
-
-    fn parse_bitxor(&mut self) -> Option<i64> {
-        let mut value = self.parse_bitand()?;
-        while self.eat_op("^") {
-            value ^= self.parse_bitand()?;
-        }
-        Some(value)
-    }
-
-    fn parse_bitand(&mut self) -> Option<i64> {
-        let mut value = self.parse_equality()?;
-        while self.eat_op("&") {
-            value &= self.parse_equality()?;
-        }
-        Some(value)
-    }
-
-    fn parse_equality(&mut self) -> Option<i64> {
-        let mut value = self.parse_relational()?;
+    fn parse_at(&mut self, min_prec: u8) -> Option<i64> {
+        let mut left = self.parse_unary()?;
         loop {
-            if self.eat_op("==") {
-                value = (value == self.parse_relational()?) as i64;
-            } else if self.eat_op("!=") {
-                value = (value != self.parse_relational()?) as i64;
-            } else {
-                return Some(value);
+            let Some(Tok::Op(op)) = self.peek() else {
+                return Some(left);
+            };
+            let Some((_, prec, apply)) = OPERATORS.iter().find(|(name, _, _)| name == op) else {
+                return Some(left);
+            };
+            if *prec < min_prec {
+                return Some(left);
             }
-        }
-    }
-
-    fn parse_relational(&mut self) -> Option<i64> {
-        let mut value = self.parse_shift()?;
-        loop {
-            if self.eat_op("<=") {
-                value = (value <= self.parse_shift()?) as i64;
-            } else if self.eat_op(">=") {
-                value = (value >= self.parse_shift()?) as i64;
-            } else if self.eat_op("<") {
-                value = (value < self.parse_shift()?) as i64;
-            } else if self.eat_op(">") {
-                value = (value > self.parse_shift()?) as i64;
-            } else {
-                return Some(value);
-            }
-        }
-    }
-
-    fn parse_shift(&mut self) -> Option<i64> {
-        let mut value = self.parse_add()?;
-        loop {
-            if self.eat_op("<<") {
-                value <<= self.parse_add()?;
-            } else if self.eat_op(">>") {
-                value >>= self.parse_add()?;
-            } else {
-                return Some(value);
-            }
-        }
-    }
-
-    fn parse_add(&mut self) -> Option<i64> {
-        let mut value = self.parse_mul()?;
-        loop {
-            if self.eat_op("+") {
-                value += self.parse_mul()?;
-            } else if self.eat_op("-") {
-                value -= self.parse_mul()?;
-            } else {
-                return Some(value);
-            }
-        }
-    }
-
-    fn parse_mul(&mut self) -> Option<i64> {
-        let mut value = self.parse_unary()?;
-        loop {
-            if self.eat_op("*") {
-                value *= self.parse_unary()?;
-            } else if self.eat_op("/") {
-                let right = self.parse_unary()?;
-                if right != 0 {
-                    value /= right;
-                }
-            } else if self.eat_op("%") {
-                let right = self.parse_unary()?;
-                if right != 0 {
-                    value %= right;
-                }
-            } else {
-                return Some(value);
-            }
+            self.pos += 1;
+            let right = self.parse_at(prec + 1)?;
+            left = apply(left, right);
         }
     }
 

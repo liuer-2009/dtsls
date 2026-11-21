@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result;
@@ -12,17 +12,15 @@ use crate::bindings::{self, BindingIndex};
 use crate::completion;
 use crate::document::Document;
 use crate::hints;
-use crate::workspace::{self, TuData, Workspace};
+use crate::unit::TuData;
+use crate::workspace::{self, Workspace};
 
-/// How many board contexts keep their unit and preprocessed snapshot. The
-/// least recently used one is evicted beyond this (its files are re-analysed
-/// when it is next used).
-const MAX_CONTEXTS: usize = 8;
-use crate::util;
+use crate::model;
 use crate::status::FeatureIssue;
+use crate::unit;
 use crate::{diagnostics, semantic_tokens, symbols};
 
-pub struct Backend {
+pub struct Inner {
     client: Client,
     documents: Arc<RwLock<HashMap<Url, Document>>>,
     root_dirs: RwLock<Vec<PathBuf>>,
@@ -37,11 +35,11 @@ pub struct Backend {
     /// Per-subtree diagnostic results, so a keystroke only rechecks the
     /// subtree it touched.
     diag_cache: Arc<diagnostics::DiagCache>,
-    /// Last per-file diagnostics, so translation-unit results can be merged
-    /// with them instead of replacing them.
-    file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
-    /// Structural diagnostics produced by the unit covering each file.
-    tu_file_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
+    /// Per-buffer diagnostics (syntax, includes, bindings, notices).
+    buf_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
+    /// Unit-level diagnostics mapped back per file (duplicates, phandle,
+    /// preprocessor errors). Disjoint from `buf_diags` by design.
+    unit_diags: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Coalesced translation-unit re-runs, per root.
     tu_pending: Arc<RwLock<HashMap<Url, u64>>>,
     /// Line of `compatible:` per binding file (go-to-binding target).
@@ -60,8 +58,17 @@ pub struct Backend {
     same_file_labels: Arc<RwLock<HashMap<Url, (i32, Arc<Vec<CompletionItem>>)>>>,
 }
 
+/// The tower-lsp service handle: a shared handle onto the server state.
+pub struct Backend(Arc<Inner>);
+
 impl Backend {
     pub fn new(client: Client) -> Self {
+        Self(Arc::new(Inner::new(client)))
+    }
+}
+
+impl Inner {
+    fn new(client: Client) -> Self {
         Self {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
@@ -70,8 +77,8 @@ impl Backend {
             bindings: Arc::new(BindingIndex::default()),
             status: RwLock::new(Vec::new()),
             diag_cache: Arc::new(diagnostics::DiagCache::default()),
-            file_diags: Arc::new(RwLock::new(HashMap::new())),
-            tu_file_diags: Arc::new(RwLock::new(HashMap::new())),
+            buf_diags: Arc::new(RwLock::new(HashMap::new())),
+            unit_diags: Arc::new(RwLock::new(HashMap::new())),
             tu_pending: Arc::new(RwLock::new(HashMap::new())),
             binding_lines: Arc::new(RwLock::new(HashMap::new())),
             active_board: RwLock::new(None),
@@ -86,25 +93,21 @@ impl Backend {
         self.root_dirs.read().unwrap().clone()
     }
 
-    /// Roots whose translation unit contains `uri`: a `.dts` is its own root,
-    /// anything else is looked up through the reverse include edges (falling
-    /// back to the file itself so a lone `.dtsi` still gets its closure
-    /// checked).
     /// Context of a document: the board whose unit contains it, or the file
-    /// itself when it was not opened inside a board (dts-lsp's ad-hoc
-    /// context). A board opened later adopts standalone documents that are in
-    /// its include closure.
+    /// itself when it was not opened inside a board. A board opened later
+    /// adopts standalone documents that are in its include closure.
     fn context_path(&self, uri: &Url) -> Option<PathBuf> {
         let path = uri.to_file_path().ok()?;
-        if path.extension().and_then(|ext| ext.to_str()) == Some("dts") {
-            return Some(path);
+        if let Some(context) = self.doc_context.read().unwrap().get(uri) {
+            return Some(context.clone());
         }
-        if let Some(board) = self.active_board.read().unwrap().clone()
-            && self.workspace.closure_contains(&board, &path)
-        {
-            return Some(board);
-        }
-        Some(path)
+        let is_board = path.extension().and_then(|ext| ext.to_str()) == Some("dts");
+        Some(context_for(
+            &path,
+            is_board,
+            self.active_board.read().unwrap().as_ref(),
+            &self.workspace,
+        ))
     }
 
     /// Contexts that must not be evicted: every open document's context plus
@@ -125,7 +128,7 @@ impl Backend {
 
     fn prune_contexts(&self) {
         let protected = self.protected_contexts();
-        self.workspace.prune(MAX_CONTEXTS, &protected);
+        self.workspace.prune(&protected);
     }
 
     /// Units to (re)check for an edit of `uri`: its own context, plus open
@@ -162,15 +165,7 @@ impl Backend {
 
     /// The unit that covers `uri`, when one has been checked already.
     fn unit_for(&self, uri: &Url) -> Option<Arc<TuData>> {
-        let context = self
-            .doc_context
-            .read()
-            .unwrap()
-            .get(uri)
-            .cloned()
-            .or_else(|| self.context_path(uri))?;
-        let root_uri = Url::from_file_path(&context).ok()?;
-        self.workspace.unit_for_uri(&root_uri)
+        self.workspace.unit(&self.context_path(uri)?)
     }
 
     /// `&label` completion. A checked unit is authoritative (it is what the
@@ -228,171 +223,179 @@ impl Backend {
             .cloned()
             .collect()
     }
-
-    /// Re-check a translation unit off the main loop. Coalesced like the index
-    /// rebuild: typing only triggers one run once the edits settle.
-    fn schedule_tu(&self, root_uri: Url, root_path: PathBuf) {
-        debug!(root = %root_uri, "tu scheduled");
-        let generation = {
-            let mut pending = self.tu_pending.write().unwrap();
-            let slot = pending.entry(root_uri.clone()).or_insert(0);
-            *slot += 1;
-            *slot
-        };
-        let documents = Arc::clone(&self.documents);
-        let file_diags = Arc::clone(&self.file_diags);
-        let tu_file_diags = Arc::clone(&self.tu_file_diags);
-        let pending = Arc::clone(&self.tu_pending);
-        let workspace = Arc::clone(&self.workspace);
-        let doc_context = Arc::clone(&self.doc_context);
-        let last_active = Arc::clone(&self.last_active);
-        let include_dirs = self.include_dirs();
-        let client = self.client.clone();
-        let task_root = root_uri.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if pending.read().unwrap().get(&task_root) != Some(&generation) {
-                return;
-            }
-            let overlays_docs = Arc::clone(&documents);
-            let blocking_workspace = Arc::clone(&workspace);
-            let publish_root = root_path.clone();
-            let blocking_root = task_root.clone();
-            let root_path_task = root_path.clone();
-            let started = std::time::Instant::now();
-            let tu_result = tokio::task::spawn_blocking(move || {
-                // clangd's VFS equivalent: every open buffer overrides the
-                // on-disk file inside the preprocessor run
-                let overlays: BTreeMap<PathBuf, String> = {
-                    let docs = overlays_docs.read().unwrap();
-                    docs.iter()
-                        .filter_map(|(uri, doc)| {
-                            let path = uri.to_file_path().ok()?;
-                            let path = std::fs::canonicalize(&path).unwrap_or(path);
-                            Some((path, doc.text.clone()))
-                        })
-                        .collect()
-                };
-                let result = crate::tu::preprocess(&crate::tu::TuInput {
-                    root: &root_path_task,
-                    include_dirs: &include_dirs,
-                    overlays: &overlays,
-                });
-                let previous = blocking_workspace.take_snapshot_uri(&blocking_root);
-                let mut doc = match previous {
-                    Some((doc, _files)) => doc,
-                    None => Document::open(&result.text, 0),
-                };
-                doc.update_text(&result.text);
-                let output = tu_output(&result, &doc);
-                blocking_workspace.put_snapshot_uri(
-                    blocking_root.clone(),
-                    doc,
-                    result.files.clone(),
-                );
-                output
-            })
-            .await;
-            debug!(
-                root = %task_root,
-                elapsed_us = started.elapsed().as_micros() as u64,
-                files = tu_result.as_ref().map(|out| out.per_file.len()).unwrap_or(0),
-                "translation unit checked"
-            );
-            let output = match tu_result {
-                Ok(output) => output,
-                Err(error) => {
-                    // a panic or cancellation inside the analysis must reach
-                    // the user, never disappear
-                    warn!(root = %task_root, %error, "translation unit check failed");
-                    {
-                        client
-                            .publish_diagnostics(
-                                task_root.clone(),
-                                vec![Diagnostic {
-                                    range: Range::default(),
-                                    severity: Some(DiagnosticSeverity::ERROR),
-                                    source: Some("dtsls".to_string()),
-                                    message: format!(
-                                        "internal: translation unit analysis failed ({error});                                          diagnostics for this file are incomplete"
-                                    ),
-                                    ..Default::default()
-                                }],
-                                None,
-                            )
-                            .await;
-                    }
-                    return;
-                }
-            };
-            workspace.store_unit_uri(task_root.clone(), Arc::new(output.data));
-            let protected: HashSet<PathBuf> =
-                doc_context.read().unwrap().values().cloned().collect();
-            workspace.prune(MAX_CONTEXTS, &protected);
-            let per_file = output.per_file;
-            let root_canonical = std::fs::canonicalize(&publish_root)
-                .unwrap_or_else(|_| publish_root.clone());
-            let mut open_docs: Vec<(Url, i32)> = {
-                let docs = documents.read().unwrap();
-                docs.iter().map(|(uri, doc)| (uri.clone(), doc.version)).collect()
-            };
-            let active = last_active.read().unwrap().clone();
-            if let Some(active) = active {
-                open_docs.sort_by_key(|(uri, _)| uri != &active);
-            }
-            for (uri, version) in open_docs {
-                let in_context = {
-                    let contexts = doc_context.read().unwrap();
-                    contexts
-                        .get(&uri)
-                        .map(|context| {
-                            std::fs::canonicalize(context).unwrap_or_else(|_| context.clone())
-                                == root_canonical
-                        })
-                        .unwrap_or(false)
-                };
-                if !in_context {
-                    continue;
-                }
-                let structural = uri
-                    .to_file_path()
-                    .ok()
-                    .map(|path| {
-                        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-                        per_file
-                            .get(&canonical)
-                            .or_else(|| per_file.get(&canonical))
-                            .cloned()
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-                let mut merged = file_diags
-                    .read()
-                    .unwrap()
-                    .get(&uri)
-                    .cloned()
-                    .unwrap_or_default();
-                merge_extra(&mut merged, structural.clone());
-                tu_file_diags
-                    .write()
-                    .unwrap()
-                    .insert(uri.clone(), structural);
-                client.publish_diagnostics(uri, merged, Some(version)).await;
-            }
-        });
-    }
 }
 
-/// Append diagnostics the per-file pass could not see (cross-file duplicates,
-/// preprocessor errors), skipping ones already reported at the same position.
-fn merge_extra(base: &mut Vec<Diagnostic>, extra: Vec<Diagnostic>) {
-    for diag in extra {
-        let known = base.iter().any(|existing| {
-            existing.range.start == diag.range.start && existing.message == diag.message
-        });
-        if !known {
-            base.push(diag);
+/// Re-check a translation unit off the main loop. Coalesced: typing only
+/// triggers one run once the edits settle.
+fn schedule_tu(shared: &Arc<Inner>, root_uri: Url, root_path: PathBuf) {
+    debug!(root = %root_uri, "tu scheduled");
+    let this = Arc::clone(shared);
+    let generation = {
+        let mut pending = this.tu_pending.write().unwrap();
+        let slot = pending.entry(root_uri.clone()).or_insert(0);
+        *slot += 1;
+        *slot
+    };
+    let include_dirs = shared.include_dirs();
+    let task_root = root_uri.clone();
+    let publish_root = root_path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if this.tu_pending.read().unwrap().get(&task_root) != Some(&generation) {
+            return;
         }
+        let started = std::time::Instant::now();
+        let root_path_task = root_path.clone();
+        let blocking = Arc::clone(&this);
+        let tu_result = tokio::task::spawn_blocking(move || {
+            // clangd's VFS equivalent: every open buffer overrides the
+            // on-disk file inside the preprocessor run
+            let overlays: BTreeMap<PathBuf, String> = {
+                let docs = blocking.documents.read().unwrap();
+                docs.iter()
+                    .filter_map(|(uri, doc)| {
+                        let path = uri.to_file_path().ok()?;
+                        let path = std::fs::canonicalize(&path).unwrap_or(path);
+                        Some((path, doc.text.clone()))
+                    })
+                    .collect()
+            };
+            let result = unit::preprocess(&unit::TuInput {
+                root: &root_path_task,
+                include_dirs: &include_dirs,
+                overlays: &overlays,
+            });
+            let previous = blocking.workspace.take_snapshot(&root_path);
+            let mut doc = match previous {
+                Some((doc, _files)) => doc,
+                None => Document::open(&result.text, 0),
+            };
+            doc.update_text(&result.text);
+            let output = unit::tu_output(&result, &doc);
+            blocking.workspace.put_snapshot(root_path.clone(), doc, result.files.clone());
+            output
+        })
+        .await;
+        debug!(
+            root = %task_root,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            files = tu_result.as_ref().map(|out| out.per_file.len()).unwrap_or(0),
+            "translation unit checked"
+        );
+        let output = match tu_result {
+            Ok(output) => output,
+            Err(error) => {
+                // a panic or cancellation inside the analysis must reach
+                // the user, never disappear
+                warn!(root = %task_root, %error, "translation unit check failed");
+                this.client
+                    .publish_diagnostics(
+                        task_root,
+                        vec![Diagnostic {
+                            range: Range::default(),
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("dtsls".to_string()),
+                            message: format!(
+                                "internal: translation unit analysis failed ({error}); \
+                                 diagnostics for this file are incomplete"
+                            ),
+                            ..Default::default()
+                        }],
+                        None,
+                    )
+                    .await;
+                return;
+            }
+        };
+        this.workspace.store_unit(publish_root.clone(), Arc::new(output.data));
+        let protected: HashSet<PathBuf> = this
+            .doc_context
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        this.workspace.prune(&protected);
+        let per_file = output.per_file;
+        let root_canonical = std::fs::canonicalize(&publish_root)
+            .unwrap_or_else(|_| publish_root.clone());
+        let mut open_docs: Vec<(Url, i32)> = {
+            let docs = this.documents.read().unwrap();
+            docs.iter().map(|(uri, doc)| (uri.clone(), doc.version)).collect()
+        };
+        if let Some(active) = this.last_active.read().unwrap().clone() {
+            open_docs.sort_by_key(|(uri, _)| uri != &active);
+        }
+        for (uri, version) in open_docs {
+            let in_context = this
+                .doc_context
+                .read()
+                .unwrap()
+                .get(&uri)
+                .map(|context| {
+                    std::fs::canonicalize(context).unwrap_or_else(|_| context.clone())
+                        == root_canonical
+                })
+                .unwrap_or(false);
+            if !in_context {
+                continue;
+            }
+            let structural = uri
+                .to_file_path()
+                .ok()
+                .map(|path| {
+                    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+                    per_file.get(&canonical).cloned().unwrap_or_default()
+                })
+                .unwrap_or_default();
+            // The buffer tier (did_open/did_change) always publishes the
+            // buffer diagnostics immediately, so the unit tier only has to
+            // republish a file when its unit diagnostics actually changed —
+            // and a file that never had unit diagnostics needs nothing when
+            // it still has none.
+            let changed = match this.unit_diags.read().unwrap().get(&uri) {
+                Some(old) => {
+                    old.len() != structural.len()
+                        || old.iter().zip(&structural).any(|(old, new)| {
+                            old.range != new.range
+                                || old.severity != new.severity
+                                || old.message != new.message
+                        })
+                }
+                None => !structural.is_empty(),
+            };
+            if !changed {
+                continue;
+            }
+            let mut merged = this
+                .buf_diags
+                .read()
+                .unwrap()
+                .get(&uri)
+                .cloned()
+                .unwrap_or_default();
+            merged.extend(structural.iter().cloned());
+            this.unit_diags.write().unwrap().insert(uri.clone(), structural);
+            this.client.publish_diagnostics(uri, merged, Some(version)).await;
+        }
+    });
+}
+
+/// The analysis context of a file: the board when the file is a board or is
+/// inside the active board's include closure, else the file itself (a lone
+/// `.dtsi` is its own root, like dts-lsp's ad-hoc context).
+fn context_for(
+    path: &Path,
+    is_board: bool,
+    active_board: Option<&PathBuf>,
+    workspace: &Workspace,
+) -> PathBuf {
+    if is_board {
+        return path.to_path_buf();
+    }
+    match active_board {
+        Some(board) if workspace.closure_contains(board, path) => board.to_path_buf(),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -408,7 +411,7 @@ fn collect_include_links(
     if node.kind() == "preproc_include"
         && let Some(path_node) = node.child_by_field_name("path")
     {
-        let raw = util::node_text(doc, path_node);
+        let raw = model::node_text(doc, path_node);
         let (target, quoted) = match path_node.kind() {
             "preproc_string_literal" => (raw.trim_matches('"'), true),
             "system_lib_string" => (raw.trim_matches(|c| c == '<' || c == '>'), false),
@@ -419,8 +422,8 @@ fn collect_include_links(
         {
             out.push(DocumentLink {
                 range: Range {
-                    start: util::byte_to_position(&doc.rope, path_node.start_byte()),
-                    end: util::byte_to_position(&doc.rope, path_node.end_byte()),
+                    start: model::byte_to_position(doc, path_node.start_byte()),
+                    end: model::byte_to_position(doc, path_node.end_byte()),
                 },
                 target: Some(url),
                 tooltip: Some(resolved.display().to_string()),
@@ -433,11 +436,6 @@ fn collect_include_links(
             collect_include_links(doc, child, file_dir, include_dirs, out);
         }
     }
-}
-
-struct TuOutput {
-    per_file: HashMap<PathBuf, Vec<Diagnostic>>,
-    data: TuData,
 }
 
 /// Publish an internal failure to every open document. A parser crash must be
@@ -465,302 +463,138 @@ async fn report_internal(
     }
 }
 
-fn tu_output(unit: &crate::tu::TuResult, doc: &Document) -> TuOutput {
-    let data = tu_data(unit, doc);
-    let mut per_file = group_diagnostics(unit, doc);
-    let report = crate::phandle_cells::check_document(doc);
-    // phandle and interrupt checks resolve labels from the unit's own text
-    for problem in report.diagnostics {
-        push_problem(unit, doc, &mut per_file, problem);
+    impl Inner {
+    /// Publish the union of the buffer-tier and unit-tier diagnostics. The
+    /// two tiers are disjoint by design, so plain concatenation is exact.
+    async fn publish(&self, uri: &Url, version: Option<i32>) {
+        let mut diags = self
+            .buf_diags
+            .read()
+            .unwrap()
+            .get(uri)
+            .cloned()
+            .unwrap_or_default();
+        diags.extend(
+            self.unit_diags
+                .read()
+                .unwrap()
+                .get(uri)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        self.client.publish_diagnostics(uri.clone(), diags, version).await;
     }
-
-    // `&label { }` blocks that extend nodes outside this unit: one diagnostic
-    // per file, listing what could not be resolved
-    let mut unresolved: HashMap<PathBuf, (Vec<String>, u32, u32)> = HashMap::new();
-    for (start, end, label) in report.unresolved_fragments {
-        let line = util::byte_to_position(&doc.rope, start as usize).line;
-        let Some((_, path)) = unit.locate(line) else {
-            continue;
-        };
-        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let entry = unresolved.entry(path).or_insert_with(|| (Vec::new(), start, end));
-        entry.0.push(label);
-    }
-    for (_path, (labels, start, end)) in unresolved {
-        let mut names = labels;
-        names.sort();
-        names.dedup();
-        let shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
-        let more = names.len().saturating_sub(5);
-        let problem = crate::phandle_cells::Problem {
-            start,
-            end,
-            error: true,
-            message: format!(
-                "{} override block(s) extend nodes that are not defined in this file's \
-                 translation unit ({shown}{}); the board file that includes this one must \
-                 provide them, so their contents are not checked",
-                names.len(),
-                if more > 0 { format!(", and {more} more") } else { String::new() }
-            ),
-        };
-        push_problem(unit, doc, &mut per_file, problem);
-    }
-
-    TuOutput { per_file, data }
 }
 
-/// Map a byte-span problem back to the file it came from and publish it there.
-fn push_problem(
-    unit: &crate::tu::TuResult,
-    doc: &Document,
-    per_file: &mut HashMap<PathBuf, Vec<Diagnostic>>,
-    problem: crate::phandle_cells::Problem,
-) {
-    let (start, end) = (problem.start as usize, problem.end as usize);
-    let line = util::byte_to_position(&doc.rope, start).line;
-    let Some((source, path)) = unit.locate(line) else {
-        // the source map is missing this line: a preprocessor bug, never
-        // silently drop the diagnostic
-        let fallback = unit
-            .files
-            .first()
-            .map(|file| std::fs::canonicalize(file).unwrap_or_else(|_| file.clone()))
-            .unwrap_or_default();
-        per_file.entry(fallback).or_default().push(Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("dtsls".to_string()),
-            message: format!(
-                "internal: cannot map a diagnostic at line {} back to a source file: {}",
-                line + 1,
-                problem.message
-            ),
-            ..Default::default()
-        });
-        return;
-    };
-    let end_position = util::byte_to_position(&doc.rope, end);
-    let end_position = if unit
-        .locate(end_position.line)
-        .map(|(source, _)| source.file)
-        == Some(source.file)
-    {
-        end_position
-    } else {
-        Position {
-            line: source.line,
-            character: util::byte_to_position(&doc.rope, start).character + 1,
+/// Everything the background scan needs: bindings dir (when found), include
+/// dirs, the roots to scan and the feature notices computed at initialize.
+struct ScanJob {
+    bindings_dir: Option<PathBuf>,
+    include_dirs: Vec<PathBuf>,
+    scan_roots: Vec<PathBuf>,
+    issues: Vec<FeatureIssue>,
+}
+
+/// Scan bindings, refresh every open document, then build the workspace
+/// include graph — in that order, so the refresh is not competing for CPU.
+fn spawn_scan(shared: &Arc<Inner>, job: ScanJob) {
+    let this = Arc::clone(shared);
+    tokio::spawn(async move {
+        let ScanJob {
+            bindings_dir,
+            include_dirs,
+            scan_roots,
+            issues,
+        } = job;
+        if let Some(dir) = bindings_dir {
+            if let Err(error) = tokio::task::spawn_blocking({
+                let bindings = Arc::clone(&this.bindings);
+                move || bindings::scan(&bindings, &dir)
+            })
+            .await
+            {
+                // a panicking scan leaves every binding check unreliable:
+                // say so instead of silently serving stale results
+                error!(%error, "binding scan failed");
+                report_internal(
+                    &this.client,
+                    &this.documents,
+                    format!(
+                        "internal: the binding scan failed ({error}); binding validation \
+                         is disabled for this session"
+                    ),
+                )
+                .await;
+            }
+            // the active document first: it is what the editor shows
+            let entries: Vec<(Url, i32)> = {
+                let docs = this.documents.read().unwrap();
+                docs.iter().map(|(uri, doc)| (uri.clone(), doc.version)).collect()
+            };
+            let active = this.last_active.read().unwrap().clone();
+            let mut ordered = entries;
+            if let Some(active) = active {
+                ordered.sort_by_key(|(uri, _)| *uri != active);
+            }
+            let compute_started = std::time::Instant::now();
+            let mut docs = 0usize;
+            let mut diagnostics = 0usize;
+            let publish_started = std::time::Instant::now();
+            for (uri, version) in ordered {
+                let diags = {
+                    let docs = this.documents.read().unwrap();
+                    match docs.get(&uri) {
+                        Some(doc) => diagnostics::buffer(
+                            doc,
+                            uri.to_file_path().ok().as_deref(),
+                            &include_dirs,
+                            &this.bindings,
+                            &issues,
+                            &this.diag_cache,
+                            this.workspace
+                                .unit(&uri.to_file_path().unwrap_or_default())
+                                .is_none(),
+                        ),
+                        None => Vec::new(),
+                    }
+                };
+                this.buf_diags.write().unwrap().insert(uri.clone(), diags);
+                let mut merged = this.buf_diags.read().unwrap().get(&uri).cloned().unwrap_or_default();
+                merged.extend(this.unit_diags.read().unwrap().get(&uri).cloned().unwrap_or_default());
+                diagnostics += merged.len();
+                docs += 1;
+                this.client.publish_diagnostics(uri, merged, Some(version)).await;
+            }
+            debug!(
+                compute_us = compute_started.elapsed().as_micros() as u64,
+                refresh_us = publish_started.elapsed().as_micros() as u64,
+                docs,
+                diagnostics,
+                "bindings ready; diagnostics refreshed"
+            );
         }
-    };
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    per_file.entry(path).or_default().push(Diagnostic {
-        range: Range {
-            start: Position {
-                line: source.line,
-                character: util::byte_to_position(&doc.rope, start).character,
-            },
-            end: end_position,
-        },
-        severity: Some(if problem.error {
-            DiagnosticSeverity::ERROR
-        } else {
-            DiagnosticSeverity::WARNING
-        }),
-        source: Some("dtsls".to_string()),
-        message: problem.message,
-        ..Default::default()
+        if let Err(error) = tokio::task::spawn_blocking({
+            let workspace = Arc::clone(&this.workspace);
+            move || workspace.scan(&scan_roots, &scan_roots)
+        })
+        .await
+        {
+            error!(%error, "workspace scan failed");
+            report_internal(
+                &this.client,
+                &this.documents,
+                format!(
+                    "internal: the workspace scan failed ({error}); label and ref \
+                     navigation is incomplete"
+                ),
+            )
+            .await;
+        }
     });
 }
 
-fn tu_data(unit: &crate::tu::TuResult, doc: &Document) -> workspace::TuData {
-    let mut data = workspace::TuData {
-        labels: HashMap::new(),
-        refs: Vec::new(),
-        defines: HashMap::new(),
-        cells: Vec::new(),
-        provider_cells: HashMap::new(),
-    };
-    for define in &unit.defines {
-        let file = define
-            .file
-            .and_then(|index| unit.files.get(index as usize))
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        data.defines
-            .entry(define.name.clone())
-            .or_insert((define.value.clone(), file));
-    }
-    let mut cursor = doc.tree.root_node().walk();
-    collect_unit_names(unit, doc, &mut cursor, &mut data);
-    data
-}
-
-fn collect_unit_names(
-    unit: &crate::tu::TuResult,
-    doc: &Document,
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-    data: &mut TuData,
-) {
-    loop {
-        let node = cursor.node();
-        match node.kind() {
-            "label" => {
-                let text = util::node_text(doc, node);
-                let name = text.trim_end_matches(':');
-                if !name.is_empty()
-                    && let Some((file, range)) = unit_range(unit, doc, node, name.len())
-                {
-                    let path = crate::analysis::node_path(doc, node);
-                    data.labels.entry(name.to_string()).or_insert(workspace::TuLabel {
-                        path,
-                        file,
-                        range,
-                    });
-                }
-            }
-            "label_ref" => {
-                let text = util::node_text(doc, node);
-                let name = text.trim_start_matches('&');
-                if !name.is_empty()
-                    && let Some((file, range)) = unit_range(unit, doc, node, text.len())
-                {
-                    data.refs.push(workspace::TuRef {
-                        label: name.to_string(),
-                        file,
-                        range,
-                    });
-                }
-            }
-            "property" => {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = util::node_text(doc, name_node);
-                    if name.starts_with('#') && name.ends_with("-cells") {
-                        let path = crate::analysis::node_path(doc, node);
-                        if let Some(value) = crate::phandle_cells::property_u32(doc, node) {
-                            data.cells.push(workspace::CellsProp {
-                                path: path.clone(),
-                                name: name.to_string(),
-                                value,
-                            });
-                            data.provider_cells
-                                .entry(path)
-                                .or_default()
-                                .insert(name.to_string(), value);
-                        }
-                    }
-                }
-                // `&label` references live inside property values, so keep
-                // descending (a property cannot contain another property)
-            }
-            _ => {}
-        }
-        if cursor.goto_first_child() {
-            collect_unit_names(unit, doc, cursor, data);
-            cursor.goto_parent();
-        }
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-fn unit_range(
-    unit: &crate::tu::TuResult,
-    doc: &Document,
-    node: tree_sitter::Node,
-    length: usize,
-) -> Option<(PathBuf, Range)> {
-    let position = util::byte_to_position(&doc.rope, node.start_byte());
-    let (source, path) = unit.locate(position.line)?;
-    Some((
-        path.to_path_buf(),
-        Range {
-            start: Position {
-                line: source.line,
-                character: position.character,
-            },
-            end: Position {
-                line: source.line,
-                character: position.character + length as u32,
-            },
-        },
-    ))
-}
-
-/// Diagnostics produced for a preprocessed unit, grouped by the file they
-/// belong to (positions mapped back through the preprocessor line markers).
-fn group_diagnostics(
-    unit: &crate::tu::TuResult,
-    doc: &Document,
-) -> HashMap<PathBuf, Vec<Diagnostic>> {
-    let mut out: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
-    for diag in diagnostics::structural(&doc) {
-        let Some((source, path)) = unit.locate(diag.range.start.line) else {
-            continue;
-        };
-        let end = unit
-            .locate(diag.range.end.line)
-            .map(|(source, _)| source)
-            .unwrap_or(source);
-        let start = Position {
-            line: source.line,
-            character: diag.range.start.character,
-        };
-        let end = if end.file == source.file && end.line >= source.line {
-            Position {
-                line: end.line,
-                character: diag.range.end.character,
-            }
-        } else {
-            Position {
-                line: start.line,
-                character: start.character + 1,
-            }
-        };
-        out.entry(path.to_path_buf())
-            .or_default()
-            .push(Diagnostic {
-                range: Range { start, end },
-                severity: diag.severity,
-                source: diag.source,
-                message: diag.message,
-                ..Default::default()
-            });
-    }
-    for error in &unit.errors {
-        // an error without a file must still be shown, not dropped
-        let path = error
-            .file
-            .and_then(|file| unit.files.get(file as usize).cloned())
-            .or_else(|| unit.files.first().cloned());
-        let Some(path) = path else {
-            continue;
-        };
-        out.entry(path).or_default().push(Diagnostic {
-            range: Range {
-                start: Position {
-                    line: error.line,
-                    character: error.column,
-                },
-                end: Position {
-                    line: error.line,
-                    character: error.column + 1,
-                },
-            },
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("dtsls".to_string()),
-            message: format!("preprocessor: {}", error.message),
-            ..Default::default()
-        });
-    }
-    out
-}
-
-#[tower_lsp::async_trait]
-impl LanguageServer for Backend {
-    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+impl Inner {
+    fn initialize(&self, params: InitializeParams) -> (InitializeResult, Option<ScanJob>) {
         info!(root = ?params.root_uri, client = ?params.client_info, "initialize");
         let mut roots = Vec::new();
         if let Some(root) = params.root_uri.as_ref().and_then(|u| u.to_file_path().ok()) {
@@ -853,178 +687,15 @@ impl LanguageServer for Backend {
         }
         *self.status.write().unwrap() = issues.clone();
         *self.root_dirs.write().unwrap() = roots;
-        if let Some(dir) = scan_dir {
-            // Scan bindings, then refresh every open document: during the scan
-            // binding checks are disabled, so the first diagnostics would
-            // otherwise keep stale (or missing) binding results until an edit.
-            let bindings = Arc::clone(&self.bindings);
-            let documents = Arc::clone(&self.documents);
-            let include_dirs = self.include_dirs();
-            let client = self.client.clone();
-            let diag_cache = Arc::clone(&self.diag_cache);
-            let file_diags = Arc::clone(&self.file_diags);
-            let tu_file_diags = Arc::clone(&self.tu_file_diags);
-            let last_active = Arc::clone(&self.last_active);
-            let workspace = Arc::clone(&self.workspace);
-            let scan_roots = self.root_dirs.read().unwrap().clone();
-            tokio::spawn(async move {
-                let scan_started = std::time::Instant::now();
-                let scan_bindings = Arc::clone(&bindings);
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    bindings::scan(&scan_bindings, &dir);
-                })
-                .await
-                {
-                    // a panicking scan leaves every binding check unreliable:
-                    // say so instead of silently serving stale results
-                    error!(%error, "binding scan failed");
-                    report_internal(&client, &documents, format!(
-                        "internal: the binding scan failed ({error}); binding validation \
-                         is disabled for this session"
-                    ))
-                    .await;
-                }
-                let scan_us = scan_started.elapsed().as_micros() as u64;
-                let entries: Vec<(Url, i32)> = {
-                    let docs = documents.read().unwrap();
-                    docs.iter().map(|(uri, doc)| (uri.clone(), doc.version)).collect()
-                };
-                let active = last_active.read().unwrap().clone();
-                let publish_started = std::time::Instant::now();
-                let mut docs = 0usize;
-                let mut diagnostics = 0usize;
-                let mut active_us = 0u64;
-
-                // the active document first: it is what the editor shows
-                let mut rest = entries;
-                if let Some(active) = active.clone()
-                    && let Some(position) = rest.iter().position(|(uri, _)| *uri == active)
-                {
-                    let (uri, version) = rest.remove(position);
-                    let active_started = std::time::Instant::now();
-                    let diags = {
-                        let docs = documents.read().unwrap();
-                        match docs.get(&uri) {
-                            Some(doc) => diagnostics::all_cached(
-                                doc,
-                                uri.to_file_path().ok().as_deref(),
-                                &include_dirs,
-                                &bindings,
-                                &issues,
-                                &diag_cache,
-                            ),
-                            None => Vec::new(),
-                        }
-                    };
-                    active_us = active_started.elapsed().as_micros() as u64;
-                    file_diags.write().unwrap().insert(uri.clone(), diags.clone());
-                    let mut merged = diags;
-                    let structural = tu_file_diags
-                        .read()
-                        .unwrap()
-                        .get(&uri)
-                        .cloned()
-                        .unwrap_or_default();
-                    merge_extra(&mut merged, structural);
-                    diagnostics += merged.len();
-                    docs += 1;
-                    client
-                        .publish_diagnostics(uri, merged, Some(version))
-                        .await;
-                }
-
-                let compute_started = std::time::Instant::now();
-                let computed: Vec<(Url, i32, Vec<Diagnostic>)> = {
-                    let docs_guard = documents.read().unwrap();
-                    let entries: Vec<(&Url, i32, &Document)> = rest
-                        .iter()
-                        .filter_map(|(uri, version)| {
-                            docs_guard.get(uri).map(|doc| (uri, *version, doc))
-                        })
-                        .collect();
-                    let workers = std::thread::available_parallelism()
-                        .map(|count| count.get())
-                        .unwrap_or(4)
-                        .min(entries.len().max(1));
-                    let chunk = entries.len().div_ceil(workers).max(1);
-                    std::thread::scope(|scope| {
-                        let handles: Vec<_> = entries
-                            .chunks(chunk)
-                            .map(|slice| {
-                                scope.spawn(|| {
-                                    slice
-                                        .iter()
-                                        .map(|(uri, version, doc)| {
-                                            let diags = diagnostics::all_cached(
-                                                doc,
-                                                uri.to_file_path().ok().as_deref(),
-                                                &include_dirs,
-                                                &bindings,
-                                                &issues,
-                                                &diag_cache,
-                                            );
-                                            ((*uri).clone(), *version, diags)
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            .flat_map(|handle| handle.join().expect("diagnostics worker"))
-                            .collect()
-                    })
-                };
-                let compute_us = compute_started.elapsed().as_micros() as u64;
-                for (uri, version, diags) in computed {
-                    file_diags
-                        .write()
-                        .unwrap()
-                        .insert(uri.clone(), diags.clone());
-                    let mut merged = diags;
-                    let structural = tu_file_diags
-                        .read()
-                        .unwrap()
-                        .get(&uri)
-                        .cloned()
-                        .unwrap_or_default();
-                    merge_extra(&mut merged, structural);
-                    diagnostics += merged.len();
-                    docs += 1;
-                    client
-                        .publish_diagnostics(uri, merged, Some(version))
-                        .await;
-                }
-                debug!(
-                    scan_us,
-                    active_us,
-                    compute_us,
-                    refresh_us = publish_started.elapsed().as_micros() as u64,
-                    docs,
-                    diagnostics,
-                    "bindings ready; diagnostics refreshed"
-                );
-                // workspace scan after the refresh: running both at once just
-                // makes the first post-scan diagnostics slower
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    workspace.scan(&scan_roots, &scan_roots);
-                })
-                .await
-                {
-                    error!(%error, "workspace scan failed");
-                    report_internal(&client, &documents, format!(
-                        "internal: the workspace scan failed ({error}); label and ref \
-                         navigation is incomplete"
-                    ))
-                    .await;
-                }
-            });
-        } else {
-            // no binding scan: go straight to the workspace scan
-            let workspace = Arc::clone(&self.workspace);
-            let scan_roots = self.root_dirs.read().unwrap().clone();
-            tokio::task::spawn_blocking(move || workspace.scan(&scan_roots, &scan_roots));
-        }
+        // capture include dirs AFTER root_dirs is populated: the scan refresh
+        // republishes every open document with these, and an empty list would
+        // flag every `<dt-bindings/...>` include as unresolved
+        let job = Some(ScanJob {
+            bindings_dir: scan_dir,
+            include_dirs: self.include_dirs(),
+            scan_roots: self.root_dirs.read().unwrap().clone(),
+            issues: issues.clone(),
+        });
         let capabilities = ServerCapabilities {
             position_encoding: Some(PositionEncodingKind::UTF16),
             text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -1061,13 +732,13 @@ impl LanguageServer for Backend {
             )),
             ..Default::default()
         };
-        Ok(InitializeResult {
+        (InitializeResult {
             capabilities,
             server_info: Some(ServerInfo {
                 name: "dtsls".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
-        })
+        }, job)
     }
 
     async fn initialized(&self, _: InitializedParams) {
@@ -1086,7 +757,7 @@ impl LanguageServer for Backend {
         Ok(())
     }
 
-    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+    async fn did_open(&self, params: DidOpenTextDocumentParams) -> Vec<(Url, PathBuf)> {
         let td = params.text_document;
         info!(uri = %td.uri, version = td.version, bytes = td.text.len(), "did_open");
         *self.last_active.write().unwrap() = Some(td.uri.clone());
@@ -1136,34 +807,31 @@ impl LanguageServer for Backend {
             docs.insert(td.uri.clone(), Document::open(&td.text, td.version));
             match docs.get(&td.uri) {
                 Some(doc) => (
-                    diagnostics::all_cached(
+                    diagnostics::buffer(
                         doc,
                         td.uri.to_file_path().ok().as_deref(),
                         &self.include_dirs(),
                         &self.bindings,
                         &self.status.read().unwrap(),
                         &self.diag_cache,
+                        self.unit_for(&td.uri).is_none(),
                     ),
                     doc.version,
                 ),
-                None => return,
+                None => return Vec::new(),
             }
         };
-        self.file_diags
+        self.buf_diags
             .write()
             .unwrap()
-            .insert(td.uri.clone(), diags.clone());
-        self.client
-            .publish_diagnostics(td.uri.clone(), diags, Some(version))
-            .await;
-        for (root_uri, root_path) in tu_roots {
-            self.schedule_tu(root_uri, root_path);
-        }
+            .insert(td.uri.clone(), diags);
+        self.publish(&td.uri, Some(version)).await;
         let protected = self.protected_contexts();
-        self.workspace.prune(MAX_CONTEXTS, &protected);
+        self.workspace.prune(&protected);
+        tu_roots
     }
 
-    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+    async fn did_change(&self, params: DidChangeTextDocumentParams) -> Vec<(Url, PathBuf)> {
         let started = std::time::Instant::now();
         let uri = params.text_document.uri;
         *self.last_active.write().unwrap() = Some(uri.clone());
@@ -1174,13 +842,14 @@ impl LanguageServer for Backend {
                 Some(doc) => {
                     doc.apply_changes(&params.content_changes, params.text_document.version);
                     let parse_done = started.elapsed();
-                    let diags = diagnostics::all_cached(
+                    let diags = diagnostics::buffer(
                         doc,
                         uri.to_file_path().ok().as_deref(),
                         &self.include_dirs(),
                         &self.bindings,
                         &self.status.read().unwrap(),
                         &self.diag_cache,
+                        self.unit_for(&uri).is_none(),
                     );
                     debug!(
                         parse_us = parse_done.as_micros() as u64,
@@ -1191,21 +860,14 @@ impl LanguageServer for Backend {
                 }
                 None => {
                     warn!(uri = %uri, "did_change for unknown document");
-                    return;
+                    return Vec::new();
                 }
             }
         };
-        self.file_diags
-            .write()
-            .unwrap()
-            .insert(uri.clone(), diags.clone());
-        self.client
-            .publish_diagnostics(uri.clone(), diags, Some(version))
-            .await;
-        for (root_uri, root_path) in tu_roots {
-            self.schedule_tu(root_uri, root_path);
-        }
+        self.buf_diags.write().unwrap().insert(uri.clone(), diags);
+        self.publish(&uri, Some(version)).await;
         debug!(total_us = started.elapsed().as_micros() as u64, "did_change done");
+        tu_roots
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -1217,7 +879,8 @@ impl LanguageServer for Backend {
         {
             *self.active_board.write().unwrap() = None;
         }
-        self.file_diags.write().unwrap().remove(&uri);
+        self.buf_diags.write().unwrap().remove(&uri);
+        self.unit_diags.write().unwrap().remove(&uri);
         self.same_file_labels.write().unwrap().remove(&uri);
         self.prune_contexts();
         // The index entry is intentionally kept (stale until the next scan):
@@ -1237,7 +900,7 @@ impl LanguageServer for Backend {
                 return Ok(None);
             };
             let Some(context) =
-                completion::completion_context(doc, util::position_to_byte(&doc.rope, position))
+                completion::completion_context(doc, model::position_to_byte(doc, position))
             else {
                 return Ok(None);
             };
@@ -1253,32 +916,33 @@ impl LanguageServer for Backend {
                     }
                 }
                 completion::Context::Properties(prefix) => {
-                    let byte = util::position_to_byte(&doc.rope, position);
-                    property_completion(doc, byte, &prefix, &self.bindings)
+                    let byte = model::position_to_byte(doc, position);
+                    completion::property_completion(doc, byte, &prefix, &self.bindings)
                 }
                 completion::Context::Compatible { prefix, vendor } => {
-                    let byte = util::position_to_byte(&doc.rope, position);
+                    let byte = model::position_to_byte(doc, position);
                     // replace everything typed inside the quotes so far; if the
                     // cursor sits mid-string, replace up to the closing quote
-                    let line_start =
-                        doc.rope.line_to_byte(doc.rope.byte_to_line(byte));
+                    let line_start = model::line_start_of(&doc.text, byte);
                     let head = doc.slice(line_start..byte);
                     let quote_start = head
                         .rfind('"')
                         .map(|offset| line_start + offset + 1)
                         .unwrap_or(byte);
                     let line_end = doc
-                        .rope
-                        .line_to_byte(doc.rope.byte_to_line(byte) + 1)
-                        .min(doc.rope.len_bytes());
+                        .line_starts
+                        .iter()
+                        .find(|&&start| start > byte)
+                        .copied()
+                        .unwrap_or(doc.text.len());
                     let tail = doc.slice(byte..line_end);
                     let end = tail
                         .find('"')
                         .map(|offset| byte + offset)
                         .unwrap_or(byte);
                     let range = Range {
-                        start: util::byte_to_position(&doc.rope, quote_start),
-                        end: util::byte_to_position(&doc.rope, end),
+                        start: model::byte_to_position(doc, quote_start),
+                        end: model::byte_to_position(doc, end),
                     };
                     match vendor {
                         None => {
@@ -1351,7 +1015,7 @@ impl LanguageServer for Backend {
             let Some(doc) = docs.get(&uri) else {
                 return Ok(None);
             };
-            completion::label_at_cursor(doc, util::position_to_byte(&doc.rope, position))
+            completion::label_at_cursor(doc, model::position_to_byte(doc, position))
         };
         let Some(label) = label else {
             return Ok(None);
@@ -1470,7 +1134,7 @@ impl LanguageServer for Backend {
     }
 }
 
-impl Backend {
+impl Inner {
     fn definition(&self, params: GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
@@ -1481,7 +1145,7 @@ impl Backend {
     fn location(&self, uri: &Url, position: Position) -> Option<Location> {
         let docs = self.documents.read().unwrap();
         let doc = docs.get(uri)?;
-        let byte = util::position_to_byte(&doc.rope, position);
+        let byte = model::position_to_byte(doc, position);
         if let Some(label) = completion::label_at_cursor(doc, byte) {
             if let Some(data) = self.unit_for(&uri)
                 && let Some(def) = data.labels.get(&label)
@@ -1502,7 +1166,7 @@ impl Backend {
         // half-written node may not have a usable tree, so fall back to the
         // text reader (same one property completion uses).
         let compatibles = completion::enclosing_node(doc, byte)
-            .and_then(|subnode| node_compatibles(doc, subnode))
+            .and_then(|subnode| diagnostics::compatible_strings(doc, subnode))
             .filter(|list| !list.is_empty())
             .or_else(|| {
                 completion::text_node(doc, byte)
@@ -1552,355 +1216,84 @@ impl Backend {
 }
 
 
-fn node_compatibles(doc: &Document, node: tree_sitter::Node) -> Option<Vec<String>> {
-    diagnostics::compatible_strings(doc, node)
-}
+#[tower_lsp::async_trait]
+impl LanguageServer for Backend {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let (result, job) = self.0.initialize(params);
+        if let Some(job) = job {
+            spawn_scan(&Arc::clone(&self.0), job);
+        }
+        Ok(result)
+    }
 
-/// What the node around `byte` looks like for completion: its binding, the
-/// property names it already has, and whether it can still take a
-/// `compatible`. The syntax tree is preferred; a half-written node makes
-/// tree-sitter collapse the region into a single ERROR node, so the raw text
-/// is used as a fallback.
-struct NodeView {
-    binding: Option<Arc<crate::bindings::Binding>>,
-    existing: HashSet<String>,
-    can_add_compatible: bool,
-}
+    async fn initialized(&self, params: InitializedParams) {
+        self.0.initialized(params).await;
+    }
 
-fn node_view(doc: &Document, byte: usize, bindings: &BindingIndex) -> NodeView {
-    let mut existing = HashSet::new();
-    let mut compatibles = None;
-    let mut endpoint = None;
-    // A node starting on the cursor's own line is not the one being typed
-    // inside: error recovery glues the partial line onto the *following*
-    // node, so its compatible would win. Only nodes whose header is above the
-    // cursor are trusted; the text reader handles the rest.
-    let line_start = doc
-        .rope
-        .line_to_byte(doc.rope.byte_to_line(byte.min(doc.rope.len_bytes())));
-    if let Some(node) = completion::enclosing_node(doc, byte)
-        && node.start_byte() < line_start
-    {
-        compatibles = node_compatibles(doc, node);
-        endpoint = Some(completion::is_endpoint_or_port(doc, node));
-        if let Some(body) = util::node_def_of(node) {
-            for i in 0..body.child_count() {
-                let Some(child) = body.child(i as u32) else { continue };
-                if child.kind() == "property"
-                    && let Some(name) = child.child_by_field_name("name")
-                {
-                    existing.insert(util::node_text(doc, name).to_string());
-                } else if child.kind() == "subnode"
-                    && let Some(name) = child.child_by_field_name("name")
-                {
-                    // child nodes (`ports`, `mdio`, ...) are declared under
-                    // `properties:` too, so they count as already present
-                    let name = util::node_text(doc, name);
-                    existing.insert(name.split('@').next().unwrap_or(name).to_string());
-                }
-            }
+    async fn shutdown(&self) -> Result<()> {
+        self.0.shutdown().await
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let roots = self.0.did_open(params).await;
+        for (root_uri, root_path) in roots {
+            schedule_tu(&Arc::clone(&self.0), root_uri, root_path);
         }
     }
-    if compatibles.is_none() {
-        // incomplete node: read compatible/properties from the text
-        if let Some(text_node) = completion::text_node(doc, byte) {
-            endpoint.get_or_insert_with(|| text_node.is_endpoint_or_port());
-            existing.extend(text_node.properties);
-            if !text_node.compatibles.is_empty() {
-                compatibles = Some(text_node.compatibles);
-            }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let roots = self.0.did_change(params).await;
+        for (root_uri, root_path) in roots {
+            schedule_tu(&Arc::clone(&self.0), root_uri, root_path);
         }
     }
-    let endpoint = endpoint.unwrap_or_else(|| completion::in_endpoint_or_port(doc, byte));
-    let binding = compatibles.as_ref().and_then(|list| bindings.lookup(list));
-    let can_add_compatible =
-        !endpoint && compatibles.is_none() && !existing.contains("compatible");
-    NodeView {
-        binding,
-        existing,
-        can_add_compatible,
-    }
-}
 
-/// Binding-based property completion for the node enclosing `byte`, plus the
-/// `compatible` snippet when the node can still take one.
-fn property_completion(
-    doc: &Document,
-    byte: usize,
-    prefix: &str,
-    bindings: &BindingIndex,
-) -> Vec<CompletionItem> {
-    let view = node_view(doc, byte, bindings);
-    let mut items = view
-        .binding
-        .as_ref()
-        .map(|binding| completion::items_from_binding(binding, &view.existing, prefix))
-        .unwrap_or_default();
-    if view.can_add_compatible
-        && let Some(item) = completion::compatible_property_item(prefix)
-    {
-        items.push(item);
-    }
-    items
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::bindings::Binding;
-
-    fn widget_bindings() -> BindingIndex {
-        let bindings = BindingIndex::default();
-        bindings.insert_for_test(Binding {
-            uri: Url::parse("file:///mmc.yaml").unwrap(),
-            singles: vec!["acme,mmc".to_string()],
-            compounds: Vec::new(),
-            properties: ["compatible", "reg", "clocks", "clock-names"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            required: vec!["compatible".to_string()],
-            required_any: Vec::new(),
-            strict: true,
-            refs_complete: true,
-            patterns: Vec::new(),
-        });
-        bindings
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.0.did_close(params).await;
     }
 
-    #[test]
-    fn property_items_work_in_a_half_written_node() {
-        // compatible accepted, but no `;` and no closing braces yet
-        let text = "/dts-v1/;\n\n/ {\n    mmc@8804000 {\n        compatible = \"acme,mmc\"\n        clo\n";
-        let doc = Document::open(text, 0);
-        let bindings = widget_bindings();
-        let byte = text.rfind("clo").unwrap() + 3;
-        let items = property_completion(&doc, byte, "clo", &bindings);
-        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, vec!["clock-names", "clocks"], "items: {labels:?}");
-        // the node already has a compatible, so no snippet is offered
-        assert!(!labels.contains(&"compatible"));
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        self.0.completion(params).await
     }
 
-    #[test]
-    fn property_completion_offers_compatible_for_a_fresh_node() {
-        let text = "/dts-v1/;\n\n/ {\n    node@1000 {\n        comp\n";
-        let doc = Document::open(text, 0);
-        let byte = text.rfind("comp").unwrap() + 4;
-        let items = property_completion(&doc, byte, "comp", &BindingIndex::default());
-        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, vec!["compatible"]);
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.0.goto_definition(params).await
     }
 
-    #[test]
-    fn property_items_resolve_through_the_enclosing_node() {
-        let text = "/dts-v1/;\n\n/ {\n    mmc@8804000 {\n        compatible = \"acme,mmc\";\n        reg = <0x1>;\n        clo\n    };\n};\n";
-        let doc = Document::open(text, 0);
-        let bindings = BindingIndex::default();
-        bindings.insert_for_test(Binding {
-            uri: Url::parse("file:///mmc.yaml").unwrap(),
-            singles: vec!["acme,mmc".to_string()],
-            compounds: Vec::new(),
-            properties: ["compatible", "reg", "clocks", "clock-names"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            required: vec!["compatible".to_string()],
-            required_any: Vec::new(),
-            strict: true,
-            refs_complete: true,
-            patterns: Vec::new(),
-        });
-        // cursor right after "clo" on its line
-        let byte = text.find("clo").unwrap() + 3;
-        let items = property_completion(&doc, byte, "clo", &bindings);
-        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, vec!["clock-names", "clocks"], "items: {labels:?}");
+    async fn goto_declaration(
+        &self,
+        params: GotoDeclarationParams,
+    ) -> Result<Option<GotoDeclarationResponse>> {
+        self.0.goto_declaration(params).await
     }
 
-    fn nested_bindings() -> BindingIndex {
-        let bindings = BindingIndex::default();
-        let make = |single: &str, props: &[&str]| Binding {
-            uri: Url::parse(&format!("file:///{single}.yaml")).unwrap(),
-            singles: vec![single.to_string()],
-            compounds: Vec::new(),
-            properties: props.iter().map(|p| p.to_string()).collect(),
-            required: vec!["compatible".to_string()],
-            required_any: Vec::new(),
-            strict: true,
-            refs_complete: true,
-            patterns: Vec::new(),
-        };
-        bindings.insert_for_test(make("acme,parent", &["compatible", "parent-prop", "parent-extra"]));
-        bindings.insert_for_test(make("acme,child", &["compatible", "child-prop"]));
-        bindings
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        self.0.references(params).await
     }
 
-    #[test]
-    fn completion_above_a_node_uses_the_parent() {
-        // cursor on the blank line between the parent's last property and the
-        // child node header: the child's compatible must not leak in
-        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        compatible = \"acme,parent\";\n        parent-prop = <1>;\n        p\n        child@2000 {\n            compatible = \"acme,child\";\n        };\n    };\n};\n";
-        let doc = Document::open(text, 0);
-        let byte = text.find("        p\n").unwrap() + 9;
-        let items = property_completion(&doc, byte, "p", &nested_bindings());
-        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
-        // parent-prop is already written in the node, so only the other one
-        assert_eq!(labels, vec!["parent-extra"], "items: {labels:?}");
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        self.0.inlay_hint(params).await
     }
 
-    #[test]
-    fn completion_above_a_node_offers_compatible_for_the_parent() {
-        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        reg = <1>;\n        c\n        child@2000 {\n            compatible = \"acme,child\";\n        };\n    };\n};\n";
-        let doc = Document::open(text, 0);
-        let byte = text.find("        c\n").unwrap() + 9;
-        let items = property_completion(&doc, byte, "c", &nested_bindings());
-        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, vec!["compatible"], "items: {labels:?}");
+    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
+        self.0.document_link(params).await
     }
 
-    #[test]
-    fn completion_inside_a_node_still_uses_that_node() {
-        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        compatible = \"acme,parent\";\n        child@2000 {\n            compatible = \"acme,child\";\n            c\n        };\n    };\n};\n";
-        let doc = Document::open(text, 0);
-        let byte = text.find("            c\n").unwrap() + 13;
-        let items = property_completion(&doc, byte, "c", &nested_bindings());
-        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, vec!["child-prop"], "items: {labels:?}");
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        self.0.document_symbol(params).await
     }
-}
 
-#[cfg(test)]
-mod tu_bench {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn bench_tu_phases() {
-        let root = std::path::Path::new("/linux-7.2.2/arch/arm64/boot/dts/qcom/sm8650-qrd.dts");
-        let include_dirs = [
-            PathBuf::from("/linux-7.2.2/include"),
-            PathBuf::from("/linux-7.2.2/scripts/dtc/include-prefixes"),
-        ];
-        let overlays = BTreeMap::new();
-        let t = std::time::Instant::now();
-        let unit = crate::tu::preprocess(&crate::tu::TuInput {
-            root,
-            include_dirs: &include_dirs,
-            overlays: &overlays,
-        });
-        println!("preprocess: {:?} ({} bytes)", t.elapsed(), unit.text.len());
-        for round in 0..3 {
-            let t = std::time::Instant::now();
-            let _ = Document::open(&unit.text, 0);
-            println!("parse #{round}: {:?}", t.elapsed());
-        }
-        let doc = Document::open(&unit.text, 0);
-        let t = std::time::Instant::now();
-        let diags = diagnostics::structural(&doc);
-        println!("structural: {:?} ({} diags)", t.elapsed(), diags.len());
-        for diag in diags.iter().take(6) {
-            println!(
-                "  diag: {}:{} {}",
-                diag.range.start.line, diag.range.start.character, diag.message
-            );
-        }
-        let t = std::time::Instant::now();
-        let data = tu_data(&unit, &doc);
-        println!(
-            "names: {:?} ({} labels, {} refs, {} cells, {} defines)",
-            t.elapsed(),
-            data.labels.len(),
-            data.refs.len(),
-            data.cells.len(),
-            data.defines.len()
-        );
-        let t = std::time::Instant::now();
-        let grouped = group_diagnostics(&unit, &doc);
-        println!("group: {:?} ({} files)", t.elapsed(), grouped.len());
-
-        // simulate one localized edit in the preprocessed text
-        let mut edited = unit.text.clone();
-        let pivot = edited.len() / 2;
-        let pivot = (pivot..edited.len())
-            .find(|index| edited.is_char_boundary(*index))
-            .unwrap_or(edited.len());
-        edited.insert(pivot, ' ');
-        let t = std::time::Instant::now();
-        let doc = {
-            let mut doc = doc;
-            doc.update_text(&edited);
-            doc
-        };
-        println!("incremental update+parse: {:?}", t.elapsed());
-        let t = std::time::Instant::now();
-        let diags = diagnostics::structural(&doc);
-        println!("structural after edit: {:?} ({} diags)", t.elapsed(), diags.len());
-        let t = std::time::Instant::now();
-        let _ = tu_data(&unit, &doc);
-        println!("names after edit: {:?}", t.elapsed());
-    }
-}
-
-#[cfg(test)]
-mod refresh_bench {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn bench_refresh_parallel() {
-        let files = [
-            "/linux-7.2.2/arch/arm64/boot/dts/qcom/sm8650.dtsi",
-            "/linux-7.2.2/arch/arm64/boot/dts/qcom/hamoa.dtsi",
-            "/linux-7.2.2/arch/arm64/boot/dts/qcom/agatti.dtsi",
-            "/linux-7.2.2/arch/arm64/boot/dts/qcom/sm8650-qrd.dts",
-        ];
-        let docs: Vec<(Url, Document)> = files
-            .iter()
-            .map(|path| {
-                let text = std::fs::read_to_string(path).unwrap();
-                (Url::from_file_path(path).unwrap(), Document::open(&text, 0))
-            })
-            .collect();
-        let bindings = Arc::new(BindingIndex::default());
-        bindings::scan(&bindings, std::path::Path::new("/linux-7.2.2/Documentation/devicetree/bindings"));
-        let issues = Vec::new();
-
-        let run = |parallel: bool| {
-            let cache = Arc::new(diagnostics::DiagCache::default());
-            let started = std::time::Instant::now();
-            let compute = |(uri, doc): &(Url, Document)| {
-                diagnostics::all_cached(
-                    doc,
-                    uri.to_file_path().ok().as_deref(),
-                    &[],
-                    &bindings,
-                    &issues,
-                    &cache,
-                )
-            };
-            if parallel {
-                std::thread::scope(|scope| {
-                    let handles: Vec<_> = docs
-                        .iter()
-                        .map(|entry| scope.spawn(|| compute(entry)))
-                        .collect();
-                    for handle in handles {
-                        let _ = handle.join().unwrap();
-                    }
-                });
-            } else {
-                for entry in &docs {
-                    let _ = compute(entry);
-                }
-            }
-            started.elapsed()
-        };
-        // warm the page cache / binding caches
-        let _ = run(false);
-        let serial = run(false);
-        let parallel = run(true);
-        println!("refresh serial: {serial:?}, parallel: {parallel:?}");
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        self.0.semantic_tokens_full(params).await
     }
 }
 

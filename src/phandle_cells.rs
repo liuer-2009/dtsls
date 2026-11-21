@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use tree_sitter::Node;
 
 use crate::document::Document;
-use crate::util;
+use crate::model::{self, RefKind, Tree};
 
 /// `(consumer property, provider cell property)`, exactly dtc's table.
 const PROVIDERS: &[(&str, &str)] = &[
@@ -72,25 +72,6 @@ fn cells_name_for(property: &str) -> Option<&'static str> {
         .map(|(_, cells)| *cells)
 }
 
-/// A phandle reference in source form.
-enum Reference<'a> {
-    Label(&'a str),
-    /// `&{/soc/foo}` — a path reference, resolved from the unit's root node
-    Path(&'a str),
-}
-
-/// One cell of a phandle-array property.
-struct Cell<'a> {
-    /// the reference when the cell is `&label` / `&{/path}`
-    reference: Option<Reference<'a>>,
-    /// value when the text evaluates to a 32-bit integer
-    value: Option<u32>,
-    /// source text, for the "not an integer" message
-    text: &'a str,
-    start: usize,
-    end: usize,
-}
-
 /// What a node declares for its `#X-cells` properties.
 enum CellsValue {
     /// the property is absent
@@ -105,18 +86,15 @@ enum CellsValue {
 /// preprocessed translation unit, so labels and providers from every included
 /// file are present.
 struct Unit<'a> {
-    /// label -> the subnode carrying it
-    labels: HashMap<&'a str, Node<'a>>,
+    doc: &'a Document,
+    /// labels and canonical (fragment-merged) paths of the unit
+    tree: Tree<'a>,
     /// numeric phandle -> the subnode declaring it
     phandles: HashMap<u32, Node<'a>>,
-    /// subnode id -> its canonical path, with `&label { }` fragments merged in
-    paths: HashMap<usize, String>,
     /// canonical path -> `&label { }` fragment bodies that extend that node
     fragments: HashMap<String, Vec<Node<'a>>>,
     /// canonical path -> merged `#X-cells` values
     cells: HashMap<String, HashMap<String, CellsValue>>,
-    /// the root devicetree node, for `&{/path}` references
-    root: Option<Node<'a>>,
     /// `&label { }` references that resolve to no node in this unit
     unresolved_fragments: Vec<Node<'a>>,
 }
@@ -124,56 +102,45 @@ struct Unit<'a> {
 impl<'a> Unit<'a> {
     fn new(doc: &'a Document) -> Self {
         let mut unit = Unit {
-            labels: HashMap::new(),
+            doc,
+            tree: Tree::new(doc),
             phandles: HashMap::new(),
-            paths: HashMap::new(),
             fragments: HashMap::new(),
             cells: HashMap::new(),
-            root: find_devicetree(doc.tree.root_node()),
             unresolved_fragments: Vec::new(),
         };
-        unit.collect_names(doc, doc.tree.root_node());
-        unit.collect_fragments(doc, doc.tree.root_node());
-        unit.collect_paths(doc, doc.tree.root_node());
-        unit.collect_cells(doc, doc.tree.root_node());
+        unit.collect_phandles(doc.tree.root_node());
+        unit.collect_fragments(doc.tree.root_node());
+        unit.collect_cells(doc.tree.root_node());
         unit
     }
 
-    /// Labels and explicit `phandle` properties.
-    fn collect_names(&mut self, doc: &'a Document, node: Node<'a>) {
-        if node.kind() == "subnode" {
-            for i in 0..node.child_count() {
-                let Some(child) = node.child(i as u32) else {
-                    continue;
-                };
-                if child.kind() != "label" {
-                    continue;
-                }
-                let name = util::node_text(doc, child);
-                let name = name.trim_end_matches(':').trim();
-                if !name.is_empty() {
-                    self.labels.entry(name).or_insert(node);
-                }
-            }
-            if let Some(value) = explicit_phandle(doc, node) {
-                self.phandles.entry(value).or_insert(node);
-            }
+    /// Explicit `phandle = <N>` properties.
+    fn collect_phandles(&mut self, node: Node<'a>) {
+        if node.kind() == "subnode"
+            && let Some(value) = explicit_phandle(self.doc, node)
+        {
+            self.phandles.entry(value).or_insert(node);
         }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
-                self.collect_names(doc, child);
+                self.collect_phandles(child);
             }
         }
     }
 
     /// `&label { ... }` fragments, keyed by the canonical path they extend.
-    fn collect_fragments(&mut self, doc: &'a Document, node: Node<'a>) {
+    fn collect_fragments(&mut self, node: Node<'a>) {
         if node.kind() == "devicetree"
-            && let Some(reference) = util::find_child(node, "reference")
+            && let Some(reference) = model::find_child(node, "reference")
         {
-            match self.resolve(doc, reference).and_then(|target| self.path_of(doc, target)) {
+            match self
+                .tree
+                .resolve(reference)
+                .and_then(|target| self.tree.path_of(target))
+            {
                 Some(path) => {
-                    if let Some(body) = body_of(node) {
+                    if let Some(body) = model::body_of(node) {
                         self.fragments.entry(path).or_default().push(body);
                     }
                 }
@@ -182,66 +149,34 @@ impl<'a> Unit<'a> {
         }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
-                self.collect_fragments(doc, child);
+                self.collect_fragments(child);
             }
         }
     }
 
-    fn collect_paths(&mut self, doc: &'a Document, node: Node<'a>) {
+    fn collect_cells(&mut self, node: Node<'a>) {
         if node.kind() == "subnode" {
-            // computing the path also memoizes every ancestor's path
-            let _ = self.path_of(doc, node);
-        }
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                self.collect_paths(doc, child);
-            }
-        }
-    }
-
-    fn collect_cells(&mut self, doc: &'a Document, node: Node<'a>) {
-        if node.kind() == "subnode" {
-            if let Some(path) = self.paths.get(&node.id()).cloned() {
-                if let Some(body) = body_of(node) {
-                    for i in 0..body.child_count() {
-                        let Some(child) = body.child(i as u32) else {
-                            continue;
-                        };
-                        if child.kind() != "property" {
-                            continue;
-                        }
-                        let Some(name_node) = child.child_by_field_name("name") else {
-                            continue;
-                        };
-                        let name = util::node_text(doc, name_node);
-                        if name.starts_with('#') && name.ends_with("-cells") {
-                            let value = match property_u32(doc, child) {
-                                Some(value) => CellsValue::Value(value),
-                                None => CellsValue::Malformed,
-                            };
-                            self.cells
-                                .entry(path.clone())
-                                .or_default()
-                                .insert(name.to_string(), value);
-                        }
-                    }
+            if let Some(path) = self.tree.path_of(node) {
+                let mut bodies = Vec::new();
+                if let Some(body) = model::body_of(node) {
+                    bodies.push(body);
                 }
                 // fragment properties take precedence, like dtc's merge
-                let fragments = self.fragments.get(&path).cloned().unwrap_or_default();
-                for body in fragments {
+                if let Some(fragments) = self.fragments.get(&path) {
+                    bodies.extend(fragments.iter().copied());
+                }
+                for body in bodies {
                     for i in 0..body.child_count() {
-                        let Some(child) = body.child(i as u32) else {
-                            continue;
-                        };
+                        let Some(child) = body.child(i as u32) else { continue };
                         if child.kind() != "property" {
                             continue;
                         }
                         let Some(name_node) = child.child_by_field_name("name") else {
                             continue;
                         };
-                        let name = util::node_text(doc, name_node);
+                        let name = model::node_text(self.doc, name_node);
                         if name.starts_with('#') && name.ends_with("-cells") {
-                            let value = match property_u32(doc, child) {
+                            let value = match model::property_u32(self.doc, child) {
                                 Some(value) => CellsValue::Value(value),
                                 None => CellsValue::Malformed,
                             };
@@ -256,95 +191,16 @@ impl<'a> Unit<'a> {
         }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
-                self.collect_cells(doc, child);
+                self.collect_cells(child);
             }
         }
     }
 
-    /// Canonical path of a node: `&label { }` fragments map onto the node they
-    /// extend, so the whole unit looks like one merged tree.
-    fn path_of(&mut self, doc: &'a Document, node: Node<'a>) -> Option<String> {
-        if let Some(path) = self.paths.get(&node.id()) {
-            return Some(path.clone());
-        }
-        let path = match node.kind() {
-            "subnode" => {
-                let name = node.child_by_field_name("name")?;
-                let name = util::node_text(doc, name).to_string();
-                match self.canonical_parent(doc, node) {
-                    Some(parent) => {
-                        let base = self.path_of(doc, parent).unwrap_or_default();
-                        Some(format!("{base}/{name}"))
-                    }
-                    None => Some(format!("/{name}")),
-                }
-            }
-            "devicetree" => match util::find_child(node, "reference") {
-                Some(reference) => {
-                    let target = self.resolve(doc, reference)?;
-                    self.path_of(doc, target)
-                }
-                None => Some(String::new()),
-            },
-            _ => return None,
-        };
-        if let Some(path) = &path {
-            self.paths.insert(node.id(), path.clone());
-        }
-        path
-    }
-
-    /// The node that encloses `node` once fragments are merged.
-    fn canonical_parent(&self, doc: &'a Document, node: Node<'a>) -> Option<Node<'a>> {
-        let owning = util::owning_node(node)?;
-        match owning.kind() {
-            // a fragment's parent is the node it extends; the root devicetree
-            // is the end of the chain but still carries properties
-            "devicetree" => match util::find_child(owning, "reference") {
-                Some(reference) => self.resolve(doc, reference),
-                None => Some(owning),
-            },
-            _ => Some(owning),
-        }
-    }
-
-    fn resolve(&self, doc: &Document, reference: Node<'a>) -> Option<Node<'a>> {
-        if let Some(label_ref) = util::find_child(reference, "label_ref") {
-            let label = util::node_text(doc, label_ref);
-            return self.labels.get(label.strip_prefix('&')?).copied();
-        }
-        let path_ref = util::find_child(reference, "path_ref")?;
-        let path_ref = util::node_text(doc, path_ref);
-        resolve_path(self.root?, doc, &path_ref)
-    }
-
-    /// Whether every `&label { }` on the way to the root resolves.
-    fn chain_is_whole(&self, doc: &Document, node: Node<'a>) -> bool {
-        let mut current = Some(node);
-        while let Some(node) = current {
-            let Some(owning) = util::owning_node(node) else {
-                return true;
-            };
-            if owning.kind() == "devicetree"
-                && let Some(reference) = util::find_child(owning, "reference")
-                && self.resolve(doc, reference).is_none()
-            {
-                return false;
-            }
-            current = self.canonical_parent(doc, node);
-        }
-        true
-    }
-
-    fn path_of_node(&self, node: Node<'_>) -> Option<&String> {
-        self.paths.get(&node.id())
-    }
-
-    fn cells_of(&self, node: Node<'_>, name: &str) -> CellsValue {
-        let Some(path) = self.path_of_node(node) else {
+    fn cells_of(&mut self, node: Node<'a>, name: &str) -> CellsValue {
+        let Some(path) = self.tree.path_of(node) else {
             return CellsValue::Absent;
         };
-        match self.cells.get(path).and_then(|cells| cells.get(name)) {
+        match self.cells.get(&path).and_then(|cells| cells.get(name)) {
             Some(CellsValue::Value(value)) => CellsValue::Value(*value),
             Some(CellsValue::Malformed) => CellsValue::Malformed,
             Some(CellsValue::Absent) | None => CellsValue::Absent,
@@ -353,19 +209,9 @@ impl<'a> Unit<'a> {
 }
 
 fn explicit_phandle(doc: &Document, node: Node<'_>) -> Option<u32> {
-    let body = body_of(node)?;
-    for i in 0..body.child_count() {
-        let child = body.child(i as u32)?;
-        if child.kind() != "property" {
-            continue;
-        }
-        let name = child.child_by_field_name("name")?;
-        let name = util::node_text(doc, name);
-        if name == "phandle" || name == "linux,phandle" {
-            return property_u32(doc, child);
-        }
-    }
-    None
+    let prop = model::find_property(doc, node, "phandle")
+        .or_else(|| model::find_property(doc, node, "linux,phandle"))?;
+    model::property_u32(doc, prop)
 }
 
 /// Everything the checks found, plus the references that could not be resolved
@@ -379,8 +225,7 @@ pub struct Report {
 /// Check every phandle-array, `interrupts`, provider and `#X-cells` property.
 /// `doc` must hold a full translation unit.
 pub fn check_document(doc: &Document) -> Report {
-    let unit = Unit::new(doc);
-    let mut out = Vec::new();
+    let mut unit = Unit::new(doc);
     let unresolved_fragments = unit
         .unresolved_fragments
         .iter()
@@ -388,18 +233,19 @@ pub fn check_document(doc: &Document) -> Report {
             (
                 reference.start_byte() as u32,
                 reference.end_byte() as u32,
-                util::node_text(doc, *reference).to_string(),
+                model::node_text(doc, *reference).to_string(),
             )
         })
         .collect();
-    check_node(doc, &unit, doc.tree.root_node(), &mut out);
+    let mut out = Vec::new();
+    check_node(doc, &mut unit, doc.tree.root_node(), &mut out);
     Report {
         diagnostics: out,
         unresolved_fragments,
     }
 }
 
-fn check_node(doc: &Document, unit: &Unit<'_>, node: Node<'_>, out: &mut Vec<Problem>) {
+fn check_node<'a>(doc: &'a Document, unit: &mut Unit<'a>, node: Node<'a>, out: &mut Vec<Problem>) {
     match node.kind() {
         "subnode" | "devicetree" => {
             check_cells_shape(doc, unit, node, out);
@@ -419,12 +265,12 @@ fn check_node(doc: &Document, unit: &Unit<'_>, node: Node<'_>, out: &mut Vec<Pro
 }
 
 /// dtc's `WARNING_IF_NOT_CELL` for every `#X-cells` of the table.
-fn check_cells_shape(doc: &Document, unit: &Unit<'_>, node: Node<'_>, out: &mut Vec<Problem>) {
+fn check_cells_shape<'a>(doc: &Document, unit: &mut Unit<'a>, node: Node<'a>, out: &mut Vec<Problem>) {
     for (_, cells_name) in PROVIDERS {
         let Some(property) = property_of(doc, unit, node, cells_name) else {
             continue;
         };
-        if property_u32(doc, property).is_none() {
+        if model::property_u32(doc, property).is_none() {
             out.push(problem(
                 property,
                 false,
@@ -439,7 +285,7 @@ fn check_cells_shape(doc: &Document, unit: &Unit<'_>, node: Node<'_>, out: &mut 
 
 /// Human-readable shape of a property value, for diagnostics.
 fn describe_value(doc: &Document, property: Node<'_>) -> String {
-    let list = cells(doc, property);
+    let list = model::cells_of_property(doc, property);
     match list.len() {
         0 => "an empty value".to_string(),
         1 => format!("'{}'", list[0].text),
@@ -448,26 +294,26 @@ fn describe_value(doc: &Document, property: Node<'_>) -> String {
 }
 
 /// dtc's `check_interrupt_provider`.
-fn check_interrupt_provider(doc: &Document, unit: &Unit<'_>, node: Node<'_>, out: &mut Vec<Problem>) {
+fn check_interrupt_provider<'a>(doc: &Document, unit: &mut Unit<'a>, node: Node<'a>, out: &mut Vec<Problem>) {
     let provider = property_of(doc, unit, node, "interrupt-controller").is_some()
         || property_of(doc, unit, node, "interrupt-map").is_some();
-    let has_cells = property_of(doc, unit, node, "#interrupt-cells").is_some();
+    let cells_property = property_of(doc, unit, node, "#interrupt-cells");
 
-    match (provider, has_cells) {
-        (true, false) => out.push(problem(
+    match (provider, cells_property) {
+        (true, None) => out.push(problem(
             node,
             false,
             format!(
                 "{}: has `interrupt-controller` but no `#interrupt-cells`, so its interrupt specifiers have no defined size",
-                node_path(doc, unit, node)
+                node_path(unit, node)
             ),
         )),
-        (false, true) => out.push(problem(
-            property_of(doc, unit, node, "#interrupt-cells").expect("checked above"),
+        (false, Some(cells_property)) => out.push(problem(
+            cells_property,
             false,
             format!(
                 "{}: declares `#interrupt-cells` but is not an interrupt controller (needs `interrupt-controller` or `interrupt-map`)",
-                node_path(doc, unit, node)
+                node_path(unit, node)
             ),
         )),
         // the value's shape is reported by check_cells_shape
@@ -476,9 +322,9 @@ fn check_interrupt_provider(doc: &Document, unit: &Unit<'_>, node: Node<'_>, out
 }
 
 /// dtc's `check_property_phandle_args`, run over source text.
-fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &mut Vec<Problem>) {
+fn check_phandle_array<'a>(doc: &Document, unit: &mut Unit<'a>, property: Node<'a>, out: &mut Vec<Problem>) {
     let Some(name_node) = property.child_by_field_name("name") else {
-        if util::find_child(property, "delete_property").is_none() {
+        if model::find_child(property, "delete_property").is_none() {
             out.push(problem(
                 property,
                 false,
@@ -487,18 +333,18 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
         }
         return;
     };
-    let property_name = util::node_text(doc, name_node);
+    let property_name = model::node_text(doc, name_node);
     let Some(cells_name) = cells_name_for(property_name) else {
         // dtc: only properties in its table are checked
         return;
     };
     let optional = OPTIONAL.contains(&property_name);
-    if !unit.chain_is_whole(doc, property) {
+    if !unit.tree.chain_is_whole(property) {
         // the unresolved `&label { }` that cut the chain is reported once, for
         // the whole file, by check_document
         return;
     }
-    let list = cells(doc, property);
+    let list = model::cells_of_property(doc, property);
 
     // a cell that is not a 32-bit integer means the source would not compile,
     // so report it instead of guessing where entries start and end
@@ -518,7 +364,7 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
         return;
     }
 
-    let mut previous: Option<(usize, usize)> = None;
+    let mut previous: Option<(usize, String, usize)> = None;
     let mut index = 0usize;
     while index < list.len() {
         let cell = &list[index];
@@ -533,8 +379,8 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
         }
 
         let target = match &cell.reference {
-            Some(Reference::Label(label)) => match unit.labels.get(label) {
-                Some(node) => *node,
+            Some(RefKind::Label(label)) => match unit.tree.label(label) {
+                Some(node) => node,
                 None => {
                     out.push(problem(
                         cell,
@@ -547,10 +393,7 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
                     return;
                 }
             },
-            Some(Reference::Path(path)) => match unit
-                .root
-                .and_then(|root| resolve_path(root, doc, path))
-            {
+            Some(RefKind::Path(path)) => match unit.tree.resolve_path(path) {
                 Some(node) => node,
                 None => {
                     out.push(problem(
@@ -567,10 +410,13 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
                 Some(node) => *node,
                 None => {
                     // dtc splits this into "not a phandle reference" and
-                    // "could not get phandle node"; one sentence says it all
-                    let context = match previous {
-                        Some((entry, declared)) => format!(
-                            " (the entry at cell {entry} takes {declared} argument cell(s), {cells_name} = <{declared}>)"
+                    // "could not get phandle node"; one sentence says it all,
+                    // plus where the previous entry's stride came from
+                    let context = match &previous {
+                        Some((entry, entry_text, declared)) => format!(
+                            " — the entry {entry_text} (cell {entry}) takes {declared} argument \
+                             cell(s) (`{cells_name}` = <{declared}>), so cell {index} must start \
+                             a new entry or be `<0>` to skip it"
                         ),
                         None => String::new(),
                     };
@@ -593,8 +439,8 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
                 let remaining = list.len() - index - 1;
                 if remaining < declared {
                     let entry = match &cell.reference {
-                        Some(Reference::Label(label)) => format!("`&{label}`"),
-                        Some(Reference::Path(path)) => format!("`{path}`"),
+                        Some(RefKind::Label(label)) => format!("`&{label}`"),
+                        Some(RefKind::Path(path)) => format!("`{path}`"),
                         None => format!("the entry at cell {index}"),
                     };
                     out.push(problem(
@@ -606,7 +452,12 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
                     ));
                     return;
                 }
-                previous = Some((index, declared));
+                let entry_text = match &cell.reference {
+                    Some(RefKind::Label(label)) => format!("`&{label}`"),
+                    Some(RefKind::Path(path)) => format!("`{path}`"),
+                    None => format!("the phandle at cell {index}"),
+                };
+                previous = Some((index, entry_text, declared));
                 index += declared + 1;
             }
             CellsValue::Absent => {
@@ -618,7 +469,7 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
                         format!(
                             "{property_name}: {} has no `{cells_name}`, so this entry's \
                              argument count is undefined",
-                            node_path(doc, unit, target)
+                            node_path(unit, target)
                         ),
                     ));
                 }
@@ -633,18 +484,18 @@ fn check_phandle_array(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out:
 }
 
 /// dtc's `check_interrupts_property`.
-fn check_interrupts(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &mut Vec<Problem>) {
+fn check_interrupts<'a>(doc: &'a Document, unit: &mut Unit<'a>, property: Node<'a>, out: &mut Vec<Problem>) {
     let Some(name_node) = property.child_by_field_name("name") else {
         return;
     };
-    if util::node_text(doc, name_node) != "interrupts" {
+    if model::node_text(doc, name_node) != "interrupts" {
         return;
     }
-    if !unit.chain_is_whole(doc, property) {
+    if !unit.tree.chain_is_whole(property) {
         // reported once for the whole file by check_document
         return;
     }
-    let list = cells(doc, property);
+    let list = model::cells_of_property(doc, property);
     if let Some((index, cell)) = list
         .iter()
         .enumerate()
@@ -661,7 +512,7 @@ fn check_interrupts(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &m
         ));
         return;
     }
-    let Some(enclosing) = util::owning_node(property) else {
+    let Some(enclosing) = model::owning_node(property) else {
         out.push(problem(
             property,
             false,
@@ -672,8 +523,8 @@ fn check_interrupts(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &m
     };
     // a property written directly inside `&label { }` belongs to the node the
     // fragment extends
-    let owner = match util::find_child(enclosing, "reference") {
-        Some(reference) => match unit.resolve(doc, reference) {
+    let owner = match model::find_child(enclosing, "reference") {
+        Some(reference) => match unit.tree.resolve(reference) {
             Some(target) => target,
             None => {
                 out.push(problem(
@@ -681,7 +532,7 @@ fn check_interrupts(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &m
                     true,
                     format!(
                         "`{}` does not name a node in this translation unit, so this                          `interrupts` cannot be resolved",
-                        util::node_text(doc, reference)
+                        model::node_text(doc, reference)
                     ),
                 ));
                 return;
@@ -708,7 +559,7 @@ fn check_interrupts(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &m
                                 "interrupt-parent points at {}, which is not an interrupt \
                                  controller (it has neither `interrupt-controller` nor \
                                  `interrupt-map`)",
-                                node_path(doc, unit, target)
+                                node_path(unit, target)
                             ),
                         ));
                     }
@@ -720,18 +571,18 @@ fn check_interrupts(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &m
                     // dtc keeps walking up only for an invalid phandle; an
                     // unresolved reference ends the search
                     if resolved {
-                        current = unit.canonical_parent(doc, node);
+                        current = unit.tree.parent_of(node);
                     } else {
                         return;
                     }
                 }
             },
-            None => current = unit.canonical_parent(doc, node),
+            None => current = unit.tree.parent_of(node),
         }
     }
 
     let Some(controller) = controller else {
-        if !unit.chain_is_whole(doc, owner) {
+        if !unit.tree.chain_is_whole(owner) {
             // the fragment reference that cut the chain is already reported
             return;
         }
@@ -741,7 +592,7 @@ fn check_interrupts(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &m
             format!(
                 "{}: `interrupts` needs an interrupt controller, but no `interrupt-parent` \
                  is set on this node or any ancestor",
-                node_path(doc, unit, owner)
+                node_path(unit, owner)
             ),
         ));
         return;
@@ -772,7 +623,7 @@ fn check_interrupts(doc: &Document, unit: &Unit<'_>, property: Node<'_>, out: &m
                 "`interrupts` has {} cell(s); {} declares `#interrupt-cells = <{declared}>`, \
                  so the size must be a multiple of {declared}",
                 list.len(),
-                node_path(doc, unit, controller)
+                node_path(unit, controller)
             ),
         ));
     }
@@ -786,8 +637,8 @@ fn interrupt_parent<'a>(
     property: Node<'a>,
 ) -> Result<Node<'a>, (bool, Problem)> {
     match first_reference(doc, property) {
-        Some(Reference::Label(label)) => match unit.labels.get(label) {
-            Some(node) => Ok(*node),
+        Some(RefKind::Label(label)) => match unit.tree.label(label) {
+            Some(node) => Ok(node),
             None => Err((
                 false,
                 problem(
@@ -800,10 +651,7 @@ fn interrupt_parent<'a>(
                 ),
             )),
         },
-        Some(Reference::Path(path)) => match unit
-            .root
-            .and_then(|root| resolve_path(root, doc, path))
-        {
+        Some(RefKind::Path(path)) => match unit.tree.resolve_path(path) {
             Some(node) => Ok(node),
             None => Err((
                 false,
@@ -817,40 +665,43 @@ fn interrupt_parent<'a>(
                 ),
             )),
         },
-        None => match cells(doc, property).first().and_then(|cell| cell.value) {
-            Some(value) if !is_skipped(value) => match unit.phandles.get(&value) {
-                Some(node) => Ok(*node),
-                None => Err((
-                    false,
+        None => {
+            let list = model::cells_of_property(doc, property);
+            match list.first().and_then(|cell| cell.value) {
+                Some(value) if !is_skipped(value) => match unit.phandles.get(&value) {
+                    Some(node) => Ok(*node),
+                    None => Err((
+                        false,
+                        problem(
+                            property,
+                            false,
+                            format!("interrupt-parent: no node declares phandle {value}"),
+                        ),
+                    )),
+                },
+                // dtc: 0 / 0xffffffff is an invalid phandle, and it keeps walking
+                // up the tree after reporting it
+                _ => Err((
+                    true,
                     problem(
                         property,
                         false,
-                        format!("interrupt-parent: no node declares phandle {value}"),
+                        format!(
+                            "interrupt-parent: `{}` is not a phandle; it must be `<&label>`",
+                            model::node_text(doc, property)
+                                .to_string()
+                                .split('=')
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim()
+                                .trim_end_matches(';')
+                                .trim()
+                                .trim_matches(['<', '>'])
+                        ),
                     ),
                 )),
-            },
-            // dtc: 0 / 0xffffffff is an invalid phandle, and it keeps walking
-            // up the tree after reporting it
-            _ => Err((
-                true,
-                problem(
-                    property,
-                    false,
-                    format!(
-                        "interrupt-parent: `{}` is not a phandle; it must be `<&label>`",
-                        util::node_text(doc, property)
-                            .to_string()
-                            .split('=')
-                            .nth(1)
-                            .unwrap_or("")
-                            .trim()
-                            .trim_end_matches(';')
-                            .trim()
-                            .trim_matches(['<', '>'])
-                    ),
-                ),
-            )),
-        },
+            }
+        }
     }
 }
 
@@ -874,83 +725,36 @@ impl IntoRange for Node<'_> {
     }
 }
 
-impl IntoRange for &Cell<'_> {
+impl IntoRange for &model::Cell<'_> {
     fn into_range(&self) -> (usize, usize) {
         (self.start, self.end)
     }
 }
 
-fn find_devicetree(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() == "devicetree" {
-        return Some(node);
-    }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32)
-            && let Some(found) = find_devicetree(child)
-        {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn body_of(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "devicetree" => {
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32)
-                    && child.kind() == "node_def"
-                {
-                    return Some(child);
-                }
-            }
-            None
-        }
-        _ => util::node_def_of(node),
-    }
-}
-
 /// The property named `name` on this node, looking through `&label { }`
 /// fragments the way dtc's merge does.
-fn property_of<'a>(doc: &Document, unit: &Unit<'a>, node: Node<'a>, name: &str) -> Option<Node<'a>> {
-    let mut found = body_of(node).and_then(|body| property_in(doc, body, name));
-    let Some(path) = unit.path_of_node(node) else {
+fn property_of<'a>(
+    doc: &Document,
+    unit: &mut Unit<'a>,
+    node: Node<'a>,
+    name: &str,
+) -> Option<Node<'a>> {
+    let mut found = model::body_of(node).and_then(|body| model::find_property(doc, body, name));
+    let Some(path) = unit.tree.path_of(node) else {
         return found;
     };
-    let Some(bodies) = unit.fragments.get(path) else {
+    let Some(bodies) = unit.fragments.get(&path) else {
         return found;
     };
     // fragments apply in source order, like dtc's merge
-    for body in bodies {
-        if deletes(doc, *body, name) {
+    for body in bodies.iter().copied().collect::<Vec<_>>() {
+        if deletes(doc, body, name) {
             found = None;
-        } else if let Some(property) = property_in(doc, *body, name) {
+        } else if let Some(property) = model::find_property(doc, body, name) {
             found = Some(property);
         }
     }
     found
-}
-
-fn property_in<'a>(doc: &Document, body: Node<'a>, name: &str) -> Option<Node<'a>> {
-    for i in 0..body.child_count() {
-        let Some(child) = body.child(i as u32) else {
-            continue;
-        };
-        if child.kind() != "property" {
-            continue;
-        }
-        // `/delete-property/ x;` removes the property, it does not define it
-        if util::find_child(child, "delete_property").is_some() {
-            continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        if util::node_text(doc, name_node) == name {
-            return Some(child);
-        }
-    }
-    None
 }
 
 /// Whether this body deletes `name` (`/delete-property/ name;`).
@@ -959,11 +763,10 @@ fn deletes(doc: &Document, body: Node<'_>, name: &str) -> bool {
         let Some(child) = body.child(i as u32) else {
             continue;
         };
-        if child.kind() != "property" || util::find_child(child, "delete_property").is_none() {
+        if child.kind() != "property" || model::find_child(child, "delete_property").is_none() {
             continue;
         }
-        let text = util::node_text(doc, child).to_string();
-        let mut words = text.split_whitespace();
+        let mut words = model::node_text(doc, child).split_whitespace();
         if words.next() == Some("/delete-property/") && words.next() == Some(name) {
             return true;
         }
@@ -971,26 +774,26 @@ fn deletes(doc: &Document, body: Node<'_>, name: &str) -> bool {
     false
 }
 
-
-fn is_interrupt_provider(doc: &Document, unit: &Unit<'_>, node: Node<'_>) -> bool {
+fn is_interrupt_provider<'a>(doc: &Document, unit: &mut Unit<'a>, node: Node<'a>) -> bool {
     property_of(doc, unit, node, "interrupt-controller").is_some()
         || property_of(doc, unit, node, "interrupt-map").is_some()
 }
 
-fn node_path(doc: &Document, unit: &Unit<'_>, node: Node<'_>) -> String {
-    match unit.path_of_node(node) {
-        Some(path) if !path.is_empty() => path.clone(),
-        _ => crate::analysis::node_path(doc, node),
+/// Canonical path of a node in the merged unit, `/` for the root.
+fn node_path<'a>(unit: &mut Unit<'a>, node: Node<'a>) -> String {
+    match unit.tree.display_path(node) {
+        path if path.is_empty() => "/".to_string(),
+        path => path,
     }
 }
 
-fn first_reference<'a>(doc: &'a Document, property: Node<'a>) -> Option<Reference<'a>> {
-    fn walk<'a>(doc: &'a Document, node: Node<'a>, found: &mut Option<Reference<'a>>) {
+fn first_reference<'a>(doc: &'a Document, property: Node<'a>) -> Option<RefKind<'a>> {
+    fn walk<'a>(doc: &'a Document, node: Node<'a>, found: &mut Option<RefKind<'a>>) {
         if found.is_some() {
             return;
         }
         if node.kind() == "reference" {
-            *found = reference(doc, node);
+            *found = model::reference_of(doc, node);
             return;
         }
         for i in 0..node.child_count() {
@@ -1005,176 +808,8 @@ fn first_reference<'a>(doc: &'a Document, property: Node<'a>) -> Option<Referenc
     found
 }
 
-/// Flatten a property value into cells, skipping comments and `/bits/` markers.
-fn cells<'a>(doc: &'a Document, property: Node<'a>) -> Vec<Cell<'a>> {
-    fn collect<'a>(doc: &'a Document, node: Node<'a>, out: &mut Vec<Cell<'a>>) {
-        match node.kind() {
-            // dtc: `/bits/ 8` is a size marker, not a cell
-            "bits" => {}
-            "property" | "prop_data" | "array" => {
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect(doc, child, out);
-                    }
-                }
-            }
-            "reference" => out.push(Cell {
-                reference: reference(doc, node),
-                value: None,
-                text: util::node_text(doc, node),
-                start: node.start_byte(),
-                end: node.end_byte(),
-            }),
-            // one cell per value token: literals, unexpanded macro names and
-            // integer expressions
-            "int_literal" | "integer" | "number" | "preproc_identifier" | "identifier"
-            | "char_literal" | "string_literal" | "preproc_number_literal" | "preproc_call"
-            | "int_unary_op" | "int_parenthesized_expression" | "int_binary_op" => {
-                out.push(Cell {
-                    reference: None,
-                    value: cell_value(doc, node),
-                    text: util::node_text(doc, node),
-                    start: node.start_byte(),
-                    end: node.end_byte(),
-                })
-            }
-            _ => {}
-        }
-    }
-
-    let mut out = Vec::new();
-    collect(doc, property, &mut out);
-    out
-}
-
 fn is_skipped(value: u32) -> bool {
     value == 0 || value == 0xffff_ffff
-}
-
-/// Numeric value of a cell, when the text evaluates to a 32-bit integer.
-///
-/// dtc evaluates C constant expressions in cells, so `(2 | 1)` and
-/// `((1 << 4) - 1) << 8 | 8` are ordinary cell values. Evaluating them here
-/// keeps the checks quiet on valid sources and reserves "not an integer" for
-/// values that really have no value.
-fn cell_value(doc: &Document, node: Node<'_>) -> Option<u32> {
-    eval(doc, node).map(|value| value as u32)
-}
-
-fn eval(doc: &Document, node: Node<'_>) -> Option<u64> {
-    match node.kind() {
-        "int_literal" | "integer" | "number" | "preproc_number_literal" => {
-            parse_integer(&util::node_text(doc, node))
-        }
-        "char_literal" => {
-            let text = util::node_text(doc, node);
-            let inner = text.trim_matches('\'');
-            let mut chars = inner.chars();
-            let value = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-            Some(value as u64)
-        }
-        "int_parenthesized_expression" => eval(doc, node.named_child(0)?),
-        "int_unary_op" => {
-            let operator = node.child(0)?.kind();
-            let operand = eval(doc, node.named_child(0)?)?;
-            match operator {
-                "~" => Some(!operand),
-                "-" => Some(operand.wrapping_neg()),
-                "+" => Some(operand),
-                "!" => Some(u64::from(operand == 0)),
-                _ => None,
-            }
-        }
-        "int_binary_op" => {
-            let left = eval(doc, node.named_child(0)?)?;
-            let right = eval(doc, node.named_child(1)?)?;
-            let operator = (0..node.child_count())
-                .filter_map(|i| node.child(i as u32))
-                .find(|child| !child.is_named())?;
-            let operator = util::node_text(doc, operator).to_string();
-            match operator.as_str() {
-                "|" => Some(left | right),
-                "&" => Some(left & right),
-                "^" => Some(left ^ right),
-                "+" => Some(left.wrapping_add(right)),
-                "-" => Some(left.wrapping_sub(right)),
-                "*" => Some(left.wrapping_mul(right)),
-                "/" => (right != 0).then(|| left / right),
-                "%" => (right != 0).then(|| left % right),
-                "<<" => (right < 64).then(|| left << right),
-                ">>" => (right < 64).then(|| left >> right),
-                "<" => Some(u64::from(left < right)),
-                ">" => Some(u64::from(left > right)),
-                "<=" => Some(u64::from(left <= right)),
-                ">=" => Some(u64::from(left >= right)),
-                "==" => Some(u64::from(left == right)),
-                "!=" => Some(u64::from(left != right)),
-                "&&" => Some(u64::from(left != 0 && right != 0)),
-                "||" => Some(u64::from(left != 0 || right != 0)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn parse_integer(text: &str) -> Option<u64> {
-    let text = text.trim().trim_end_matches(['u', 'U', 'l', 'L']);
-    let (digits, radix) = match text.get(..2) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("0x") => (&text[2..], 16),
-        Some(prefix) if prefix.eq_ignore_ascii_case("0b") => (&text[2..], 2),
-        Some(prefix) if prefix.starts_with('0') && text.len() > 1 => (&text[1..], 8),
-        _ => (text, 10),
-    };
-    u64::from_str_radix(digits, radix).ok()
-}
-
-/// Value of a single-cell property such as `#clock-cells = <1>`.
-pub fn property_u32(doc: &Document, property: Node<'_>) -> Option<u32> {
-    let list = cells(doc, property);
-    match list.len() {
-        1 => list[0].value,
-        _ => None,
-    }
-}
-
-fn reference<'a>(doc: &'a Document, node: Node<'a>) -> Option<Reference<'a>> {
-    if let Some(label_ref) = util::find_child(node, "label_ref") {
-        let text = util::node_text(doc, label_ref);
-        return text.strip_prefix('&').map(Reference::Label);
-    }
-    let path_ref = util::find_child(node, "path_ref")?;
-    Some(Reference::Path(util::node_text(doc, path_ref)))
-}
-
-/// Resolve `&{/soc/foo}` to its node, walking the root's children by name.
-fn resolve_path<'a>(root: Node<'a>, doc: &Document, path_ref: &str) -> Option<Node<'a>> {
-    let inner = path_ref.strip_prefix("&{")?.strip_suffix('}')?;
-    let mut current = root;
-    for segment in inner.split('/').filter(|segment| !segment.is_empty()) {
-        let body = body_of(current)?;
-        let mut next = None;
-        for i in 0..body.child_count() {
-            let Some(candidate) = body.child(i as u32) else {
-                continue;
-            };
-            if candidate.kind() != "subnode" {
-                continue;
-            }
-            if candidate
-                .child_by_field_name("name")
-                .is_some_and(|name| util::node_text(doc, name) == segment)
-            {
-                next = Some(candidate);
-                break;
-            }
-        }
-        current = next?;
-    }
-    Some(current)
 }
 
 #[cfg(test)]
@@ -1419,6 +1054,3 @@ mod tests {
         assert!(diags(text).is_empty(), "{:?}", diags(text));
     }
 }
-
-
-

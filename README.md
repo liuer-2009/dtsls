@@ -33,18 +33,14 @@ cargo build --release
     properties removed by `/delete-property/`, and — for same-file overlays —
     base properties overridden by `&label { }` / `&{/path} { }` extensions
     (last definition wins, matching dtc merge order)
-- **Analysis context (dts-lsp's `activeContext`)** — an active board claims
-  the files in its include closure: a `.dtsi` opened from the board (goto
-  definition, or a `#include` link) is analysed inside the board's unit, while
-  a `.dtsi` opened on its own is treated as a standalone dts with its own
-  closure. Opening a board later adopts standalone documents that it includes.
-  Diagnostics are only published into documents analysed in that context.
-  Binding checks wait for the background binding scan, and every open document
-  is re-diagnosed and republished when the scan finishes (the active document
-  first, the rest computed in parallel); the workspace scan runs after that so
-  the refresh is not competing for CPU. At most 8 contexts keep their unit and
-  preprocessed snapshot; the least recently used one is evicted (open documents and the active board are never
-  evicted) and re-analysed when it is next used.
+- **Analysis context** — an active board claims the files in its include
+  closure: a `.dtsi` opened from the board (goto definition, or a `#include`
+  link) is analysed inside the board's unit, while a `.dtsi` opened on its own
+  is treated as a standalone dts with its own closure. Opening a board later
+  adopts standalone documents that it includes. Diagnostics are only
+  published into documents analysed in that context. At most 8 board contexts
+  keep their unit and preprocessed snapshot (FIFO eviction; open documents and
+  the active board are never evicted) and are re-analysed when reused.
 - **`#include` links** — include paths are document links, so "go to file" on
   an include lands in the included source with the board still active
 - **M1: `&label` completion** — trigger on `&`; the active translation unit
@@ -91,11 +87,15 @@ cargo build --release
   on-disk files, and a source map ties every expanded line back to its file and
   line. No `cpp` process is spawned per edit; the preprocessed text is reparsed
   incrementally (common prefix/suffix), so a localized edit only reshapes the
-  changed region. Duplicate labels, duplicate properties,
-  duplicate node names and syntax errors are therefore judged on the merged
-  tree, exactly like dtc; `#ifdef` branches are resolved by the preprocessor
-  instead of being guessed. Re-runs are coalesced (200 ms) and only happen for
-  open or affected boards. Labels, `&label` references, macro definitions and
+  changed region. Checks are split so they never run twice: the **buffer tier**
+  (syntax errors, unresolved includes, binding violations, feature notices)
+  answers on the live buffer within a keystroke, and the **unit tier**
+  (duplicate labels/properties/nodes on the merged tree, phandle-argument
+  checks, preprocessor errors) republishes ~200 ms after typing settles,
+  mapped back to the file each diagnostic came from — exactly like dtc judges
+  the merged tree, with `#ifdef` branches resolved by the preprocessor instead
+  of guessed. A file not covered by a unit yet also gets duplicate checks from
+  the buffer tier. Labels, `&label` references, macro definitions and
   `#*-cells` come from the unit, so completion, go-to-definition, references,
   macro completion and `*-names` hints all see macro-expanded names and the
   branches the preprocessor actually kept; the live buffer is merged on top for
@@ -112,6 +112,12 @@ cargo build --release
   (definition) and `gD` (declaration) jump to the YAML binding of the node's
   `compatible`, landing on its `compatible:` property. Half-written nodes work
   too (the text reader supplies the compatible list when the tree is broken)
+- **Inlay hints** — bidirectional `X` / `X-names` pairing with strides from
+  the phandle target's `#*-cells` (`reg` uses the parent bus's
+  `#address-cells + #size-cells`; `interrupts` uses the interrupt-parent's
+  `#interrupt-cells`, walking up the tree). A bare `interrupts = <...>` (no
+  inline `&ref`) additionally shows its controller inline — `&intc` from
+  `interrupt-parent`, tooltip with the controller path and `#interrupt-cells`
 - **M3: property completion** — typing a property name inside a node whose
   `compatible` has a binding suggests that binding's properties (required
   ones first, already-present ones dropped); value positions never trigger.
@@ -156,7 +162,17 @@ Logs go to `$DTSLS_LOG` (default `/tmp/dtsls.log`), verbosity via `RUST_LOG`.
 
 ## Roadmap
 
-- M1: workspace index (labels / nodes / phandles), `&label` completion, goto definition/references
-- M2: rename, `*-names` inlay hints (stride from `#*-cells` of the phandle target)
-- M3: YAML binding integration (`Documentation/devicetree/bindings`)
-- M4: dtc diagnostics bridge, editor packaging
+All milestones are implemented: M1 (workspace scan, `&label` completion, goto
+definition/references), M2 (`*-names` inlay hints), M3 (YAML binding
+integration, dtc-style phandle checks), M4 (packaging is the Neovim snippet
+above).
+
+## Architecture notes
+
+One shared toolkit (`model.rs`) owns tree walking, canonical node paths
+(`&label { }` fragments merge into the nodes they extend), reference
+resolution, cell parsing and the raw-text brace scanner — every feature reads
+the tree through it. `unit.rs` builds a translation unit (preprocess + parse +
+one name-collection walk) and maps unit diagnostics back to their files.
+`workspace.rs` keeps the include graph and per-root snapshots. `backend.rs` is
+a thin LSP layer over that state.

@@ -1,26 +1,26 @@
-use ropey::Rope;
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
-use tree_sitter::{InputEdit, Parser, Point, Tree};
+use tree_sitter::{InputEdit, Parser, Tree};
 
-use crate::util;
+use crate::model;
 
 pub struct Document {
-    pub rope: Rope,
     pub text: String,
+    /// byte offset where each line starts (`line_starts[0] == 0`)
+    pub line_starts: Vec<usize>,
     pub tree: Tree,
     pub version: i32,
 }
 
 impl Document {
     pub fn open(text: &str, version: i32) -> Self {
-        let rope = Rope::from_str(text);
-        let tree = Self::parse(&rope, None).unwrap_or_else(Self::empty_tree);
-        Self {
-            rope,
+        let mut doc = Self {
             text: text.to_string(),
-            tree,
+            line_starts: Vec::new(),
+            tree: Self::parse(text, None).unwrap_or_else(Self::empty_tree),
             version,
-        }
+        };
+        doc.rebuild_line_starts();
+        doc
     }
 
     fn empty_tree() -> Tree {
@@ -31,24 +31,22 @@ impl Document {
         parser.parse("", None).expect("parsing empty text always succeeds")
     }
 
-    /// Incremental-friendly parse over the rope, reusing the old tree when given.
-    fn parse(rope: &Rope, old_tree: Option<&Tree>) -> Option<Tree> {
+    fn parse(text: &str, old_tree: Option<&Tree>) -> Option<Tree> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_devicetree2::LANGUAGE.into())
             .ok()?;
-        let mut chunk: (&str, usize) = ("", usize::MAX);
-        let mut callback = |byte: usize, _point: Point| -> &[u8] {
-            if byte >= rope.len_bytes() {
-                return &[];
+        parser.parse(text, old_tree)
+    }
+
+    fn rebuild_line_starts(&mut self) {
+        self.line_starts.clear();
+        self.line_starts.push(0);
+        for (i, b) in self.text.bytes().enumerate() {
+            if b == b'\n' {
+                self.line_starts.push(i + 1);
             }
-            if !(byte >= chunk.1 && byte < chunk.1 + chunk.0.len()) {
-                let (text, byte_start, _, _) = rope.chunk_at_byte(byte);
-                chunk = (text, byte_start);
-            }
-            &chunk.0.as_bytes()[byte - chunk.1..]
-        };
-        parser.parse_with_options(&mut callback, old_tree, None)
+        }
     }
 
     pub fn apply_changes(
@@ -59,19 +57,17 @@ impl Document {
         for change in changes {
             match change.range {
                 Some(range) => {
-                    let start_byte = util::position_to_byte(&self.rope, range.start);
-                    let old_end_byte = util::position_to_byte(&self.rope, range.end);
-                    let start_point = util::byte_to_point(&self.rope, start_byte);
-                    let old_end_point = util::byte_to_point(&self.rope, old_end_byte);
+                    let start_byte = model::position_to_byte(self, range.start);
+                    let old_end_byte = model::position_to_byte(self, range.end);
+                    let start_point = model::byte_to_point(self, start_byte);
+                    let old_end_point = model::byte_to_point(self, old_end_byte);
 
-                    let start_char = self.rope.byte_to_char(start_byte);
-                    let old_end_char = self.rope.byte_to_char(old_end_byte);
-                    self.rope.remove(start_char..old_end_char);
-                    self.rope.insert(start_char, &change.text);
-                    self.text.replace_range(start_byte..old_end_byte, &change.text);
+                    self.text
+                        .replace_range(start_byte..old_end_byte, &change.text);
 
                     let new_end_byte = start_byte + change.text.len();
-                    let new_end_point = util::byte_to_point(&self.rope, new_end_byte);
+                    self.rebuild_line_starts();
+                    let new_end_point = model::byte_to_point(self, new_end_byte);
                     self.tree.edit(&InputEdit {
                         start_byte,
                         old_end_byte,
@@ -80,14 +76,14 @@ impl Document {
                         old_end_position: old_end_point,
                         new_end_position: new_end_point,
                     });
-                    if let Some(tree) = Self::parse(&self.rope, Some(&self.tree)) {
+                    if let Some(tree) = Self::parse(&self.text, Some(&self.tree)) {
                         self.tree = tree;
                     }
                 }
                 None => {
-                    self.rope = Rope::from_str(&change.text);
                     self.text = change.text.clone();
-                    self.tree = Self::parse(&self.rope, None).unwrap_or_else(Self::empty_tree);
+                    self.rebuild_line_starts();
+                    self.tree = Self::parse(&self.text, None).unwrap_or_else(Self::empty_tree);
                 }
             }
         }
@@ -125,14 +121,12 @@ impl Document {
         let start_byte = prefix;
         let old_end_byte = old.len() - suffix;
         let new_end_byte = new_text.len() - suffix;
-        let start_point = util::byte_to_point(&self.rope, start_byte);
-        let old_end_point = util::byte_to_point(&self.rope, old_end_byte);
-        let start_char = self.rope.byte_to_char(start_byte);
-        let old_end_char = self.rope.byte_to_char(old_end_byte);
-        self.rope.remove(start_char..old_end_char);
-        self.rope.insert(start_char, &new_text[prefix..new_end_byte]);
-        let new_end_point = util::byte_to_point(&self.rope, new_end_byte);
-        self.text = new_text.to_string();
+        let start_point = model::byte_to_point(self, start_byte);
+        let old_end_point = model::byte_to_point(self, old_end_byte);
+        self.text
+            .replace_range(start_byte..old_end_byte, &new_text[prefix..new_end_byte]);
+        self.rebuild_line_starts();
+        let new_end_point = model::byte_to_point(self, new_end_byte);
         self.tree.edit(&InputEdit {
             start_byte,
             old_end_byte,
@@ -141,13 +135,13 @@ impl Document {
             old_end_position: old_end_point,
             new_end_position: new_end_point,
         });
-        if let Some(tree) = Self::parse(&self.rope, Some(&self.tree)) {
+        if let Some(tree) = Self::parse(&self.text, Some(&self.tree)) {
             self.tree = tree;
         }
         true
     }
 
-    /// Byte-range text slice, from the mirrored plain-text copy.
+    /// Byte-range text slice.
     pub fn slice(&self, range: std::ops::Range<usize>) -> &str {
         self.text.get(range).unwrap_or("")
     }

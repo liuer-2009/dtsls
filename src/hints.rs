@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
-use tower_lsp::lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, Position, Range, Url};
+use tower_lsp::lsp_types::{
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip, MarkupContent, MarkupKind,
+    Position, Range, Url,
+};
 use tree_sitter::Node;
 
 use crate::document::Document;
-use crate::workspace::TuData;
-use crate::util;
+use crate::model::{self, RefKind, Tree};
+use crate::unit::TuData;
 
 // Range pruning bounds the work per request; this is only a pathological-
 // input guard.
@@ -40,8 +43,8 @@ pub fn inlay_hints(
         uri,
         unit,
         range,
-        range_start: util::position_to_byte(&doc.rope, range.start),
-        range_end: util::position_to_byte(&doc.rope, range.end),
+        range_start: model::position_to_byte(doc, range.start),
+        range_end: model::position_to_byte(doc, range.end),
     };
     let mut out = Vec::new();
     collect(doc.tree.root_node(), &ctx, &mut out);
@@ -74,11 +77,17 @@ fn collect(node: Node, ctx: &HintCtx, out: &mut Vec<InlayHint>) {
                     continue;
                 }
                 if let Some(name) = child.child_by_field_name("name") {
-                    props.insert(util::node_text(doc, name).to_string(), child);
+                    props.insert(model::node_text(doc, name).to_string(), child);
                 }
             }
         }
-        for (name, names_prop) in &props {
+        for (name, prop) in &props {
+            if name == "interrupts" {
+                emit_interrupt_parent_hint(*prop, doc, unit, range, out);
+                if out.len() >= MAX_HINTS {
+                    return;
+                }
+            }
             let Some(base) = name.strip_suffix("-names") else {
                 continue;
             };
@@ -86,7 +95,7 @@ fn collect(node: Node, ctx: &HintCtx, out: &mut Vec<InlayHint>) {
                 .into_iter()
                 .find_map(|candidate| props.get(&candidate).copied());
             if let Some(x_prop) = companion {
-                emit_pair(x_prop, *names_prop, doc, uri, unit, range, out);
+                emit_pair(x_prop, *prop, doc, uri, unit, range, out);
                 if out.len() >= MAX_HINTS {
                     return;
                 }
@@ -131,7 +140,7 @@ fn groups_of<'a>(prop: Node<'a>, doc: &'a Document) -> Vec<Group<'a>> {
 
 fn units_of_group(data: Node, doc: &Document) -> Vec<Unit> {
     let mut units = Vec::new();
-    if let Some(array) = util::find_child(data, "array") {
+    if let Some(array) = model::find_child(data, "array") {
         // cells are annotated after the array's closing `>`
         let array_end = array.end_byte();
         for i in 0..array.child_count() {
@@ -157,8 +166,8 @@ fn push_unit(node: Node, doc: &Document, units: &mut Vec<Unit>, hint_after: usiz
     }
     let ref_label = match node.kind() {
         "label" => return, // cell labels are not cells
-        "reference" => util::find_child(node, "label_ref").map(|lr| {
-            util::node_text(doc, lr)
+        "reference" => model::find_child(node, "label_ref").map(|lr| {
+            model::node_text(doc, lr)
                 .strip_prefix('&')
                 .unwrap_or_default()
                 .to_string()
@@ -190,9 +199,9 @@ fn emit_pair(
         if data.kind() != "prop_data" {
             continue;
         }
-        if let Some(string) = util::find_child(data, "string_literal") {
-            let name = util::node_text(doc, string).trim_matches('"').to_string();
-            let pos = util::byte_to_position(&doc.rope, string.end_byte());
+        if let Some(string) = model::find_child(data, "string_literal") {
+            let name = model::node_text(doc, string).trim_matches('"').to_string();
+            let pos = model::byte_to_position(doc, string.end_byte());
             names.push((name, pos));
         }
     }
@@ -202,7 +211,7 @@ fn emit_pair(
 
     let prop_name = x_prop
         .child_by_field_name("name")
-        .map(|n| util::node_text(doc, n).to_string())
+        .map(|n| model::node_text(doc, n).to_string())
         .unwrap_or_default();
 
     let mut forward: Vec<(Position, String)> = Vec::new();
@@ -216,7 +225,7 @@ fn emit_pair(
                 .last()
                 .map(|u| u.hint_after)
                 .unwrap_or_else(|| group.node.end_byte());
-            forward.push((util::byte_to_position(&doc.rope, end), names[i].0.clone()));
+            forward.push((model::byte_to_position(doc, end), names[i].0.clone()));
             reverse.push((names[i].1, format!("<{}>", group.text)));
         }
     } else {
@@ -233,9 +242,7 @@ fn emit_pair(
             let stride = units[pos]
                 .ref_label
                 .as_ref()
-                .and_then(|label| {
-                    cells_of_target(unit, uri, doc, label, &cells_name)
-                })
+                .and_then(|label| cells_of_target(unit, uri, doc, label, &cells_name))
                 .map(|c| 1 + c)
                 .or_else(|| {
                     if interrupt_parent {
@@ -265,7 +272,7 @@ fn emit_pair(
                 break;
             }
             let last = &units[pos + stride - 1];
-            forward.push((util::byte_to_position(&doc.rope, last.hint_after), name.clone()));
+            forward.push((model::byte_to_position(doc, last.hint_after), name.clone()));
             let slice = doc.slice(units[pos].start..last.end);
             reverse.push((names[i].1, format!("<{slice}>")));
             pos += stride;
@@ -325,7 +332,7 @@ fn cells_of_target(
         && let Some(def) = unit.labels.get(label)
     {
         if uri.to_file_path().ok().as_deref() == Some(def.file.as_path())
-            && let Some(value) = cells_from_doc(doc, &def.path, cells_name)
+            && let Some(value) = cells_at(doc, &def.path, cells_name)
         {
             return Some(value);
         }
@@ -336,51 +343,28 @@ fn cells_of_target(
             .map(|cell| cell.value);
     }
     // no unit: the label must be defined in this buffer
-    let path = local_label_path(doc, label)?;
-    cells_from_doc(doc, &path, cells_name)
+    let mut tree = Tree::new(doc);
+    let path = tree.display_path(tree.label(label)?);
+    cells_at(doc, &path, cells_name)
 }
 
-/// Node path of a label defined in this buffer.
-fn local_label_path(doc: &Document, label: &str) -> Option<String> {
-    fn walk(doc: &Document, node: Node, label: &str, found: &mut Option<String>) {
-        if found.is_some() {
-            return;
-        }
-        if node.kind() == "label" {
-            let text = util::node_text(doc, node);
-            if text.trim_end_matches(':') == label {
-                let owner = match node.parent() {
-                    Some(parent) if parent.kind() == "property" => {
-                        util::owning_node(parent).unwrap_or(parent)
-                    }
-                    Some(parent) => parent,
-                    None => node,
-                };
-                *found = Some(analysis_node_path(doc, owner));
-            }
-            return;
-        }
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                walk(doc, child, label, found);
-            }
-        }
-    }
-    let mut found = None;
-    walk(doc, doc.tree.root_node(), label, &mut found);
-    found
+/// `#*-cells` value of the node at a canonical path in this document.
+fn cells_at(doc: &Document, path: &str, cells_name: &str) -> Option<u32> {
+    let node = Tree::new(doc).node_at(path)?;
+    let prop = model::find_property(doc, node, cells_name)?;
+    model::property_u32(doc, prop)
 }
 
 /// `reg` entries are `#address-cells + #size-cells` wide, as advertised by
 /// the parent bus node (spec defaults: 2 and 2).
 fn reg_cells(doc: &Document, x_prop: Node, unit: Option<&TuData>) -> Option<u32> {
-    let owner = util::owning_node(x_prop)?;
+    let owner = model::owning_node(x_prop)?;
     // the bus is the parent node: a subnode or the root devicetree
     let bus = owner
         .parent()
         .and_then(|p| p.parent())
         .filter(|p| p.kind() == "subnode" || p.kind() == "devicetree")?;
-    let path = analysis_node_path(doc, bus);
+    let path = Tree::new(doc).display_path(bus);
     let cell = |name: &str| {
         unit.and_then(|unit| {
             unit.cells
@@ -388,56 +372,35 @@ fn reg_cells(doc: &Document, x_prop: Node, unit: Option<&TuData>) -> Option<u32>
                 .find(|cell| cell.path == path && cell.name == name)
                 .map(|cell| cell.value)
         })
-        .or_else(|| cells_from_doc(doc, &path, name))
+        .or_else(|| cells_at(doc, &path, name))
     };
     let address = cell("#address-cells").unwrap_or(DEFAULT_ADDRESS_CELLS);
     let size = cell("#size-cells").unwrap_or(DEFAULT_SIZE_CELLS);
     Some(address + size)
 }
 
-fn analysis_node_path(doc: &Document, node: Node) -> String {
-    crate::analysis::node_path(doc, node)
-}
-
-/// `interrupts` takes its stride from the interrupt-parent's
-/// `#interrupt-cells`, which may be inherited from an ancestor.
-fn interrupt_cells(doc: &Document, unit: Option<&TuData>, x_prop: Node) -> Option<u32> {
-    let mut owner = util::owning_node(x_prop)?;
+/// The `interrupt-parent` reference of this node or the nearest ancestor, in
+/// display form: `&intc` for a label ref, `&{/path}` for a path ref. The
+/// nearest `interrupt-parent` wins, like dtc's lookup.
+fn interrupt_parent_ref(doc: &Document, x_prop: Node) -> Option<String> {
+    let mut owner = model::owning_node(x_prop)?;
     loop {
-        if let Some(prop) = child_property(&owner, "interrupt-parent", doc) {
-            let reference = util::find_child(prop, "prop_data")
-                .and_then(|data| util::find_child(data, "reference"))
-                .or_else(|| util::find_child(prop, "reference"));
-            if let Some(reference) = reference {
-                let label = util::find_child(reference, "label_ref")
-                    .map(|label_ref| {
-                        util::node_text(doc, label_ref)
-                            .trim_start_matches('&')
-                            .to_string()
-                    })
-                    .unwrap_or_default();
-                if let Some(unit) = unit
-                    && let Some(def) = unit.labels.get(&label)
-                    && let Some(cell) = unit
-                        .cells
-                        .iter()
-                        .find(|cell| cell.path == def.path && cell.name == "#interrupt-cells")
-                {
-                    return Some(cell.value);
-                }
-                if let Some(path) = local_label_path(doc, &label)
-                    && let Some(value) = cells_from_doc(doc, &path, "#interrupt-cells")
-                {
-                    return Some(value);
-                }
-                return None;
+        if let Some(prop) = model::find_property(doc, owner, "interrupt-parent") {
+            let reference = model::find_descendant(prop, "reference");
+            if let Some(reference) = reference
+                && let Some(kind) = model::reference_of(doc, reference)
+            {
+                return Some(match kind {
+                    RefKind::Label(label) => format!("&{label}"),
+                    RefKind::Path(path) => path.to_string(),
+                });
             }
         }
-        // inherit: walk up to the parent node
+        // inherit: walk up to the parent node (a subnode or the root devicetree)
         let parent = owner
             .parent()
             .and_then(|p| p.parent())
-            .filter(|p| p.kind() == "subnode");
+            .filter(|p| p.kind() == "subnode" || p.kind() == "devicetree");
         match parent {
             Some(p) => owner = p,
             None => return None,
@@ -445,94 +408,102 @@ fn interrupt_cells(doc: &Document, unit: Option<&TuData>, x_prop: Node) -> Optio
     }
 }
 
-fn child_property<'a>(container: &Node<'a>, name: &str, doc: &Document) -> Option<Node<'a>> {
-    for i in 0..container.child_count() {
-        let Some(child) = container.child(i as u32) else { continue };
-        if child.kind() != "property" {
-            continue;
-        }
-        if child
-            .child_by_field_name("name")
-            .is_some_and(|n| util::node_text(doc, n) == name)
-        {
-            return Some(child);
-        }
+/// `interrupts` takes its stride from the interrupt-parent's
+/// `#interrupt-cells`, which may be inherited from an ancestor.
+fn interrupt_cells(doc: &Document, unit: Option<&TuData>, x_prop: Node) -> Option<u32> {
+    let display = interrupt_parent_ref(doc, x_prop)?;
+    let label = display.strip_prefix('&')?;
+    if label.starts_with('{') {
+        // `&{/path}` parent: the cells lookup below is label-keyed
+        return None;
     }
-    None
+    if let Some(unit) = unit
+        && let Some(def) = unit.labels.get(label)
+        && let Some(cell) = unit
+            .cells
+            .iter()
+            .find(|cell| cell.path == def.path && cell.name == "#interrupt-cells")
+    {
+        return Some(cell.value);
+    }
+    let mut tree = Tree::new(doc);
+    let path = tree.display_path(tree.label(label)?);
+    cells_at(doc, &path, "#interrupt-cells")
 }
 
-fn cells_from_doc(doc: &Document, path: &str, cells_name: &str) -> Option<u32> {
-    let body = find_node_by_path(doc.tree.root_node(), path, doc)?;
-    let prop = child_property(&body, cells_name, doc)?;
-    let value: String = (0..prop.child_count()).find_map(|i| {
-        let data = prop.child(i as u32)?;
-        if data.kind() != "prop_data" {
-            return None;
-        }
-            let text = match util::find_child(data, "array") {
-                Some(array) => util::node_text(doc, array)
-                    .trim_matches(|c| c == '<' || c == '>')
-                    .to_string(),
-                None => util::node_text(doc, data).to_string(),
-            };
-            parse_int(&text).map(|_| text)
-        })?;
-    parse_int(&value)
-}
+/// `interrupts` specifiers belong to the controller named by
+/// `interrupt-parent` (on this node or an ancestor). Render that controller
+/// as an inlay hint at the value start so the reader sees who the cells are
+/// addressed to. A trailing phandle cell in the value (GICv3's 4-cell form)
+/// selects a PPI partition, not the controller — the hint still shows the
+/// interrupt-parent, which is exactly the disambiguation a reader needs there.
+fn emit_interrupt_parent_hint(
+    x_prop: Node,
+    doc: &Document,
+    unit: Option<&TuData>,
+    range: &Range,
+    out: &mut Vec<InlayHint>,
+) {
+    if out.len() >= MAX_HINTS {
+        return;
+    }
+    let Some(display) = interrupt_parent_ref(doc, x_prop) else {
+        return;
+    };
+    // position: the start of the value (the first prop_data, i.e. the `<`)
+    let Some(value_byte) = (0..x_prop.child_count()).find_map(|i| {
+        let child = x_prop.child(i as u32)?;
+        (child.kind() == "prop_data").then_some(child.start_byte())
+    }) else {
+        return;
+    };
+    let position = model::byte_to_position(doc, value_byte);
+    if !position_in_range(&position, range) {
+        return;
+    }
 
-/// Body (`node_def`/`devicetree`) of the node at `path`. Accepts the root
-/// written either as a `devicetree` node or as a plain `node_def`.
-fn find_node_by_path<'a>(root: Node<'a>, path: &str, doc: &'a Document) -> Option<Node<'a>> {
-    let mut current = None;
-    for i in 0..root.child_count() {
-        if let Some(child) = root.child(i as u32) {
-            if child.kind() == "devicetree" && util::find_child(child, "reference").is_none() {
-                current = Some(child);
-                break;
-            }
-            if child.kind() == "node_def" {
-                current = Some(child);
-                break;
-            }
+    let mut tooltip_lines = vec![format!("`{display}` from `interrupt-parent`")];
+    let bare = display.strip_prefix('&').unwrap_or(&display);
+    let controller = match (unit, bare.starts_with('{')) {
+        (Some(unit), false) => unit.labels.get(bare).and_then(|def| {
+            let cells = unit
+                .cells
+                .iter()
+                .find(|cell| cell.path == def.path && cell.name == "#interrupt-cells")
+                .map(|cell| cell.value);
+            Some((def.path.clone(), cells))
+        }),
+        (_, false) => {
+            let mut tree = Tree::new(doc);
+            tree.label(bare).map(|node| {
+                let path = tree.display_path(node);
+                let cells = model::find_property(doc, node, "#interrupt-cells")
+                    .and_then(|prop| model::property_u32(doc, prop));
+                (path, cells)
+            })
+        }
+        _ => None,
+    };
+    if let Some((path, cells)) = controller {
+        tooltip_lines.push(format!("controller at `{path}`"));
+        if let Some(value) = cells {
+            tooltip_lines.push(format!("`#interrupt-cells` = <{value}>"));
         }
     }
-    let mut current = current?;
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
-        let body = if current.kind() == "node_def" {
-            current
-        } else {
-            util::node_def_of(current)?
-        };
-        let mut next = None;
-        for i in 0..body.child_count() {
-            if let Some(candidate) = body.child(i as u32) {
-                if candidate.kind() != "subnode" {
-                    continue;
-                }
-                let matches = candidate
-                    .child_by_field_name("name")
-                    .is_some_and(|n| util::node_text(doc, n) == segment);
-                if matches {
-                    next = Some(candidate);
-                    break;
-                }
-            }
-        }
-        current = next?;
-    }
-    Some(if current.kind() == "node_def" {
-        current
-    } else {
-        util::node_def_of(current)?
-    })
-}
 
-fn parse_int(text: &str) -> Option<u32> {
-    let text = text.trim();
-    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        return u32::from_str_radix(hex, 16).ok();
-    }
-    text.parse::<u32>().ok()
+    out.push(InlayHint {
+        position,
+        label: InlayHintLabel::String(display),
+        kind: Some(InlayHintKind::PARAMETER),
+        tooltip: Some(InlayHintTooltip::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: tooltip_lines.join("  \n"),
+        })),
+        padding_left: Some(true),
+        padding_right: Some(true),
+        text_edits: None,
+        data: None,
+    });
 }
 
 #[cfg(test)]
@@ -574,13 +545,60 @@ mod tests {
     fn packed_interrupts_use_interrupt_parent_cells() {
         let text = "/dts-v1/;\n\n/ {\n    intc: interrupt-controller@1000 {\n        #interrupt-cells = <3>;\n    };\n\n    uart {\n        interrupt-parent = <&intc>;\n        interrupts = <GIC_SPI 32 4 GIC_SPI 33 4>;\n        interrupt-names = \"rx\", \"tx\";\n    };\n};\n";
         let hints = hints_for(text);
-        let ints: Vec<_> = hints.iter().filter(|(l, _)| *l == 10).map(|(_, s)| s).collect();
+        let ints: Vec<_> = hints
+            .iter()
+            .filter(|(l, s)| *l == 10 && (*s == "rx" || *s == "tx"))
+            .map(|(_, s)| s)
+            .collect();
         assert_eq!(ints.len(), 2, "hints: {:?}", hints);
         assert_eq!(ints[0], "rx");
         assert_eq!(ints[1], "tx");
         let names: Vec<_> = hints.iter().filter(|(l, _)| *l == 11).map(|(_, s)| s).collect();
         assert_eq!(names[0], "<GIC_SPI 32 4>");
         assert_eq!(names[1], "<GIC_SPI 33 4>");
+    }
+
+    #[test]
+    fn interrupts_hint_shows_the_interrupt_parent() {
+        let text = "/dts-v1/;\n\n/ {\n    intc: interrupt-controller@1000 {\n        #interrupt-cells = <3>;\n    };\n\n    uart {\n        interrupt-parent = <&intc>;\n        interrupts = <GIC_SPI 0 4>;\n    };\n};\n";
+        let hints = hints_for(text);
+        let parent: Vec<_> = hints
+            .iter()
+            .filter(|(l, s)| *l == 10 && s.starts_with('&'))
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(parent.len(), 1, "hints: {:?}", hints);
+        assert_eq!(parent[0], "&intc");
+    }
+
+    #[test]
+    fn interrupts_hint_inherits_from_an_ancestor() {
+        // interrupt-parent sits on the root, interrupts two levels deep
+        let text = "/dts-v1/;\n\n/ {\n    interrupt-parent = <&intc>;\n\n    intc: interrupt-controller@1000 {\n        #interrupt-cells = <2>;\n    };\n\n    bus {\n        dev {\n            interrupts = <5 6>;\n        };\n    };\n};\n";
+        let hints = hints_for(text);
+        let parent: Vec<_> = hints
+            .iter()
+            .filter(|(l, s)| *l == 12 && s.starts_with('&'))
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(parent.len(), 1, "{hints:?}");
+        assert_eq!(parent[0], "&intc");
+    }
+
+    #[test]
+    fn partition_phandle_does_not_suppress_the_parent_hint() {
+        // GICv3 4-cell form: the trailing &ppi_cluster0 selects a PPI
+        // partition, not the controller — the hint shows the inherited
+        // interrupt-parent (&intc), which is the actual disambiguation
+        let text = "/dts-v1/;\n\n/ {\n    interrupt-parent = <&intc>;\n\n    intc: interrupt-controller@1000 {\n        #interrupt-cells = <4>;\n\n        ppi_cluster0: partition-0 {\n            affinity = <&cpu0>;\n        };\n    };\n\n    pmu-a520 {\n        interrupts = <GIC_PPI 7 4 &ppi_cluster0>;\n    };\n};\n";
+        let hints = hints_for(text);
+        // interrupts is on 0-based line 14
+        let parent: Vec<_> = hints
+            .iter()
+            .filter(|(l, s)| *l == 15 && s.starts_with('&'))
+            .map(|(_, s)| s.clone())
+            .collect();
+        assert_eq!(parent, ["&intc"], "{hints:?}");
     }
 
     #[test]

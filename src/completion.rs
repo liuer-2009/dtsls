@@ -5,15 +5,9 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::Node;
 
-use crate::analysis;
 use crate::document::Document;
-use crate::workspace::DefineMap;
-use crate::util;
-
-/// label -> (node path, defining file name). An empty file name means the
-/// label is defined in the file the index entry belongs to.
-#[cfg_attr(not(test), allow(dead_code))]
-pub type LabelMap = HashMap<String, (String, String)>;
+use crate::unit::DefineMap;
+use crate::model;
 
 /// What kind of completion the cursor is in.
 #[derive(Debug, PartialEq, Eq)]
@@ -38,13 +32,13 @@ pub fn completion_context(doc: &Document, cursor: usize) -> Option<Context> {
     if let Some(context) = compatible_context(doc, cursor) {
         return Some(context);
     }
-    let cursor = cursor.min(doc.rope.len_bytes());
-    let line = doc.rope.byte_to_line(cursor);
-    let line_start = doc.rope.line_to_byte(line);
+    let cursor = cursor.min(doc.text.len());
+    let line_start = model::line_start_of(&doc.text, cursor);
     let mut start = cursor;
     while start > line_start {
-        let b = doc.rope.byte(start - 1);
-        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+        let b = doc.text.as_bytes()[start - 1];
+        // `#` is a legal first character of dt property names (`#clock-cells`)
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'#' {
             start -= 1;
         } else {
             break;
@@ -53,7 +47,7 @@ pub fn completion_context(doc: &Document, cursor: usize) -> Option<Context> {
     if start == cursor {
         // no word typed: right after `&` offer labels, right after `<` macros
         if cursor > 0 {
-            match doc.rope.byte(cursor - 1) {
+            match doc.text.as_bytes()[cursor - 1] {
                 b'&' => return Some(Context::Labels(String::new())),
                 b'<' => return Some(Context::Defines(String::new())),
                 _ => {}
@@ -62,7 +56,7 @@ pub fn completion_context(doc: &Document, cursor: usize) -> Option<Context> {
         return None;
     }
     let word = doc.slice(start..cursor).to_string();
-    if start > 0 && doc.rope.byte(start - 1) == b'&' {
+    if start > 0 && doc.text.as_bytes()[start - 1] == b'&' {
         return Some(Context::Labels(word));
     }
     let macro_case = word.chars().next().is_some_and(|c| c.is_ascii_uppercase())
@@ -85,8 +79,8 @@ pub fn completion_context(doc: &Document, cursor: usize) -> Option<Context> {
 /// stage (after `vendor,`). Works on the raw line so it also fires while the
 /// string is still unterminated (everything is mid-typing).
 fn compatible_context(doc: &Document, cursor: usize) -> Option<Context> {
-    let cursor = cursor.min(doc.rope.len_bytes());
-    let line_start = doc.rope.line_to_byte(doc.rope.byte_to_line(cursor));
+    let cursor = cursor.min(doc.text.len());
+    let line_start = model::line_start_of(&doc.text, cursor);
     let head = doc.slice(line_start..cursor);
     // an odd number of quotes means the cursor sits inside a string
     if head.matches('"').count() % 2 == 0 {
@@ -141,7 +135,7 @@ pub fn is_endpoint_or_port(doc: &Document, node: Node<'_>) -> bool {
     let Some(name) = node.child_by_field_name("name") else {
         return false;
     };
-    let name = util::node_text(doc, name);
+    let name = model::node_text(doc, name);
     let base = name.split('@').next().unwrap_or(name);
     base == "endpoint" || base == "port"
 }
@@ -202,7 +196,7 @@ pub fn text_node(doc: &Document, byte: usize) -> Option<TextNode> {
 fn text_header(doc: &Document, byte: usize) -> Option<TextHeader> {
     let text = &doc.text;
     let cursor = byte.min(text.len());
-    let (open, block_end) = enclosing_brace(text.as_bytes(), cursor)?;
+    let (open, block_end) = enclosing_brace(text, cursor)?;
     let mut name = header_name(text, open);
     let mut content_start = open + 1;
     let mut content_end = block_end;
@@ -220,118 +214,28 @@ fn text_header(doc: &Document, byte: usize) -> Option<TextHeader> {
 }
 
 /// Innermost brace still open at `cursor`, plus the byte where its block ends
-/// (the closing brace, or EOF when it is missing). Runs over a whole 200 KB
-/// file: the special bytes are collected with vectorized scans first so the
-/// per-token work is a handful of comparisons.
-fn enclosing_brace(bytes: &[u8], cursor: usize) -> Option<(usize, usize)> {
-    let len = bytes.len();
-    let opens: Vec<usize> = memchr::memchr_iter(b'{', bytes).collect();
-    let closes: Vec<usize> = memchr::memchr_iter(b'}', bytes).collect();
-    let quotes: Vec<usize> = memchr::memchr_iter(b'"', bytes).collect();
-    let slashes: Vec<usize> = memchr::memchr_iter(b'/', bytes).collect();
-    let (mut oi, mut ci, mut qi, mut si) = (0, 0, 0, 0);
+/// (the closing brace, or EOF when it is missing).
+fn enclosing_brace(text: &str, cursor: usize) -> Option<(usize, usize)> {
     let mut stack: Vec<usize> = Vec::new();
-    let mut open: Option<usize> = None;
-    let mut target_depth = 0;
-    loop {
-        let mut next = len;
-        if oi < opens.len() {
-            next = next.min(opens[oi]);
+    let mut open: Option<(usize, usize)> = None; // (brace byte, stack depth)
+    for (offset, byte) in model::brace_offsets(text, 0) {
+        if open.is_none() && offset >= cursor {
+            let brace = *stack.last()?;
+            open = Some((brace, stack.len()));
         }
-        if ci < closes.len() {
-            next = next.min(closes[ci]);
-        }
-        if qi < quotes.len() {
-            next = next.min(quotes[qi]);
-        }
-        if si < slashes.len() {
-            next = next.min(slashes[si]);
-        }
-        if next >= len {
-            break;
-        }
-        // record the stack as of the cursor before a token at/after it
-        if open.is_none() && next >= cursor {
-            open = stack.last().copied();
-            if open.is_none() {
-                return None;
-            }
-            target_depth = stack.len();
-        }
-        if oi < opens.len() && opens[oi] == next {
-            stack.push(next);
-            oi += 1;
-        } else if ci < closes.len() && closes[ci] == next {
+        if byte == b'{' {
+            stack.push(offset);
+        } else if let Some((_, depth)) = open {
             stack.pop();
-            ci += 1;
-            if open.is_some() && stack.len() < target_depth {
-                return Some((open.unwrap(), next));
+            if stack.len() < depth {
+                return Some((open.unwrap().0, offset));
             }
-        } else if qi < quotes.len() && quotes[qi] == next {
-            // skip the string: its closing quote is the next unescaped one
-            let mut string_end = len;
-            qi += 1;
-            while qi < quotes.len() {
-                let quote = quotes[qi];
-                qi += 1;
-                if !escaped(bytes, quote) {
-                    string_end = quote;
-                    break;
-                }
-            }
-            // slashes and braces inside the string are not syntax
-            while oi < opens.len() && opens[oi] < string_end {
-                oi += 1;
-            }
-            while ci < closes.len() && closes[ci] < string_end {
-                ci += 1;
-            }
-            while si < slashes.len() && slashes[si] < string_end {
-                si += 1;
-            }
-        } else if si < slashes.len() && slashes[si] == next {
-            let slash = next;
-            si += 1;
-            let skip_to = if slash + 1 < len && bytes[slash + 1] == b'*' {
-                memchr::memmem::find(&bytes[slash + 2..], b"*/")
-                    .map(|offset| slash + 2 + offset + 2)
-                    .unwrap_or(len)
-            } else if slash + 1 < len && bytes[slash + 1] == b'/' {
-                memchr::memchr(b'\n', &bytes[slash..])
-                    .map(|offset| slash + offset + 1)
-                    .unwrap_or(len)
-            } else {
-                slash + 1
-            };
-            while oi < opens.len() && opens[oi] < skip_to {
-                oi += 1;
-            }
-            while ci < closes.len() && closes[ci] < skip_to {
-                ci += 1;
-            }
-            while qi < quotes.len() && quotes[qi] < skip_to {
-                qi += 1;
-            }
-            while si < slashes.len() && slashes[si] < skip_to {
-                si += 1;
-            }
+        } else {
+            stack.pop();
         }
     }
-    // no token at or after the cursor: the stack as of EOF is the answer
-    if open.is_none() {
-        open = Some(stack.last().copied()?);
-    }
-    open.map(|open| (open, len))
-}
-
-fn escaped(bytes: &[u8], index: usize) -> bool {
-    let mut backslashes = 0;
-    let mut i = index;
-    while i > 0 && bytes[i - 1] == b'\\' {
-        backslashes += 1;
-        i -= 1;
-    }
-    backslashes % 2 == 1
+    let (brace, _) = open.or_else(|| stack.last().map(|&b| (b, stack.len())))?;
+    Some((brace, text.len()))
 }
 
 fn header_name(text: &str, brace: usize) -> String {
@@ -360,19 +264,7 @@ fn line_indent_at(text: &str, byte: usize) -> usize {
     let line_start = text[..byte.min(text.len())]
         .rfind('\n')
         .map_or(0, |pos| pos + 1);
-    indent_of(&text[line_start..])
-}
-
-fn indent_of(line: &str) -> usize {
-    let mut indent = 0;
-    for c in line.chars() {
-        match c {
-            '\t' => indent += 8 - (indent % 8),
-            ' ' => indent += 1,
-            _ => break,
-        }
-    }
-    indent
+    model::indent_of(&text[line_start..])
 }
 
 /// A node header written without its `{` yet, deeper than the enclosing block.
@@ -404,9 +296,9 @@ fn braceless_header(
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_alphanumeric() || c == '&' || c == '_' || c == '/')
-            && indent_of(line) > open_indent;
+            && model::indent_of(line) > open_indent;
         if looks_like_header {
-            found = Some((node_name_from_header(trimmed), indent_of(line), line_end));
+            found = Some((node_name_from_header(trimmed), model::indent_of(line), line_end));
         }
         if line_end >= text.len() {
             break;
@@ -425,7 +317,7 @@ fn indent_bound(text: &str, start: usize, indent: usize, block_end: usize) -> us
             .find('\n')
             .map_or(text.len(), |offset| pos + offset);
         let line = &text[pos..line_end];
-        if !line.trim().is_empty() && indent_of(line) <= indent {
+        if !line.trim().is_empty() && model::indent_of(line) <= indent {
             return pos;
         }
         pos = line_end + 1;
@@ -594,20 +486,20 @@ pub fn label_definition(doc: &Document, label: &str) -> Option<Range> {
         if found.is_some() || node.kind() != "label" {
             return;
         }
-        let text = util::node_text(doc, node);
+        let text = model::node_text(doc, node);
         if text.trim_end_matches(':') != label {
             return;
         }
         let owner = match node.parent() {
             Some(parent) if parent.kind() == "property" => {
-                util::owning_node(parent).unwrap_or(parent)
+                model::owning_node(parent).unwrap_or(parent)
             }
             Some(parent) => parent,
             None => node,
         };
         found = Some(Range {
-            start: util::byte_to_position(&doc.rope, owner.start_byte()),
-            end: util::byte_to_position(&doc.rope, owner.end_byte()),
+            start: model::byte_to_position(doc, owner.start_byte()),
+            end: model::byte_to_position(doc, owner.end_byte()),
         });
     });
     found
@@ -620,16 +512,16 @@ pub fn label_references(doc: &Document, label: &str) -> Vec<Range> {
         if node.kind() != "reference" {
             return;
         }
-        let Some(label_ref) = util::find_child(node, "label_ref") else {
+        let Some(label_ref) = model::find_child(node, "label_ref") else {
             return;
         };
-        let text = util::node_text(doc, label_ref);
+        let text = model::node_text(doc, label_ref);
         if text.trim_start_matches('&') != label {
             return;
         }
         out.push(Range {
-            start: util::byte_to_position(&doc.rope, node.start_byte()),
-            end: util::byte_to_position(&doc.rope, node.end_byte()),
+            start: model::byte_to_position(doc, node.start_byte()),
+            end: model::byte_to_position(doc, node.end_byte()),
         });
     });
     out
@@ -641,17 +533,17 @@ pub fn same_file_define_items(doc: &Document, prefix: &str) -> Vec<CompletionIte
     walk_tree(doc.tree.root_node(), &mut |node| match node.kind() {
         "preproc_def" => {
             if let Some(name) = node.child_by_field_name("name") {
-                let name = util::node_text(doc, name).to_string();
+                let name = model::node_text(doc, name).to_string();
                 let value = node
                     .child_by_field_name("value")
-                    .map(|value| summarize_value(util::node_text(doc, value)))
+                    .map(|value| summarize_value(model::node_text(doc, value)))
                     .unwrap_or_default();
                 defines.insert(name, (value, String::new()));
             }
         }
         "preproc_undef" => {
             if let Some(name) = node.child_by_field_name("name") {
-                defines.remove(util::node_text(doc, name));
+                defines.remove(model::node_text(doc, name));
             }
         }
         _ => {}
@@ -823,20 +715,6 @@ pub fn label_item(label: &str, path: &str, file: &str) -> CompletionItem {
     item(label, &detail, CompletionItemKind::VARIABLE)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn items_from_index(labels: &LabelMap, prefix: &str) -> Vec<CompletionItem> {
-    let mut items: Vec<CompletionItem> = labels
-        .iter()
-        .filter(|(label, _)| label.starts_with(prefix))
-        .map(|(label, (path, file))| {
-            let detail = detail(path.as_str(), file.as_str());
-            item(label, &detail, CompletionItemKind::VARIABLE)
-        })
-        .collect();
-    items.sort_by(|a, b| a.label.cmp(&b.label));
-    items
-}
-
 pub fn items_from_defines(defines: &DefineMap, prefix: &str) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = defines
         .iter()
@@ -853,7 +731,7 @@ pub fn items_from_defines(defines: &DefineMap, prefix: &str) -> Vec<CompletionIt
 /// Fallback for the first completion right after opening a document, before
 /// the background index has landed: walk the current tree synchronously.
 pub fn same_file_items(doc: &Document) -> Vec<CompletionItem> {
-    let analysis = analysis::analyze(doc);
+    let analysis = model::analyze(doc);
     let mut items: Vec<CompletionItem> = analysis
         .labels
         .iter()
@@ -866,12 +744,11 @@ pub fn same_file_items(doc: &Document) -> Vec<CompletionItem> {
 /// Where is the cursor relative to a label? Reference context (`&label`)
 /// or definition context (`label:`) both resolve to the label name.
 pub fn label_at_cursor(doc: &Document, cursor: usize) -> Option<String> {
-    let cursor = cursor.min(doc.rope.len_bytes());
-    let line = doc.rope.byte_to_line(cursor);
-    let line_start = doc.rope.line_to_byte(line);
+    let cursor = cursor.min(doc.text.len());
+    let line_start = model::line_start_of(&doc.text, cursor);
     let mut start = cursor;
     while start > line_start {
-        let b = doc.rope.byte(start - 1);
+        let b = doc.text.as_bytes()[start - 1];
         if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
             start -= 1;
         } else {
@@ -879,8 +756,8 @@ pub fn label_at_cursor(doc: &Document, cursor: usize) -> Option<String> {
         }
     }
     let mut end = cursor;
-    while end < doc.rope.len_bytes() {
-        let b = doc.rope.byte(end);
+    while end < doc.text.len() {
+        let b = doc.text.as_bytes()[end];
         if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
             end += 1;
         } else {
@@ -891,10 +768,10 @@ pub fn label_at_cursor(doc: &Document, cursor: usize) -> Option<String> {
         return None;
     }
     let word = doc.slice(start..end).to_string();
-    if start > 0 && doc.rope.byte(start - 1) == b'&' {
+    if start > 0 && doc.text.as_bytes()[start - 1] == b'&' {
         return Some(word);
     }
-    if doc.slice(end..(end + 1).min(doc.rope.len_bytes())) == ":" {
+    if doc.slice(end..(end + 1).min(doc.text.len())) == ":" {
         return Some(word);
     }
     None
@@ -923,6 +800,99 @@ pub fn completion_list(items: Vec<CompletionItem>) -> CompletionList {
         is_incomplete: false,
         items,
     }
+}
+
+/// What the node around `byte` looks like for completion: its binding, the
+/// property names it already has, and whether it can still take a
+/// `compatible`. The syntax tree is preferred; a half-written node makes
+/// tree-sitter collapse the region into a single ERROR node, so the raw text
+/// is used as a fallback.
+struct NodeView {
+    binding: Option<std::sync::Arc<crate::bindings::Binding>>,
+    existing: std::collections::HashSet<String>,
+    can_add_compatible: bool,
+}
+
+fn node_view(doc: &Document, byte: usize, bindings: &crate::bindings::BindingIndex) -> NodeView {
+    let mut existing = std::collections::HashSet::new();
+    let mut compatibles = None;
+    let mut endpoint = None;
+    let mut in_node = false;
+    // A node starting on the cursor's own line is not the one being typed
+    // inside: error recovery glues the partial line onto the *following*
+    // node, so its compatible would win. Only nodes whose header is above the
+    // cursor are trusted; the text reader handles the rest.
+    let line_start = doc.text[..byte.min(doc.text.len())]
+        .rfind('\n')
+        .map_or(0, |pos| pos + 1);
+    if let Some(node) = enclosing_node(doc, byte)
+        && node.start_byte() < line_start
+    {
+        in_node = true;
+        compatibles = crate::diagnostics::compatible_strings(doc, node);
+        endpoint = Some(is_endpoint_or_port(doc, node));
+        if let Some(body) = model::node_def_of(node) {
+            for i in 0..body.child_count() {
+                let Some(child) = body.child(i as u32) else { continue };
+                if child.kind() == "property"
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    existing.insert(model::node_text(doc, name).to_string());
+                } else if child.kind() == "subnode"
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    // child nodes (`ports`, `mdio`, ...) are declared under
+                    // `properties:` too, so they count as already present
+                    let name = model::node_text(doc, name);
+                    existing.insert(name.split('@').next().unwrap_or(name).to_string());
+                }
+            }
+        }
+    }
+    if compatibles.is_none() {
+        // incomplete node: read compatible/properties from the text
+        if let Some(text_node) = text_node(doc, byte) {
+            in_node = true;
+            endpoint.get_or_insert_with(|| text_node.is_endpoint_or_port());
+            existing.extend(text_node.properties);
+            if !text_node.compatibles.is_empty() {
+                compatibles = Some(text_node.compatibles);
+            }
+        }
+    }
+    let endpoint = endpoint.unwrap_or_else(|| in_endpoint_or_port(doc, byte));
+    let binding = compatibles.as_ref().and_then(|list| bindings.lookup(list));
+    // the `compatible` snippet only makes sense inside a node — top-level
+    // directives (`#include`, `/dts-v1/`) have no node context
+    let can_add_compatible =
+        in_node && !endpoint && compatibles.is_none() && !existing.contains("compatible");
+    NodeView {
+        binding,
+        existing,
+        can_add_compatible,
+    }
+}
+
+/// Binding-based property completion for the node enclosing `byte`, plus the
+/// `compatible` snippet when the node can still take one.
+pub fn property_completion(
+    doc: &Document,
+    byte: usize,
+    prefix: &str,
+    bindings: &crate::bindings::BindingIndex,
+) -> Vec<CompletionItem> {
+    let view = node_view(doc, byte, bindings);
+    let mut items = view
+        .binding
+        .as_ref()
+        .map(|binding| items_from_binding(binding, &view.existing, prefix))
+        .unwrap_or_default();
+    if view.can_add_compatible
+        && let Some(item) = compatible_property_item(prefix)
+    {
+        items.push(item);
+    }
+    items
 }
 
 #[cfg(test)]
@@ -1067,7 +1037,7 @@ mod tests {
             required_any: Vec::new(),
             strict: false,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         };
         let mut existing = std::collections::HashSet::new();
         let items = items_from_binding(&binding, &existing, "");
@@ -1146,6 +1116,59 @@ mod tests {
     }
 
     #[test]
+    fn hash_prefixed_property_position_detected() {
+        // `#` is a legal first character of dt property names
+        let text = "/ {\n    node {\n        #address-cells = <1>;\n        #siz\n    };\n};\n";
+        assert_eq!(
+            context_at(text, "#siz"),
+            Some(Context::Properties("#siz".to_string()))
+        );
+        // cursor right after `#`
+        assert_eq!(
+            context_at(text, "#"),
+            Some(Context::Properties("#".to_string()))
+        );
+    }
+
+    #[test]
+    fn top_level_directive_gets_no_compatible_snippet() {
+        // `#include <...>` lines have no node context: property completion
+        // must not offer the `compatible` snippet there
+        let text = "/dts-v1/;\n#include <dt-bindings/clock.h>\n#inc\n";
+        let doc = Document::open(text, 0);
+        let byte = text.rfind("#inc").unwrap() + 4;
+        let items = property_completion(&doc, byte, "#inc", &crate::bindings::BindingIndex::default());
+        assert!(items.is_empty(), "items: {items:?}");
+    }
+
+    #[test]
+    fn hash_property_items_match_the_hash_prefix() {
+        use crate::bindings::Binding;
+        use tower_lsp::lsp_types::Url;
+        let text = "/ {\n    node {\n        compatible = \"acme,widget\";\n        #siz\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let byte = text.rfind("#siz").unwrap() + 4;
+        let bindings = crate::bindings::BindingIndex::default();
+        bindings.insert_for_test(crate::bindings::Binding {
+            uri: Url::parse("file:///w.yaml").unwrap(),
+            singles: vec!["acme,widget".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "#size-cells"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required: vec!["compatible".to_string()],
+            required_any: Vec::new(),
+            strict: true,
+            refs_complete: true,
+            patterns: regex::RegexSet::empty(),
+        });
+        let items = property_completion(&doc, byte, "#siz", &bindings);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["#size-cells"], "items: {labels:?}");
+    }
+
+    #[test]
     fn binding_items_are_required_first_and_deduped() {
         use crate::bindings::Binding;
         use std::collections::HashSet;
@@ -1161,7 +1184,7 @@ mod tests {
             required_any: Vec::new(),
             strict: true,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         };
         let existing = HashSet::from(["compatible".to_string()]);
         let items = items_from_binding(&binding, &existing, "");
@@ -1180,23 +1203,6 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "uart0");
         assert_eq!(items[0].detail.as_deref(), Some("/soc/serial@1000"));
-    }
-
-    #[test]
-    fn items_from_index_are_filtered_and_tagged() {
-        let mut labels = LabelMap::new();
-        labels.insert("uart0".to_string(), ("/serial@1000".to_string(), String::new()));
-        labels.insert(
-            "intc".to_string(),
-            ("/interrupt-controller@1000".to_string(), "soc.dtsi".to_string()),
-        );
-        let items = items_from_index(&labels, "u");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "uart0");
-        assert_eq!(items[0].detail.as_deref(), Some("/serial@1000"));
-        let all = items_from_index(&labels, "");
-        assert_eq!(all.len(), 2);
-        assert!(all[0].detail.as_deref().unwrap().contains("soc.dtsi"));
     }
 
     #[test]
@@ -1219,6 +1225,134 @@ mod tests {
             .find(|i| i.label == "IRQ_TYPE_EDGE_RISING")
             .unwrap();
         assert_eq!(irq.detail.as_deref(), Some("1 — irq.h"));
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use crate::bindings::Binding;
+    use crate::bindings::BindingIndex;
+    use tower_lsp::lsp_types::Url;
+
+    fn widget_bindings() -> BindingIndex {
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(Binding {
+            uri: Url::parse("file:///mmc.yaml").unwrap(),
+            singles: vec!["acme,mmc".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "reg", "clocks", "clock-names"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required: vec!["compatible".to_string()],
+            required_any: Vec::new(),
+            strict: true,
+            refs_complete: true,
+            patterns: regex::RegexSet::empty(),
+        });
+        bindings
+    }
+
+    #[test]
+    fn property_items_work_in_a_half_written_node() {
+        // compatible accepted, but no `;` and no closing braces yet
+        let text = "/dts-v1/;\n\n/ {\n    mmc@8804000 {\n        compatible = \"acme,mmc\"\n        clo\n";
+        let doc = Document::open(text, 0);
+        let bindings = widget_bindings();
+        let byte = text.rfind("clo").unwrap() + 3;
+        let items = property_completion(&doc, byte, "clo", &bindings);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["clock-names", "clocks"], "items: {labels:?}");
+        // the node already has a compatible, so no snippet is offered
+        assert!(!labels.contains(&"compatible"));
+    }
+
+    #[test]
+    fn property_completion_offers_compatible_for_a_fresh_node() {
+        let text = "/dts-v1/;\n\n/ {\n    node@1000 {\n        comp\n";
+        let doc = Document::open(text, 0);
+        let byte = text.rfind("comp").unwrap() + 4;
+        let items = property_completion(&doc, byte, "comp", &BindingIndex::default());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["compatible"]);
+    }
+
+    #[test]
+    fn property_items_resolve_through_the_enclosing_node() {
+        let text = "/dts-v1/;\n\n/ {\n    mmc@8804000 {\n        compatible = \"acme,mmc\";\n        reg = <0x1>;\n        clo\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let bindings = BindingIndex::default();
+        bindings.insert_for_test(Binding {
+            uri: Url::parse("file:///mmc.yaml").unwrap(),
+            singles: vec!["acme,mmc".to_string()],
+            compounds: Vec::new(),
+            properties: ["compatible", "reg", "clocks", "clock-names"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required: vec!["compatible".to_string()],
+            required_any: Vec::new(),
+            strict: true,
+            refs_complete: true,
+            patterns: regex::RegexSet::empty(),
+        });
+        // cursor right after "clo" on its line
+        let byte = text.find("clo").unwrap() + 3;
+        let items = property_completion(&doc, byte, "clo", &bindings);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["clock-names", "clocks"], "items: {labels:?}");
+    }
+
+    fn nested_bindings() -> BindingIndex {
+        let bindings = BindingIndex::default();
+        let make = |single: &str, props: &[&str]| Binding {
+            uri: Url::parse(&format!("file:///{single}.yaml")).unwrap(),
+            singles: vec![single.to_string()],
+            compounds: Vec::new(),
+            properties: props.iter().map(|p| p.to_string()).collect(),
+            required: vec!["compatible".to_string()],
+            required_any: Vec::new(),
+            strict: true,
+            refs_complete: true,
+            patterns: regex::RegexSet::empty(),
+        };
+        bindings.insert_for_test(make("acme,parent", &["compatible", "parent-prop", "parent-extra"]));
+        bindings.insert_for_test(make("acme,child", &["compatible", "child-prop"]));
+        bindings
+    }
+
+    #[test]
+    fn completion_above_a_node_uses_the_parent() {
+        // cursor on the blank line between the parent's last property and the
+        // child node header: the child's compatible must not leak in
+        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        compatible = \"acme,parent\";\n        parent-prop = <1>;\n        p\n        child@2000 {\n            compatible = \"acme,child\";\n        };\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let byte = text.find("        p\n").unwrap() + 9;
+        let items = property_completion(&doc, byte, "p", &nested_bindings());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        // parent-prop is already written in the node, so only the other one
+        assert_eq!(labels, vec!["parent-extra"], "items: {labels:?}");
+    }
+
+    #[test]
+    fn completion_above_a_node_offers_compatible_for_the_parent() {
+        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        reg = <1>;\n        c\n        child@2000 {\n            compatible = \"acme,child\";\n        };\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let byte = text.find("        c\n").unwrap() + 9;
+        let items = property_completion(&doc, byte, "c", &nested_bindings());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["compatible"], "items: {labels:?}");
+    }
+
+    #[test]
+    fn completion_inside_a_node_still_uses_that_node() {
+        let text = "/dts-v1/;\n\n/ {\n    parent@1000 {\n        compatible = \"acme,parent\";\n        child@2000 {\n            compatible = \"acme,child\";\n            c\n        };\n    };\n};\n";
+        let doc = Document::open(text, 0);
+        let byte = text.find("            c\n").unwrap() + 13;
+        let items = property_completion(&doc, byte, "c", &nested_bindings());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["child-prop"], "items: {labels:?}");
     }
 }
 

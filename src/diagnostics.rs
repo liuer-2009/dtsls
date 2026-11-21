@@ -1,15 +1,15 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use rustc_hash::FxHashMap;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use tree_sitter::Node;
 
 use crate::bindings::BindingIndex;
 use crate::document::Document;
 use crate::status::FeatureIssue;
-use crate::{util, workspace};
+use crate::{model, workspace};
 
 const SOURCE: &str = "dtsls";
 const MAX_DIAGNOSTICS: usize = 500;
@@ -19,20 +19,17 @@ const CAT_SYNTAX: u8 = 1 << 0;
 const CAT_DUPLICATES: u8 = 1 << 1;
 const CAT_INCLUDES: u8 = 1 << 2;
 const CAT_BINDINGS: u8 = 1 << 3;
-const CAT_ALL: u8 = CAT_SYNTAX | CAT_DUPLICATES | CAT_INCLUDES | CAT_BINDINGS;
 
 /// Node-kind ids resolved once: comparing ids beats comparing kind strings on
 /// every node of every traversal.
 struct Kinds {
     subnode: u16,
-    devicetree: u16,
     property: u16,
     prop_data: u16,
     preproc_include: u16,
     preproc_string_literal: u16,
     system_lib_string: u16,
     string_literal: u16,
-    node_def: u16,
     /// `foo:` tokens on nodes and properties
     label: u16,
     /// containers whose direct subnodes may collide (`node_def`, `#if` bodies)
@@ -57,14 +54,12 @@ fn kinds() -> &'static Kinds {
         }
         Kinds {
             subnode: id("subnode"),
-            devicetree: id("devicetree"),
             property: id("property"),
             prop_data: id("prop_data"),
             preproc_include: id("preproc_include"),
             preproc_string_literal: id("preproc_string_literal"),
             system_lib_string: id("system_lib_string"),
             string_literal: id("string_literal"),
-            node_def: id("node_def"),
             label: id("label"),
             containers: [
                 id("node_def"),
@@ -108,60 +103,57 @@ impl RawDiag {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct CacheKey {
-    file: u64,
     text: u64,
     len: u32,
     cats: u8,
 }
 
-const CACHE_LIMIT: usize = 200_000;
+const CACHE_LIMIT: usize = 50_000;
 
 /// Per-subtree result cache: a keystroke only changes one small subtree, so
 /// everything else is served from here. Keyed by the subtree's text, which
 /// also survives the positions of the whole file shifting.
-/// One memoized subtree: its diagnostics plus the labels it defines (byte
-/// ranges relative to the subtree start; labels never span a subtree unit, so
-/// nested units are not double counted).
 struct CachedUnit {
     diags: Vec<RawDiag>,
-    labels: Vec<(u32, u32)>,
 }
 
 #[derive(Default)]
 pub struct DiagCache {
-    entries: dashmap::DashMap<CacheKey, std::sync::Arc<CachedUnit>>,
-    generation: std::sync::atomic::AtomicU64,
+    entries: Mutex<HashMap<CacheKey, std::sync::Arc<CachedUnit>>>,
+    generation: AtomicU64,
 }
 
 impl DiagCache {
     fn sync(&self, bindings: &BindingIndex) {
-        use std::sync::atomic::Ordering;
         let current = bindings.generation();
         let previous = self.generation.load(Ordering::Relaxed);
         if previous != current {
-            // binding index grew (background scan) or was re-scanned
+            // the binding index grew (background scan) or was re-scanned
             if previous != 0 {
-                self.entries.clear();
+                self.entries.lock().unwrap().clear();
             }
             self.generation.store(current, Ordering::Relaxed);
         }
-        if self.entries.len() > CACHE_LIMIT {
-            self.entries.clear();
+        if self.entries.lock().unwrap().len() > CACHE_LIMIT {
+            self.entries.lock().unwrap().clear();
         }
     }
 
     fn get(&self, key: &CacheKey) -> Option<std::sync::Arc<CachedUnit>> {
-        self.entries.get(key).map(|entry| entry.clone())
+        self.entries.lock().unwrap().get(key).cloned()
     }
 
     fn insert(&self, key: CacheKey, value: CachedUnit) {
-        self.entries.insert(key, std::sync::Arc::new(value));
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(key, std::sync::Arc::new(value));
     }
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
     use std::hash::Hasher;
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hasher.write(bytes);
     hasher.finish()
 }
@@ -173,70 +165,33 @@ struct CheckCtx<'a> {
     include_dirs: &'a [PathBuf],
     bindings: &'a BindingIndex,
     cache: Option<&'a DiagCache>,
-    file_hash: u64,
     cats: u8,
 }
 
-/// Syntax errors, duplicate nodes, unresolved includes and binding violations
-/// sorted by position. Whole-feature issues (`status`) are reported at the top
-/// of the file.
-/// Structural checks on a preprocessed translation unit: syntax errors,
-/// duplicate labels, duplicate properties and duplicate node names. Positions
-/// are in the preprocessed text; the caller maps them back via the
-/// preprocessor's line markers.
+/// Structural checks on a preprocessed translation unit: duplicate labels,
+/// duplicate properties and duplicate node names. Positions are in the
+/// preprocessed text; the caller maps them back via the preprocessor's line
+/// markers. (Syntax errors and binding checks run per open buffer instead.)
 pub fn structural(doc: &Document) -> Vec<Diagnostic> {
-    run(
-        doc,
-        None,
-        &[],
-        &BindingIndex::default(),
-        &[],
-        CAT_SYNTAX | CAT_DUPLICATES,
-        None,
-    )
+    run(doc, None, &[], &BindingIndex::default(), &[], CAT_DUPLICATES, None)
 }
 
-/// Uncached entry point (tests and one-off callers).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn all(
-    doc: &Document,
-    file_path: Option<&Path>,
-    include_dirs: &[PathBuf],
-    bindings: &BindingIndex,
-    status: &[FeatureIssue],
-) -> Vec<Diagnostic> {
-    run(doc, file_path, include_dirs, bindings, status, CAT_ALL, None)
-}
-
-/// Same, reusing per-subtree results across edits.
-pub fn all_cached(
+/// The per-buffer checks: syntax errors, unresolved includes and binding
+/// violations, plus the whole-feature notices at the top of the file.
+/// Duplicate checks run here only while no translation unit covers the file
+/// (`duplicates`), because the unit judges them on the merged tree.
+pub fn buffer(
     doc: &Document,
     file_path: Option<&Path>,
     include_dirs: &[PathBuf],
     bindings: &BindingIndex,
     status: &[FeatureIssue],
     cache: &DiagCache,
+    duplicates: bool,
 ) -> Vec<Diagnostic> {
-    let cached = run(
-        doc,
-        file_path,
-        include_dirs,
-        bindings,
-        status,
-        CAT_ALL,
-        Some(cache),
-    );
-    if std::env::var_os("DTSLS_VERIFY_CACHE").is_some() {
-        let full = run(doc, file_path, include_dirs, bindings, status, CAT_ALL, None);
-        if cached != full {
-            tracing::error!(
-                cached = cached.len(),
-                full = full.len(),
-                "diagnostics cache diverged from a full recompute"
-            );
-        }
-    }
-    cached
+    let cats = CAT_SYNTAX | CAT_INCLUDES | CAT_BINDINGS
+        | if duplicates { CAT_DUPLICATES } else { 0 };
+    run(doc, file_path, include_dirs, bindings, status, cats, Some(cache))
 }
 
 fn run(
@@ -298,34 +253,17 @@ fn run(
         include_dirs,
         bindings,
         cache,
-        file_hash: hash_bytes(
-            file_path
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default()
-                .as_bytes(),
-        ),
         cats,
     };
     let mut raws: Vec<RawDiag> = Vec::new();
-    let mut labels: Vec<(u32, u32)> = Vec::new();
-    let collect_labels_here = cache.is_none() && cats & CAT_DUPLICATES != 0;
-    check_node(
-        &ctx,
-        root,
-        false,
-        &mut raws,
-        if collect_labels_here {
-            None
-        } else {
-            (cats & CAT_DUPLICATES != 0).then_some(&mut labels)
-        },
-    );
-    if collect_labels_here {
+    check_node(&ctx, root, false, &mut raws);
+    if cats & CAT_DUPLICATES != 0 {
+        // labels are leaves: one whole-file walk finds duplicates, so the
+        // subtree cache never has to carry label tables
+        let mut labels: Vec<(u32, u32)> = Vec::new();
         subtree_labels(root, &mut labels);
-    }
-    if cats & CAT_DUPLICATES != 0 && !labels.is_empty() {
         labels.sort_unstable();
-        let mut seen: FxHashMap<&str, ()> = FxHashMap::default();
+        let mut seen: HashMap<&str, ()> = HashMap::default();
         for (start, end) in labels {
             let (start, end) = (start as usize, (end as usize).min(doc.text.len()));
             if start >= end {
@@ -345,8 +283,8 @@ fn run(
     }
     out.extend(raws.iter().map(|raw| Diagnostic {
         range: Range {
-            start: util::byte_to_position(&doc.rope, raw.start as usize),
-            end: util::byte_to_position(&doc.rope, raw.end as usize),
+            start: model::byte_to_position(doc, raw.start as usize),
+            end: model::byte_to_position(doc, raw.end as usize),
         },
         severity: Some(raw.severity),
         source: Some(SOURCE.to_string()),
@@ -360,13 +298,7 @@ fn run(
 
 /// Check one structural node and everything below it. Property subtrees are
 /// skipped: they can never contain subnodes, duplicates or includes.
-fn check_node(
-    ctx: &CheckCtx,
-    node: Node,
-    in_alternative: bool,
-    out: &mut Vec<RawDiag>,
-    mut labels: Option<&mut Vec<(u32, u32)>>,
-) {
+fn check_node(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<RawDiag>) {
     let k = kinds();
     let kind = node.kind_id();
     if kind == k.property {
@@ -378,7 +310,7 @@ fn check_node(
     }
     let alternative = in_alternative || k.alternatives.contains(&kind);
     if kind == k.subnode {
-        check_subnode(ctx, node, alternative, out, labels);
+        check_subnode(ctx, node, alternative, out);
         return;
     }
     if kind == k.preproc_include {
@@ -390,24 +322,12 @@ fn check_node(
     if k.containers.contains(&kind) && ctx.cats & CAT_DUPLICATES != 0 && !alternative {
         duplicate_children_into(ctx.doc, node, out);
     }
-    // labels on the root node and on overlays are not covered by a subnode
-    // unit, so collect them here
-    if !alternative
-        && ctx.cats & CAT_DUPLICATES != 0
-        && (kind == k.devicetree
-            || kind == k.node_def
-            || node.kind() == "reference"
-            || k.containers.contains(&kind))
-        && let Some(dst) = labels.as_deref_mut()
-    {
-        container_labels(ctx.doc, node, dst);
-    }
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
             if child.is_named() {
-                check_node(ctx, child, alternative, out, labels.as_deref_mut());
+                check_node(ctx, child, alternative, out);
             }
             if !cursor.goto_next_sibling() {
                 break;
@@ -419,60 +339,31 @@ fn check_node(
 /// A subnode's diagnostics depend only on its own text, so the whole subtree
 /// result is memoized (except inside `#else`/`#elif`, where duplicate checks
 /// must not run).
-fn check_subnode(
-    ctx: &CheckCtx,
-    node: Node,
-    in_alternative: bool,
-    out: &mut Vec<RawDiag>,
-    labels: Option<&mut Vec<(u32, u32)>>,
-) {
+fn check_subnode(ctx: &CheckCtx, node: Node, in_alternative: bool, out: &mut Vec<RawDiag>) {
     let Some(cache) = ctx.cache.filter(|_| !in_alternative) else {
-        // Labels are collected once for the whole file by `run` when there is
-        // no cache, so nothing is gathered per subnode here.
         check_subnode_uncached(ctx, node, in_alternative, out);
         return;
     };
     let base = node.start_byte() as u32;
     let text = &ctx.doc.text[node.start_byte()..node.end_byte()];
     let key = CacheKey {
-        file: ctx.file_hash,
         text: hash_bytes(text.as_bytes()),
         len: text.len() as u32,
         cats: ctx.cats,
     };
     if let Some(hit) = cache.get(&key) {
         out.extend(hit.diags.iter().map(|raw| raw.shifted(base)));
-        if let Some(dst) = labels {
-            dst.extend(hit.labels.iter().map(|&(start, end)| (start + base, end + base)));
-        }
         return;
     }
     let mut local = Vec::new();
     check_subnode_uncached(ctx, node, in_alternative, &mut local);
-    // labels of the whole subtree: nested units are not visited once this
-    // entry is reused, so they belong to the outermost reachable unit. Only
-    // the outermost caller collects them (nested calls pass no label sink),
-    // which keeps the walk linear.
-    let mut abs_labels = Vec::new();
-    let want_labels = labels.is_some() && ctx.cats & CAT_DUPLICATES != 0;
-    if want_labels {
-        subtree_labels(node, &mut abs_labels);
-    }
-    let relative = abs_labels
-        .iter()
-        .map(|&(start, end)| (start - base, end - base))
-        .collect();
     cache.insert(
         key,
         CachedUnit {
             diags: local.iter().map(|raw| raw.rebase(base)).collect(),
-            labels: relative,
         },
     );
     out.extend(local);
-    if let Some(dst) = labels {
-        dst.extend(abs_labels);
-    }
 }
 
 /// Labels defined in a subtree, skipping `#else`/`#elif` branches (we cannot
@@ -504,38 +395,6 @@ fn subtree_labels(node: Node, out: &mut Vec<(u32, u32)>) {
     }
 }
 
-/// Labels attached to a container that is not inside a subnode (the root node,
-/// overlay bodies) plus the labels of its direct properties.
-fn container_labels(_doc: &Document, node: Node, out: &mut Vec<(u32, u32)>) {
-    let k = kinds();
-    let mut cursor = node.walk();
-    if !cursor.goto_first_child() {
-        return;
-    }
-    loop {
-        let child = cursor.node();
-        if child.kind_id() == k.label {
-            out.push((child.start_byte() as u32, child.end_byte() as u32));
-        } else if child.kind_id() == k.property {
-            let mut prop_cursor = child.walk();
-            if prop_cursor.goto_first_child() {
-                loop {
-                    let kind_child = prop_cursor.node();
-                    if kind_child.kind_id() == k.label {
-                        out.push((kind_child.start_byte() as u32, kind_child.end_byte() as u32));
-                    }
-                    if !prop_cursor.goto_next_sibling() {
-                        break;
-                    }
-                }
-            }
-        }
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
 fn check_subnode_uncached(
     ctx: &CheckCtx,
     node: Node,
@@ -545,27 +404,32 @@ fn check_subnode_uncached(
     if ctx.cats & CAT_BINDINGS != 0 {
         check_binding_node(node, ctx.doc, ctx.bindings, out);
     }
-    if let Some(body) = util::node_def_of(node) {
-        check_node(ctx, body, in_alternative, out, None);
+    if let Some(body) = model::node_def_of(node) {
+        check_node(ctx, body, in_alternative, out);
     }
 }
 
 /// Walk only the parts of the tree that carry errors: every node knows
 /// whether its subtree has one, so clean subtrees are never entered.
+/// The brace scan for multi-line error localization is computed at most once
+/// per run and shared: every multi-line ERROR node would otherwise rescan the
+/// file tail (the dominant cost while typing broken code).
 fn collect_errors(doc: &Document, root: Node, out: &mut Vec<Diagnostic>) {
+    let mut braces = None;
     let mut cursor = root.walk();
-    collect_errors_node(doc, &mut cursor, out);
+    collect_errors_node(doc, &mut cursor, out, &mut braces);
 }
 
 fn collect_errors_node(
     doc: &Document,
     cursor: &mut tree_sitter::TreeCursor<'_>,
     out: &mut Vec<Diagnostic>,
+    braces: &mut Option<Vec<(usize, u8)>>,
 ) {
     let node = cursor.node();
     if node.is_error() {
         out.push(Diagnostic {
-            range: error_range(doc, node),
+            range: error_range(doc, node, braces),
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some(SOURCE.to_string()),
             message: format!("syntax error near {}", snippet(doc, node)),
@@ -586,7 +450,7 @@ fn collect_errors_node(
     if cursor.goto_first_child() {
         loop {
             if cursor.node().has_error() {
-                collect_errors_node(doc, cursor, out);
+                collect_errors_node(doc, cursor, out, braces);
             }
             if !cursor.goto_next_sibling() {
                 break;
@@ -648,7 +512,7 @@ fn check_binding_node(
     // one pass over the body: property names, plus child node names because a
     // required entry may be a child node (`required: [ports]`)
     let k = kinds();
-    let body = util::node_def_of(node).unwrap_or(node);
+    let body = model::node_def_of(node).unwrap_or(node);
     let mut props: Vec<(Node, &str)> = Vec::with_capacity(body.child_count() / 2);
     let mut child_names: Vec<&str> = Vec::new();
     let mut compatible = None;
@@ -659,7 +523,7 @@ fn check_binding_node(
             if child.kind_id() == k.property
                 && let Some(prop_name) = child.child_by_field_name("name")
             {
-                let name = util::node_text(doc, prop_name);
+                let name = model::node_text(doc, prop_name);
                 if name == "compatible" {
                     compatible = Some(child);
                 }
@@ -668,7 +532,7 @@ fn check_binding_node(
                 && let Some(child_name) = child.child_by_field_name("name")
             {
                 // exact name: `required: [port@0]` must not match `port@1`
-                child_names.push(util::node_text(doc, child_name));
+                child_names.push(model::node_text(doc, child_name));
             }
             if !cursor.goto_next_sibling() {
                 break;
@@ -711,7 +575,7 @@ fn check_binding_node(
         .path_segments()
         .and_then(|mut s| s.next_back())
         .unwrap_or("");
-    let node_name = util::node_text(doc, name_node);
+    let node_name = model::node_text(doc, name_node);
     let mut count = 0;
     for required in &binding.required {
         if has(required) {
@@ -766,7 +630,7 @@ fn check_binding_node(
 
 /// All `compatible` strings declared by this node's `compatible` property.
 pub fn compatible_strings(doc: &Document, node: Node) -> Option<Vec<String>> {
-    let prop = node_property(node, "compatible", doc)?;
+    let prop = model::find_property(doc, node, "compatible")?;
     compatible_strings_of(doc, prop)
 }
 
@@ -782,35 +646,12 @@ fn compatible_strings_of(doc: &Document, prop: Node) -> Option<Vec<String>> {
         for j in 0..data.child_count() {
             let Some(child) = data.child(j as u32) else { continue };
             if child.kind_id() == k.string_literal {
-                out.push(util::node_text(doc, child).trim_matches('"').to_string());
+                out.push(model::node_text(doc, child).trim_matches('"').to_string());
                 break;
             }
         }
     }
     if out.is_empty() { None } else { Some(out) }
-}
-
-fn node_property<'a>(node: Node<'a>, name: &str, doc: &Document) -> Option<Node<'a>> {
-    // properties live inside the node's `{ ... }` body, not on the subnode
-    let k = kinds();
-    let container = if node.kind_id() == k.subnode || node.kind_id() == k.devicetree {
-        util::node_def_of(node).unwrap_or(node)
-    } else {
-        node
-    };
-    for i in 0..container.child_count() {
-        let Some(child) = container.child(i as u32) else { continue };
-        if child.kind_id() != k.property {
-            continue;
-        }
-        if child
-            .child_by_field_name("name")
-            .is_some_and(|n| util::node_text(doc, n) == name)
-        {
-            return Some(child);
-        }
-    }
-    None
 }
 
 fn include_into(ctx: &CheckCtx, node: Node, out: &mut Vec<RawDiag>) {
@@ -819,7 +660,7 @@ fn include_into(ctx: &CheckCtx, node: Node, out: &mut Vec<RawDiag>) {
         return;
     };
     let kind = path_node.kind_id();
-    let raw = util::node_text(doc, path_node);
+    let raw = model::node_text(doc, path_node);
     let (target, quoted) = if kind == kinds().preproc_string_literal {
         (raw.trim_matches('"'), true)
     } else if kind == kinds().system_lib_string {
@@ -852,9 +693,9 @@ fn include_into(ctx: &CheckCtx, node: Node, out: &mut Vec<RawDiag>) {
 /// Flag sibling nodes that define the same name (dtc would silently merge
 /// them) or that claim the same unit address under one parent.
 fn duplicate_children_into(doc: &Document, node: Node, out: &mut Vec<RawDiag>) {
-    let mut seen_names: FxHashMap<&str, ()> = FxHashMap::default();
-    let mut seen_addresses: FxHashMap<&str, &str> = FxHashMap::default();
-    let mut seen_properties: FxHashMap<&str, ()> = FxHashMap::default();
+    let mut seen_names: HashMap<&str, ()> = HashMap::default();
+    let mut seen_addresses: HashMap<&str, &str> = HashMap::default();
+    let mut seen_properties: HashMap<&str, ()> = HashMap::default();
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
@@ -863,7 +704,7 @@ fn duplicate_children_into(doc: &Document, node: Node, out: &mut Vec<RawDiag>) {
                 && let Some(name_node) = child.child_by_field_name("name")
             {
                 // dtc is strict about this: duplicate_property_names is an error
-                let name = util::node_text(doc, name_node);
+                let name = model::node_text(doc, name_node);
                 if seen_properties.insert(name, ()).is_some() {
                     out.push(RawDiag {
                         start: name_node.start_byte() as u32,
@@ -875,7 +716,7 @@ fn duplicate_children_into(doc: &Document, node: Node, out: &mut Vec<RawDiag>) {
             } else if child.kind_id() == kinds().subnode
                 && let Some(name_node) = child.child_by_field_name("name")
             {
-                let full = util::node_text(doc, name_node);
+                let full = model::node_text(doc, name_node);
                 let (name, address) = match full.split_once('@') {
                     Some((name, addr)) => (name, Some(addr)),
                     None => (full, None),
@@ -919,8 +760,8 @@ fn duplicate_children_into(doc: &Document, node: Node, out: &mut Vec<RawDiag>) {
 
 fn node_range(doc: &Document, node: Node) -> Range {
     Range {
-        start: util::byte_to_position(&doc.rope, node.start_byte()),
-        end: util::byte_to_position(&doc.rope, node.end_byte()),
+        start: model::byte_to_position(doc, node.start_byte()),
+        end: model::byte_to_position(doc, node.end_byte()),
     }
 }
 
@@ -928,14 +769,14 @@ fn node_range(doc: &Document, node: Node) -> Range {
 /// (e.g. an unclosed `{`), and squiggling all of it is noise. Instead point at
 /// the last unmatched `{` in the region — the likely culprit — or fall back to
 /// the first line of the region.
-fn error_range(doc: &Document, node: Node) -> Range {
+fn error_range(doc: &Document, node: Node, braces: &mut Option<Vec<(usize, u8)>>) -> Range {
     let start = node.start_byte();
     let end = node.end_byte();
-    let start_pos = util::byte_to_position(&doc.rope, start);
-    let end_pos = util::byte_to_position(&doc.rope, end);
+    let start_pos = model::byte_to_position(doc, start);
+    let end_pos = model::byte_to_position(doc, end);
 
     if end_pos.line > start_pos.line {
-        if let Some(brace) = last_unmatched_open_brace(doc, start) {
+        if let Some(brace) = last_unmatched_open_brace(doc, start, braces) {
             return line_range(doc, brace);
         }
         return line_range_at_line(doc, start_pos.line);
@@ -952,26 +793,26 @@ fn error_range(doc: &Document, node: Node) -> Range {
 }
 
 fn line_range(doc: &Document, byte: usize) -> Range {
-    let line = doc.rope.byte_to_line(byte);
+    let line = doc.line_starts.partition_point(|&start| start <= byte) - 1;
     line_range_at_line(doc, line as u32)
 }
 
 fn line_range_at_line(doc: &Document, line: u32) -> Range {
     let line_idx = line as usize;
-    let start_byte = doc.rope.line_to_byte(line_idx);
-    let mut end_byte = if line_idx + 1 < doc.rope.len_lines() {
-        doc.rope.line_to_byte(line_idx + 1)
-    } else {
-        doc.rope.len_bytes()
-    };
+    let start_byte = doc.line_starts[line_idx];
+    let mut end_byte = doc
+        .line_starts
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(doc.text.len());
     while end_byte > start_byte
-        && matches!(doc.rope.byte(end_byte - 1), b'\n' | b'\r' | b' ' | b'\t')
+        && matches!(doc.text.as_bytes()[end_byte - 1], b'\n' | b'\r' | b' ' | b'\t')
     {
         end_byte -= 1;
     }
     Range {
-        start: util::byte_to_position(&doc.rope, start_byte),
-        end: util::byte_to_position(&doc.rope, end_byte),
+        start: model::byte_to_position(doc, start_byte),
+        end: model::byte_to_position(doc, end_byte),
     }
 }
 
@@ -980,78 +821,44 @@ fn line_range_at_line(doc: &Document, line: u32) -> Range {
 /// indented at or before its own column, so a `{` whose closer "stole" a
 /// shallower one is the likely culprit. Plain greedy pairing would blame the
 /// outermost node instead (everything below an unclosed `{` shifts one level).
-fn last_unmatched_open_brace(doc: &Document, start_byte: usize) -> Option<usize> {
-    // scan the mirrored text directly: ropey random access is O(log n) and
-    // an unterminated file makes this region span everything up to EOF
-    let bytes = doc.text.as_bytes();
-    let start_byte = start_byte.min(bytes.len());
-    let line_start = doc.text[..start_byte].rfind('\n').map_or(0, |pos| pos + 1);
-    let mut stack: Vec<(usize, usize)> = Vec::new(); // (byte, indent width)
-    let mut suspects: Vec<usize> = Vec::new();
-    let mut in_comment = false;
-    let mut line_begin = line_start;
-
-    while line_begin < bytes.len() {
-        let line_end = doc.text[line_begin..]
-            .find('\n')
-            .map_or(bytes.len(), |pos| line_begin + pos);
-
-        let mut indent = 0;
-        let mut byte = line_begin;
-        while byte < line_end {
-            match bytes[byte] {
-                b'\t' => indent += 8 - (indent % 8),
-                b' ' => indent += 1,
-                _ => break,
-            }
-            byte += 1;
-        }
-
-        let mut in_string = false;
-        while byte < line_end {
-            let b = bytes[byte];
-            if in_comment {
-                if b == b'*' && byte + 1 < line_end && bytes[byte + 1] == b'/' {
-                    in_comment = false;
-                    byte += 1;
-                }
-            } else if in_string {
-                match b {
-                    b'\\' => byte += 1,
-                    b'"' => in_string = false,
-                    _ => {}
-                }
-            } else {
-                match b {
-                    b'/' if byte + 1 < line_end && bytes[byte + 1] == b'*' => {
-                        in_comment = true;
-                        byte += 1;
-                    }
-                    b'/' if byte + 1 < line_end && bytes[byte + 1] == b'/' => break,
-                    b'"' => in_string = true,
-                    b'{' => stack.push((byte, indent)),
-                    b'}' => loop {
-                        match stack.last() {
-                            Some(&(_, open_indent)) if open_indent > indent => {
-                                // This closer is too shallow for the open
-                                // brace; the open brace is a suspect.
-                                suspects.push(stack.pop().unwrap().0);
-                            }
-                            Some(&(_, open_indent)) if open_indent <= indent => {
-                                stack.pop();
-                                break;
-                            }
-                            _ => break,
-                        }
-                    },
-                    _ => {}
-                }
-            }
-            byte += 1;
-        }
-        line_begin = line_end + 1;
+/// The brace offsets are computed on first use and cached in `braces` — with
+/// a broken file every ERROR node in the tree would otherwise rescan the tail.
+fn last_unmatched_open_brace(
+    doc: &Document,
+    start_byte: usize,
+    braces: &mut Option<Vec<(usize, u8)>>,
+) -> Option<usize> {
+    if braces.is_none() {
+        *braces = Some(model::brace_offsets(&doc.text, 0));
     }
-
+    let offsets = braces.as_deref().unwrap_or(&[]);
+    let text = &doc.text;
+    let from = text[..start_byte.min(text.len())].rfind('\n').map_or(0, |pos| pos + 1);
+    let mut stack: Vec<(usize, usize)> = Vec::new(); // (byte, line indent)
+    let mut suspects: Vec<usize> = Vec::new();
+    for &(offset, byte) in offsets.iter().filter(|(offset, _)| *offset >= from) {
+        let line_start = text[..offset].rfind('\n').map_or(0, |pos| pos + 1);
+        let indent = model::indent_of(&text[line_start..]);
+        if byte == b'{' {
+            stack.push((offset, indent));
+            continue;
+        }
+        loop {
+            match stack.last() {
+                Some(&(open, open_indent)) if open_indent > indent => {
+                    // this closer is too shallow for the open brace; the open
+                    // brace is a suspect
+                    suspects.push(open);
+                    stack.pop();
+                }
+                Some(_) => {
+                    stack.pop();
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
     suspects.extend(stack.into_iter().map(|(pos, _)| pos));
     suspects.into_iter().max()
 }
@@ -1070,6 +877,18 @@ mod tests {
     use super::*;
     use crate::bindings::scan;
     use crate::document::Document;
+
+    const CAT_ALL: u8 = CAT_SYNTAX | CAT_DUPLICATES | CAT_INCLUDES | CAT_BINDINGS;
+
+    fn all(
+        doc: &Document,
+        file_path: Option<&Path>,
+        include_dirs: &[PathBuf],
+        bindings: &BindingIndex,
+        status: &[FeatureIssue],
+    ) -> Vec<Diagnostic> {
+        run(doc, file_path, include_dirs, bindings, status, CAT_ALL, None)
+    }
 
     fn diagnostics_for(text: &str) -> Vec<Diagnostic> {
         compute(&Document::open(text, 0))
@@ -1319,50 +1138,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn bench_diagnostics() {
-        let path = Path::new("/linux-7.2.2/arch/arm64/boot/dts/qcom/sm8650.dtsi");
-        let text = std::fs::read_to_string(path).unwrap();
-        let doc = Document::open(&text, 1);
-        let includes = vec![PathBuf::from("/linux-7.2.2/include")];
-        let iterations = 200;
-
-        let bindings = BindingIndex::default();
-        let started = std::time::Instant::now();
-        scan(
-            &bindings,
-            Path::new("/linux-7.2.2/Documentation/devicetree/bindings"),
-        );
-        println!(
-            "bindings: {} scanned in {:?}",
-            bindings.len(),
-            started.elapsed()
-        );
-
-        let empty = BindingIndex::default();
-        for (label, index, cats) in [
-            ("walk only (no checks)", &empty, 0u8),
-            ("syntax", &empty, CAT_SYNTAX),
-            ("duplicates", &empty, CAT_DUPLICATES),
-            ("includes", &empty, CAT_INCLUDES),
-            ("bindings (empty index)", &empty, CAT_BINDINGS),
-            ("bindings (kernel index)", &bindings, CAT_BINDINGS),
-            ("all (kernel index)", &bindings, CAT_ALL),
-        ] {
-            let diags = run(&doc, Some(path), &includes, index, &[], cats, None);
-            let started = std::time::Instant::now();
-            for _ in 0..iterations {
-                std::hint::black_box(run(&doc, Some(path), &includes, index, &[], cats, None));
-            }
-            println!(
-                "{label}: {:?}/iter, {} diagnostics",
-                started.elapsed() / iterations,
-                diags.len()
-            );
-        }
-    }
-
-    #[test]
     fn cached_diagnostics_match_full_recompute() {
         use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier};
         let text = "/dts-v1/;\n\n/ {\n    lbl: widget@1000 {\n        compatible = \"acme,widget\";\n        reg = <0x0 0x1000>;\n        bogus = <1>;\n        reg = <0x1 0x1000>;\n    };\n\n    lbl: widget@2000 {\n        compatible = \"acme,widget\";\n        reg = <0x0 0x2000>;\n    };\n};\n";
@@ -1381,11 +1156,11 @@ mod tests {
             required_any: Vec::new(),
             strict: true,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         });
         let check = |doc: &Document| {
-            let cached = all_cached(doc, None, &[], &bindings, &[], &cache);
-            let full = all(doc, None, &[], &bindings, &[]);
+            let cached = run(doc, None, &[], &bindings, &[], CAT_ALL, Some(&cache));
+            let full = run(doc, None, &[], &bindings, &[], CAT_ALL, None);
             assert_eq!(cached, full, "cached diagnostics diverged from a full recompute");
             cached
         };
@@ -1461,7 +1236,7 @@ mod tests {
             ]],
             strict: true,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         }
     }
 
@@ -1480,7 +1255,7 @@ mod tests {
             required_any: Vec::new(),
             strict: true,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         });
         bindings.mark_ready(false);
         assert!(binding_diagnostics(&doc, &bindings, None).is_empty());
@@ -1537,7 +1312,7 @@ mod tests {
             required_any: Vec::new(),
             strict: true,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         });
         let diags = binding_diagnostics(&doc, &bindings, None);
         assert!(diags.is_empty(), "{diags:?}");
@@ -1554,7 +1329,7 @@ mod tests {
             required_any: Vec::new(),
             strict: true,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         });
         let diags = binding_diagnostics(&doc, &bindings, None);
         assert_eq!(diags.len(), 1, "{diags:?}");
@@ -1613,7 +1388,7 @@ mod tests {
             required_any: Vec::new(),
             strict: false,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         });
         let text = "/dts-v1/;\n\n/ {\n    tcon@1000 {\n        compatible = \"acme,tcon\";\n        ports {\n            port@0 {\n            };\n            port {\n            };\n        };\n    };\n};\n";
         let doc = Document::open(text, 0);

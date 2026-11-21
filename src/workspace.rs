@@ -1,62 +1,25 @@
 //! Workspace state built on top of translation units.
 //!
-//! The old workspace index parsed every file into per-file tables. That is
-//! exactly what a translation unit already provides (after preprocessing), so
-//! this module keeps only what a unit cannot answer:
+//! A translation unit already provides the per-file tables (labels, macros,
+//! `#*-cells`), so this module keeps only what a unit cannot answer:
 //!
 //! * which `.dts` roots exist and which files each of them includes (a cheap
 //!   line scan, no parsing), used to map a file to the boards that contain it;
-//! * the last checked unit per root (labels, references, macros, `#*-cells`);
-//! * the preprocessed text snapshot per root for incremental reparsing.
+//! * the last checked unit and preprocessed-text snapshot per root, so an
+//!   edit reparses incrementally. Snapshots are capped (FIFO) and the contexts
+//!   of open documents are never evicted.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use tower_lsp::lsp_types::{Range, Url};
 use walkdir::WalkDir;
 
 use crate::document::Document;
+use crate::unit::TuData;
 
-/// macro name -> (value snippet, defining file name)
-pub type DefineMap = HashMap<String, (String, String)>;
-
-/// `#address-cells`-style metadata used to derive `X-names` strides.
-#[derive(Clone, Debug)]
-pub struct CellsProp {
-    pub path: String,
-    pub name: String,
-    pub value: u32,
-}
-
-/// A label defined in a preprocessed unit.
-pub struct TuLabel {
-    /// node path, for the completion detail
-    pub path: String,
-    /// file the label is defined in
-    pub file: PathBuf,
-    /// range of the label in that file
-    pub range: Range,
-}
-
-/// An `&label` use in a preprocessed unit.
-pub struct TuRef {
-    pub label: String,
-    pub file: PathBuf,
-    pub range: Range,
-}
-
-/// Everything a unit tells us besides diagnostics.
-pub struct TuData {
-    pub labels: HashMap<String, TuLabel>,
-    pub refs: Vec<TuRef>,
-    pub defines: DefineMap,
-    pub cells: Vec<CellsProp>,
-    /// provider node path -> `#X-cells` name -> value, for phandle-argument
-    /// checks across files (dtc's `WARNING_PROPERTY_PHANDLE_CELLS`).
-    pub provider_cells: HashMap<String, HashMap<String, u32>>,
-}
+/// How many board contexts keep their unit and preprocessed snapshot.
+const MAX_CONTEXTS: usize = 8;
 
 #[derive(Default)]
 pub struct Workspace {
@@ -70,55 +33,32 @@ pub struct Workspace {
     units: RwLock<HashMap<PathBuf, Arc<TuData>>>,
     /// preprocessed text per root, kept so edits reparse incrementally
     snapshots: Mutex<HashMap<PathBuf, (Document, Vec<PathBuf>)>>,
-    /// last use of each context, for LRU eviction
-    last_used: Mutex<HashMap<PathBuf, u64>>,
-    clock: AtomicU64,
+    /// insertion order of the context keys, for FIFO eviction
+    order: Mutex<Vec<PathBuf>>,
 }
 
 impl Workspace {
-    fn touch(&self, root: &Path) {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
-        self.last_used.lock().unwrap().insert(root, tick);
-    }
-
-    /// Drop the least recently used contexts beyond `limit`, keeping the ones
-    /// in `protected` (open documents and the active board).
-    pub fn prune(&self, limit: usize, protected: &HashSet<PathBuf>) {
-        let contexts: HashSet<PathBuf> = {
-            let units = self.units.read().unwrap();
-            let snapshots = self.snapshots.lock().unwrap();
-            units.keys().chain(snapshots.keys()).cloned().collect()
-        };
-        if contexts.len() <= limit {
-            return;
-        }
-        let protected: HashSet<PathBuf> = protected
-            .iter()
-            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
-            .collect();
-        let mut order: Vec<(u64, PathBuf)> = {
-            let last_used = self.last_used.lock().unwrap();
-            contexts
-                .into_iter()
-                .map(|path| (last_used.get(&path).copied().unwrap_or(0), path))
-                .collect()
-        };
-        order.sort();
-        let mut remaining = order.len();
-        for (_, path) in order {
-            if remaining <= limit {
-                break;
-            }
+    /// Drop the least recently created contexts beyond [`MAX_CONTEXTS`],
+    /// keeping the ones in `protected` (open documents and the active board)
+    /// without counting them against the cap.
+    pub fn prune(&self, protected: &HashSet<PathBuf>) {
+        let mut order = self.order.lock().unwrap();
+        let mut keep: Vec<PathBuf> = Vec::with_capacity(order.len());
+        let mut contexts = 0usize;
+        for path in order.drain(..).rev() {
             if protected.contains(&path) {
-                continue;
+                keep.push(path);
+            } else if contexts < MAX_CONTEXTS {
+                contexts += 1;
+                keep.push(path);
+            } else {
+                self.units.write().unwrap().remove(&path);
+                self.snapshots.lock().unwrap().remove(&path);
+                tracing::debug!(root = %path.display(), "evicted translation-unit context");
             }
-            self.units.write().unwrap().remove(&path);
-            self.snapshots.lock().unwrap().remove(&path);
-            self.last_used.lock().unwrap().remove(&path);
-            remaining -= 1;
-            tracing::debug!(root = %path.display(), "evicted translation-unit context");
         }
+        keep.reverse();
+        *order = keep;
     }
 
     /// Discover `.dts` roots and the include graph. Only `#include` lines are
@@ -219,8 +159,8 @@ impl Workspace {
     /// Whether `file` is the board itself or reachable from it through
     /// `#include` lines (this is what decides "analyze in board context").
     pub fn closure_contains(&self, board: &Path, file: &Path) -> bool {
-        let board = std::fs::canonicalize(board).unwrap_or_else(|_| board.to_path_buf());
-        let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let board = canonical(board);
+        let file = canonical(file);
         if board == file {
             return true;
         }
@@ -243,11 +183,10 @@ impl Workspace {
         false
     }
 
-    /// Boards whose unit contains `path`, preferring nothing here (the caller
-    /// may sort). Falls back to the file itself so a lone `.dtsi` still gets
-    /// its own closure checked.
+    /// Boards whose unit contains `path`. Falls back to the file itself so a
+    /// lone `.dtsi` still gets its own closure checked.
     pub fn roots_for(&self, path: &Path) -> Vec<PathBuf> {
-        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = canonical(path);
         let includers = self.includers.read().unwrap();
         let is_root = |file: &Path| file.extension().and_then(|ext| ext.to_str()) == Some("dts");
         let mut roots = Vec::new();
@@ -277,56 +216,41 @@ impl Workspace {
         roots
     }
 
-    pub fn unit_for_uri(&self, uri: &Url) -> Option<Arc<TuData>> {
-        let path = uri.to_file_path().ok()?;
-        self.unit(&path)
-    }
-
-    pub fn store_unit_uri(&self, uri: Url, data: Arc<TuData>) {
-        if let Ok(path) = uri.to_file_path() {
-            self.store_unit(path, data);
-        }
-    }
-
-    pub fn take_snapshot_uri(&self, uri: &Url) -> Option<(Document, Vec<PathBuf>)> {
-        let path = uri.to_file_path().ok()?;
-        self.take_snapshot(&path)
-    }
-
-    pub fn put_snapshot_uri(&self, uri: Url, doc: Document, files: Vec<PathBuf>) {
-        if let Ok(path) = uri.to_file_path() {
-            self.put_snapshot(path, doc, files);
-        }
-    }
-
+    /// Last checked unit for a root.
     pub fn unit(&self, root: &Path) -> Option<Arc<TuData>> {
-        self.touch(root);
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        self.units.read().unwrap().get(&root).cloned()
+        self.units.read().unwrap().get(&canonical(root)).cloned()
     }
 
     pub fn store_unit(&self, root: PathBuf, data: Arc<TuData>) {
-        self.touch(&root);
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
-        self.units.write().unwrap().insert(root, data);
+        let root = canonical(&root);
+        self.units.write().unwrap().insert(root.clone(), data);
+        let mut order = self.order.lock().unwrap();
+        if !order.contains(&root) {
+            order.push(root);
+        }
     }
 
     /// Take the previous preprocessed snapshot so the unit run can reparse it
     /// incrementally instead of from scratch.
     pub fn take_snapshot(&self, root: &Path) -> Option<(Document, Vec<PathBuf>)> {
-        self.touch(root);
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        self.snapshots.lock().unwrap().remove(&root)
+        self.snapshots.lock().unwrap().remove(&canonical(root))
     }
 
     pub fn put_snapshot(&self, root: PathBuf, doc: Document, files: Vec<PathBuf>) {
-        self.touch(&root);
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let root = canonical(&root);
         self.snapshots
             .lock()
             .unwrap()
-            .insert(root, (doc, files));
+            .insert(root.clone(), (doc, files));
+        let mut order = self.order.lock().unwrap();
+        if !order.contains(&root) {
+            order.push(root);
+        }
     }
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// `#include "x"` / `#include <x>` lines of a source file.
@@ -500,5 +424,29 @@ mod tests {
             "#include \"a.dtsi\"\n  #include <dt-bindings/x.h>\n// #include \"b.dtsi\"\n#define X\n",
         );
         assert_eq!(lines, vec![("a.dtsi".into(), true), ("dt-bindings/x.h".into(), false)]);
+    }
+
+    #[test]
+    fn prune_keeps_protected_contexts_and_the_cap() {
+        let workspace = Workspace::default();
+        let roots: Vec<PathBuf> = (0..10)
+            .map(|i| std::env::temp_dir().join(format!("dtsls-prune-{i}")))
+            .collect();
+        for root in &roots {
+            workspace.store_unit(root.clone(), Arc::new(TuData {
+                labels: Default::default(),
+                refs: Vec::new(),
+                defines: Default::default(),
+                cells: Vec::new(),
+            }));
+        }
+        // the oldest context is protected: it survives despite being evictable
+        let protected: HashSet<PathBuf> = [roots[0].clone()].into_iter().collect();
+        workspace.prune(&protected);
+        assert!(workspace.unit(&roots[0]).is_some());
+        // 0 is protected, 2..10 (newest 8) survive, 1 was evicted
+        assert!(workspace.unit(&roots[1]).is_none());
+        assert!(workspace.unit(&roots[2]).is_some());
+        assert!(workspace.unit(&roots[9]).is_some());
     }
 }

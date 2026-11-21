@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{DocumentSymbol, SymbolKind};
 use tree_sitter::Node;
 
 use crate::document::Document;
-use crate::util;
+use crate::model;
 
 pub fn document_symbols(doc: &Document) -> Vec<DocumentSymbol> {
     let root = doc.tree.root_node();
@@ -28,17 +28,17 @@ pub fn document_symbols(doc: &Document) -> Vec<DocumentSymbol> {
 
 fn position_range(doc: &Document, node: Node) -> tower_lsp::lsp_types::Range {
     tower_lsp::lsp_types::Range {
-        start: util::byte_to_position(&doc.rope, node.start_byte()),
-        end: util::byte_to_position(&doc.rope, node.end_byte()),
+        start: model::byte_to_position(doc, node.start_byte()),
+        end: model::byte_to_position(doc, node.end_byte()),
     }
 }
 
 /// `/ { ... }` (root) or `&label { ... }` (same-file extension).
 fn devicetree_symbol(devicetree: Node, doc: &Document) -> DocumentSymbol {
-    let reference = util::find_child(devicetree, "reference");
+    let reference = model::find_child(devicetree, "reference");
     let (name, child_path) = match reference {
         Some(reference) => {
-            let name = util::node_text(doc, reference).to_string();
+            let name = model::node_text(doc, reference).to_string();
             let path = name.clone();
             (name, path)
         }
@@ -47,7 +47,7 @@ fn devicetree_symbol(devicetree: Node, doc: &Document) -> DocumentSymbol {
     let detail = child_path.clone();
 
     let mut children = Vec::new();
-    if let Some(body) = util::node_def_of(devicetree) {
+    if let Some(body) = model::node_def_of(devicetree) {
         collect_block(body, doc, &child_path, &mut children);
     }
 
@@ -67,13 +67,13 @@ fn subnode_symbol(subnode: Node, doc: &Document, path: &str, out: &mut Vec<Docum
     let Some(name_node) = subnode.child_by_field_name("name") else {
         // `omit_node` wraps a real subnode; `delete_node` statements are not
         // outline-worthy.
-        if let Some(omit) = util::find_child(subnode, "omit_node")
-            && let Some(inner) = util::find_child(omit, "subnode") {
+        if let Some(omit) = model::find_child(subnode, "omit_node")
+            && let Some(inner) = model::find_child(omit, "subnode") {
                 subnode_symbol(inner, doc, path, out);
             }
         return;
     };
-    let name = util::node_text(doc, name_node).to_string();
+    let name = model::node_text(doc, name_node).to_string();
     let child_path = if path.ends_with('/') {
         format!("{path}{name}")
     } else {
@@ -82,7 +82,7 @@ fn subnode_symbol(subnode: Node, doc: &Document, path: &str, out: &mut Vec<Docum
     let detail = child_path.clone();
 
     let mut children = Vec::new();
-    if let Some(body) = util::node_def_of(subnode) {
+    if let Some(body) = model::node_def_of(subnode) {
         collect_block(body, doc, &child_path, &mut children);
     }
 
@@ -126,14 +126,14 @@ fn collect_block(container: Node, doc: &Document, path: &str, out: &mut Vec<Docu
 }
 
 fn property_symbol(property: Node, doc: &Document, out: &mut Vec<DocumentSymbol>) {
-    if util::find_child(property, "delete_property").is_some() {
+    if model::find_child(property, "delete_property").is_some() {
         return;
     }
     let Some(name_node) = property.child_by_field_name("name") else {
         return;
     };
     out.push(DocumentSymbol {
-        name: util::node_text(doc, name_node).to_string(),
+        name: model::node_text(doc, name_node).to_string(),
         detail: Some(value_summary(property)),
         kind: SymbolKind::FIELD,
         range: position_range(doc, property),
@@ -182,7 +182,7 @@ fn define_symbol(define: Node, doc: &Document) -> Option<DocumentSymbol> {
         _ => "#define",
     };
     Some(DocumentSymbol {
-        name: format!("#define {}", util::node_text(doc, name_node)),
+        name: format!("#define {}", model::node_text(doc, name_node)),
         detail: Some(detail.to_string()),
         kind: SymbolKind::CONSTANT,
         range: position_range(doc, define),

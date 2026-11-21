@@ -1,9 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-
-use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use tower_lsp::lsp_types::Url;
 use yaml_rust2::{Yaml, YamlLoader};
@@ -39,11 +37,30 @@ impl CompatibleIndex {
     }
 }
 
-/// Compound compatible pattern: per position, the allowed values.
-type CompoundPattern = Vec<Vec<String>>;
+/// One position of a compound compatible: either an enumerated value set or
+/// a regex the value must match (dt-schema `pattern:`, e.g. Adreno's
+/// `^qcom,adreno-[0-9a-f]{8}$`).
+#[derive(Clone)]
+pub enum PositionMatcher {
+    Values(Vec<String>),
+    Pattern(regex::Regex),
+}
+
+impl PositionMatcher {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            PositionMatcher::Values(values) => values.iter().any(|v| v == value),
+            PositionMatcher::Pattern(re) => re.is_match(value),
+        }
+    }
+}
+
+/// Compound compatible pattern: per position, the allowed values (or a
+/// position regex).
+type CompoundPattern = Vec<PositionMatcher>;
 
 /// Compound patterns bucketed by their first compatible value.
-type CompoundBucket = FxHashMap<String, Vec<(CompoundPattern, Arc<Binding>)>>;
+type CompoundBucket = HashMap<String, Vec<(CompoundPattern, Arc<Binding>)>>;
 
 /// The subset of a devicetree binding this server validates against.
 pub struct Binding {
@@ -53,7 +70,7 @@ pub struct Binding {
     /// compound compatibles (`items:`): per position, the allowed values
     pub compounds: Vec<CompoundPattern>,
     /// property names allowed on matching nodes (own + `$ref`-resolved)
-    pub properties: FxHashSet<String>,
+    pub properties: HashSet<String>,
     /// required property names
     pub required: Vec<String>,
     /// groups where at least one member must be present: dt-schema rewrites
@@ -65,30 +82,31 @@ pub struct Binding {
     /// when the allowed set is complete
     pub refs_complete: bool,
     /// compiled `patternProperties` matchers (e.g. `.*-supply$`)
-    pub patterns: Vec<regex::Regex>,
+    pub patterns: regex::RegexSet,
 }
 
 /// compatible string -> binding. First file wins (sorted scan order), so
 /// lookups are deterministic.
 pub struct BindingIndex {
-    by_single: RwLock<FxHashMap<String, Arc<Binding>>>,
+    by_single: RwLock<HashMap<String, Arc<Binding>>>,
     /// first compatible string -> compound patterns
     by_compound: RwLock<CompoundBucket>,
-    count: RwLock<usize>,
+    /// compound patterns whose FIRST position is a regex (nothing concrete
+    /// to bucket by — the list is tiny, scanned as a fallback)
+    pattern_compounds: RwLock<Vec<(CompoundPattern, Arc<Binding>)>>,
+    count: AtomicUsize,
     /// meta-schema properties every node may carry (`pinctrl-*`, ...)
-    implicit_properties: RwLock<FxHashSet<String>>,
+    implicit_properties: RwLock<HashSet<String>>,
     /// meta-schema property patterns (`-supply$`, `.*-names$`, ...)
-    implicit_patterns: RwLock<Vec<regex::Regex>>,
+    implicit_patterns: RwLock<regex::RegexSet>,
     /// vendors/devices/vendor-less compatibles for `compatible = "…"`
     compat: RwLock<CompatibleIndex>,
-    /// `binding pointer -> property name -> allowed`
-    allowed_cache: dashmap::DashMap<usize, dashmap::DashMap<String, bool>>,
     /// bumped whenever the index contents change, so diagnostics caches keyed
     /// on binding answers can be dropped
-    generation: std::sync::atomic::AtomicU64,
+    generation: AtomicU64,
     /// false while the background scan is running: a partially filled index
     /// would otherwise report "no binding" for every node
-    ready: std::sync::atomic::AtomicBool,
+    ready: AtomicBool,
 }
 
 impl Default for BindingIndex {
@@ -96,13 +114,13 @@ impl Default for BindingIndex {
         Self {
             by_single: Default::default(),
             by_compound: Default::default(),
-            count: Default::default(),
+            pattern_compounds: Default::default(),
+            count: AtomicUsize::default(),
             implicit_properties: Default::default(),
             implicit_patterns: Default::default(),
             compat: Default::default(),
-            allowed_cache: Default::default(),
-            generation: Default::default(),
-            ready: std::sync::atomic::AtomicBool::new(true),
+            generation: AtomicU64::default(),
+            ready: AtomicBool::new(true),
         }
     }
 }
@@ -149,49 +167,16 @@ impl BindingIndex {
     }
 
     /// May the node carry this property according to the binding and the
-    /// meta-schemas? Answers are memoized per (binding, property): bindings
-    /// live in the index for the whole process, so the pointer key is stable.
+    /// meta-schemas?
     pub fn is_property_allowed(&self, name: &str, binding: &Binding) -> bool {
-        // fast path: no locks and no memoization for the common cases
-        if is_common_property(name) || binding.properties.contains(name) {
-            return true;
-        }
-        let ptr = binding as *const Binding as usize;
-        {
-            if let Some(per_binding) = self.allowed_cache.get(&ptr) {
-                if let Some(allowed) = per_binding.get(name) {
-                    return *allowed;
-                }
-            }
-        }
-        let allowed = self.compute_property_allowed(name, binding);
-        self.allowed_cache
-            .entry(ptr)
-            .or_default()
-            .insert(name.to_string(), allowed);
-        allowed
+        is_common_property(name)
+            || binding.properties.contains(name)
+            || binding.patterns.is_match(name)
+            || self.implicit_properties.read().unwrap().contains(name)
+            || self.implicit_patterns.read().unwrap().is_match(name)
     }
 
-    fn compute_property_allowed(&self, name: &str, binding: &Binding) -> bool {
-        if self
-            .implicit_properties
-            .read()
-            .unwrap()
-            .contains(name)
-        {
-            return true;
-        }
-        if binding.patterns.iter().any(|re| re.is_match(name)) {
-            return true;
-        }
-        self.implicit_patterns
-            .read()
-            .unwrap()
-            .iter()
-            .any(|re| re.is_match(name))
-    }
-
-    fn set_implicit(&self, properties: FxHashSet<String>, patterns: Vec<regex::Regex>) {
+    fn set_implicit(&self, properties: HashSet<String>, patterns: regex::RegexSet) {
         *self.implicit_properties.write().unwrap() = properties;
         *self.implicit_patterns.write().unwrap() = patterns;
         self.bump_generation();
@@ -209,12 +194,11 @@ impl BindingIndex {
 
     /// Changes whenever binding answers may have changed.
     pub fn generation(&self) -> u64 {
-        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+        self.generation.load(Ordering::Relaxed)
     }
 
     fn bump_generation(&self) {
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Match a node's full compatible list: singles match if the list
@@ -228,17 +212,30 @@ impl BindingIndex {
                 }
             }
         }
-        let first = compatible_list.first()?;
-        let compounds = self.by_compound.read().unwrap();
-        for (pattern, binding) in compounds.get(first)? {
-            if pattern.len() != compatible_list.len() {
-                continue;
+        let match_len = |pattern: &CompoundPattern| -> bool {
+            pattern.len() == compatible_list.len()
+                && pattern
+                    .iter()
+                    .zip(compatible_list)
+                    .all(|(matcher, actual)| matcher.matches(actual))
+        };
+        {
+            let compounds = self.by_compound.read().unwrap();
+            if let Some(first) = compatible_list.first()
+                && let Some(bucket) = compounds.get(first)
+            {
+                for (pattern, binding) in bucket {
+                    if match_len(pattern) {
+                        return Some(binding.clone());
+                    }
+                }
             }
-            let matches = pattern
-                .iter()
-                .zip(compatible_list)
-                .all(|(allowed, actual)| allowed.contains(actual));
-            if matches {
+        }
+        // compounds whose first position is a regex can't be bucketed by
+        // value: scan the (tiny) fallback list
+        let pattern_compounds = self.pattern_compounds.read().unwrap();
+        for (pattern, binding) in pattern_compounds.iter() {
+            if match_len(pattern) {
                 return Some(binding.clone());
             }
         }
@@ -246,11 +243,11 @@ impl BindingIndex {
     }
 
     pub fn is_empty(&self) -> bool {
-        *self.count.read().unwrap() == 0
+        self.count.load(Ordering::Relaxed) == 0
     }
 
     pub fn len(&self) -> usize {
-        *self.count.read().unwrap()
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Test-only: insert without the scan.
@@ -260,8 +257,8 @@ impl BindingIndex {
     }
 
     fn insert(&self, binding: Binding) {
-        let shared = Arc::new(binding.clone_shallow());
-        let file = binding
+        let shared = Arc::new(binding);
+        let file = shared
             .uri
             .path_segments()
             .and_then(|mut segments| segments.next_back())
@@ -269,7 +266,7 @@ impl BindingIndex {
             .to_string();
         {
             let mut singles = self.by_single.write().unwrap();
-            for compatible in &binding.singles {
+            for compatible in &shared.singles {
                 singles
                     .entry(compatible.clone())
                     .or_insert_with(|| shared.clone());
@@ -277,54 +274,49 @@ impl BindingIndex {
         }
         {
             let mut compounds = self.by_compound.write().unwrap();
-            for pattern in &binding.compounds {
+            let mut pattern_compounds = self.pattern_compounds.write().unwrap();
+            for pattern in &shared.compounds {
                 // bucket under EVERY allowed first-position value, otherwise
                 // a node whose first string is not the first enum entry misses
-                if let Some(allowed) = pattern.first() {
-                    for first in allowed {
-                        compounds
-                            .entry(first.clone())
-                            .or_default()
-                            .push((pattern.clone(), shared.clone()));
+                match pattern.first() {
+                    Some(PositionMatcher::Values(allowed)) => {
+                        for first in allowed {
+                            compounds
+                                .entry(first.clone())
+                                .or_default()
+                                .push((pattern.clone(), shared.clone()));
+                        }
                     }
+                    // a regex first position has nothing concrete to bucket
+                    // by: keep it in the tiny fallback list
+                    Some(PositionMatcher::Pattern(_)) => {
+                        pattern_compounds.push((pattern.clone(), shared.clone()));
+                    }
+                    None => {}
                 }
             }
         }
         {
             let mut compat = self.compat.write().unwrap();
-            for compatible in &binding.singles {
+            for compatible in &shared.singles {
                 compat.add(compatible, &file);
             }
-            for pattern in &binding.compounds {
-                if let Some(allowed) = pattern.first() {
-                    for compatible in allowed {
-                        compat.add(compatible, &file);
+            for pattern in &shared.compounds {
+                for matcher in pattern {
+                    if let PositionMatcher::Values(allowed) = matcher {
+                        for compatible in allowed {
+                            compat.add(compatible, &file);
+                        }
                     }
                 }
             }
         }
-        *self.count.write().unwrap() += 1;
+        self.count.fetch_add(1, Ordering::Relaxed);
         self.bump_generation();
     }
 
     fn set_vendor_names(&self, names: BTreeMap<String, String>) {
         self.compat.write().unwrap().vendor_names = names;
-    }
-}
-
-impl Binding {
-    fn clone_shallow(&self) -> Binding {
-        Binding {
-            uri: self.uri.clone(),
-            singles: self.singles.clone(),
-            compounds: self.compounds.clone(),
-            properties: self.properties.clone(),
-            required: self.required.clone(),
-            required_any: self.required_any.clone(),
-            strict: self.strict,
-            refs_complete: self.refs_complete,
-            patterns: self.patterns.clone(),
-        }
     }
 }
 
@@ -352,7 +344,7 @@ pub fn scan(index: &BindingIndex, dir: &Path) {
     let started = std::time::Instant::now();
     let package = dtschema_package_dir();
     if let Some(package) = package {
-        let mut properties = FxHashSet::default();
+        let mut properties = HashSet::default();
         let mut patterns = Vec::new();
         collect_meta_allowlist(
             &package.join("meta-schemas"),
@@ -364,7 +356,10 @@ pub fn scan(index: &BindingIndex, dir: &Path) {
             patterns = patterns.len(),
             "meta-schema allowlist"
         );
-        index.set_implicit(properties, patterns);
+        index.set_implicit(
+            properties,
+            regex::RegexSet::new(&patterns).unwrap_or_default(),
+        );
     } else {
         tracing::warn!("dtschema python package not found; run `pip install dtschema`");
     }
@@ -532,8 +527,8 @@ fn parse_vendor_prefixes(path: &Path) -> BTreeMap<String, String> {
 /// sees the same allowed set dt-schema does.
 fn fixup_node_props(
     schema: &Yaml,
-    properties: &mut FxHashSet<String>,
-    patterns: &mut Vec<regex::Regex>,
+    properties: &mut HashSet<String>,
+    patterns: &mut Vec<String>,
 ) {
     let additional = yaml_get(schema, "additionalProperties");
     let unevaluated = yaml_get(schema, "unevaluatedProperties");
@@ -594,7 +589,7 @@ fn build_binding(
     singles: Vec<String>,
     compounds: Vec<CompoundPattern>,
 ) -> Binding {
-    let mut properties: FxHashSet<String> = FxHashSet::default();
+    let mut properties: HashSet<String> = HashSet::default();
     if let Some(props) = yaml_get(schema, "properties").and_then(Yaml::as_hash) {
         for key in props.keys() {
             if let Some(name) = key.as_str() {
@@ -602,13 +597,13 @@ fn build_binding(
             }
         }
     }
-    let mut patterns = Vec::new();
+    let mut pattern_strings: Vec<String> = Vec::new();
     if let Some(pattern_props) = yaml_get(schema, "patternProperties").and_then(Yaml::as_hash) {
         for (key, child) in pattern_props {
             if let Some(pattern) = key.as_str()
-                && let Some(re) = compile_pattern(pattern)
+                && let Some(pattern) = compile_pattern(pattern)
             {
-                patterns.push(re);
+                pattern_strings.push(pattern);
             }
             // properties declared inside a pattern are allowed for matching
             // nodes (permissive: avoids false positives from incomplete regex)
@@ -641,7 +636,7 @@ fn build_binding(
     if properties.contains("interrupts") || properties.contains("interrupt-controller") {
         properties.insert("interrupt-parent".to_string());
     }
-    fixup_node_props(schema, &mut properties, &mut patterns);
+    fixup_node_props(schema, &mut properties, &mut pattern_strings);
 
     let mut required = Vec::new();
     let mut required_any = Vec::new();
@@ -676,7 +671,7 @@ fn build_binding(
         required_any,
         strict,
         refs_complete,
-        patterns,
+        patterns: regex::RegexSet::new(&pattern_strings).unwrap_or_default(),
     }
 }
 
@@ -779,17 +774,31 @@ fn parse_compatible(
                             }
                         }
                     }
+                    Some("pattern") => {
+                        // a regex-compatible binding: single-position matcher
+                        // (fail-open: an uncompilable regex matches anything)
+                        if value.as_str().is_some() {
+                            let re = value
+                                .as_str()
+                                .and_then(|s| regex::Regex::new(s).ok())
+                                .unwrap_or_else(|| regex::Regex::new("").unwrap());
+                            compounds.push(vec![PositionMatcher::Pattern(re)]);
+                        }
+                    }
                     Some("items") => {
                         if let Some(items) = value.as_vec() {
                             let mut pattern = Vec::new();
                             for item in items {
-                                let mut allowed = Vec::new();
-                                collect_value_strings(item, &mut allowed);
-                                if allowed.is_empty() {
+                                let matcher = collect_position(item);
+                                let empty =
+                                    matches!(&matcher, PositionMatcher::Values(v) if v.is_empty());
+                                if empty {
+                                    // a position with no constraint means the
+                                    // branch cannot match: drop it entirely
                                     pattern.clear();
                                     break;
                                 }
-                                pattern.push(allowed);
+                                pattern.push(matcher);
                             }
                             if !pattern.is_empty() {
                                 compounds.push(pattern);
@@ -813,6 +822,54 @@ fn parse_compatible(
             }
         }
         _ => {}
+    }
+}
+
+/// One `items` entry of a compound compatible: an enumerated value set, or a
+/// regex the string at that position must match (dt-schema `pattern:`).
+fn collect_position(item: &Yaml) -> PositionMatcher {
+    match item {
+        Yaml::String(s) => PositionMatcher::Values(vec![s.clone()]),
+        Yaml::Hash(hash) => {
+            for (key, value) in hash {
+                match key.as_str() {
+                    Some("const") => {
+                        if let Some(s) = value.as_str() {
+                            return PositionMatcher::Values(vec![s.to_string()]);
+                        }
+                    }
+                    Some("enum") => {
+                        let mut values = Vec::new();
+                        collect_value_strings(item, &mut values);
+                        if !values.is_empty() {
+                            return PositionMatcher::Values(values);
+                        }
+                    }
+                    Some("pattern") => {
+                        if let Some(s) = value.as_str() {
+                            // fail-open: an uncompilable regex matches anything
+                            return PositionMatcher::Pattern(
+                                regex::Regex::new(s).unwrap_or_else(|_| regex::Regex::new("").unwrap()),
+                            );
+                        }
+                    }
+                    Some("oneOf") | Some("anyOf") | Some("allOf") => {
+                        let mut values = Vec::new();
+                        if let Some(branches) = value.as_vec() {
+                            for branch in branches {
+                                collect_value_strings(branch, &mut values);
+                            }
+                        }
+                        if !values.is_empty() {
+                            return PositionMatcher::Values(values);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            PositionMatcher::Values(Vec::new())
+        }
+        _ => PositionMatcher::Values(Vec::new()),
     }
 }
 
@@ -847,7 +904,7 @@ fn resolve_refs(
     doc: &Yaml,
     binding_path: &Path,
     binding_dir: Option<&Path>,
-    properties: &mut FxHashSet<String>,
+    properties: &mut HashSet<String>,
     visited: &mut HashSet<PathBuf>,
     depth: usize,
 ) -> bool {
@@ -973,11 +1030,11 @@ fn resolve_ref_path(
     None
 }
 
-/// Rust's regex has no look-around; drop look-behind groups (making the
-/// matcher slightly more permissive) before compiling.
-fn compile_pattern(pattern: &str) -> Option<regex::Regex> {
-    if let Ok(re) = regex::Regex::new(pattern) {
-        return Some(re);
+/// A compilable form of `pattern`. Rust's regex has no look-around; drop
+/// look-behind groups (making the matcher slightly more permissive) first.
+fn compile_pattern(pattern: &str) -> Option<String> {
+    if regex::Regex::new(pattern).is_ok() {
+        return Some(pattern.to_string());
     }
     let mut sanitized = String::with_capacity(pattern.len());
     let mut chars = pattern.char_indices().peekable();
@@ -1006,7 +1063,7 @@ fn compile_pattern(pattern: &str) -> Option<regex::Regex> {
         }
         sanitized.push(c);
     }
-    regex::Regex::new(&sanitized).ok()
+    regex::Regex::new(&sanitized).ok().map(|_| sanitized)
 }
 
 fn in_tree_root(binding_dir: Option<&Path>) -> Option<PathBuf> {
@@ -1064,7 +1121,7 @@ fn local_schema_roots() -> Vec<PathBuf> {
 
 /// Union of `properties` keys and `patternProperties` from every
 /// meta-schema document: properties any node may carry.
-fn collect_meta_allowlist(dir: &Path, properties: &mut FxHashSet<String>, patterns: &mut Vec<regex::Regex>) {
+fn collect_meta_allowlist(dir: &Path, properties: &mut HashSet<String>, patterns: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1087,8 +1144,8 @@ fn collect_meta_allowlist(dir: &Path, properties: &mut FxHashSet<String>, patter
 
 fn collect_property_declarations(
     node: &Yaml,
-    properties: &mut FxHashSet<String>,
-    patterns: &mut Vec<regex::Regex>,
+    properties: &mut HashSet<String>,
+    patterns: &mut Vec<String>,
 ) {
     match node {
         Yaml::Hash(hash) => {
@@ -1107,8 +1164,8 @@ fn collect_property_declarations(
                         if let Some(map) = value.as_hash() {
                             for pattern_key in map.keys() {
                                 if let Some(pattern) = pattern_key.as_str()
-                                    && let Some(re) = compile_pattern(pattern) {
-                                        patterns.push(re);
+                                    && let Some(pattern) = compile_pattern(pattern) {
+                                        patterns.push(pattern);
                                     }
                             }
                         }
@@ -1235,18 +1292,90 @@ properties:
             uri: Url::parse("file:///t.yaml").unwrap(),
             singles,
             compounds,
-            properties: FxHashSet::default(),
+            properties: HashSet::default(),
             required: Vec::new(),
             required_any: Vec::new(),
             strict: false,
             refs_complete: true,
-            patterns: Vec::new(),
+            patterns: regex::RegexSet::empty(),
         });
         // a bare "simple-bus" node must NOT match this binding
         assert!(index.lookup(&["simple-bus".to_string()]).is_none());
         // the full compound list must
         assert!(index
             .lookup(&["fsl,imx28-pinctrl".to_string(), "simple-bus".to_string()])
+            .is_some());
+    }
+
+    #[test]
+    fn pattern_positions_match_by_regex() {
+        // the Adreno binding form: oneOf items with a regex position plus a
+        // const position (Documentation/devicetree/bindings/display/msm/gpu.yaml)
+        let yaml = r#"
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - pattern: '^qcom,adreno-[0-9a-f]{8}$'
+          - const: qcom,adreno
+      - items:
+          - pattern: '^qcom,adreno-[3-7][0-9][0-9]\.[0-9]+$'
+          - const: qcom,adreno
+"#;
+        let docs = YamlLoader::load_from_str(yaml).unwrap();
+        let doc = &docs[0];
+        let node = yaml_get(doc, "properties")
+            .and_then(|p| yaml_get(p, "compatible"))
+            .unwrap();
+        let mut singles = Vec::new();
+        let mut compounds = Vec::new();
+        parse_compatible(node, &mut singles, &mut compounds);
+        assert!(singles.is_empty(), "pattern parts leaked as singles");
+        assert_eq!(compounds.len(), 2);
+
+        let index = BindingIndex::default();
+        index.insert(Binding {
+            uri: Url::parse("file:///gpu.yaml").unwrap(),
+            singles,
+            compounds,
+            properties: ["compatible", "reg"].into_iter().map(str::to_string).collect(),
+            required: vec!["compatible".to_string()],
+            required_any: Vec::new(),
+            strict: true,
+            refs_complete: true,
+            patterns: regex::RegexSet::empty(),
+        });
+
+        // the sm8650 GPU node: 8-hex-chars form (first regex)
+        assert!(index
+            .lookup(&["qcom,adreno-43051401".to_string(), "qcom,adreno".to_string()])
+            .is_some());
+        // the gen4 dotted form (second regex)
+        assert!(index
+            .lookup(&["qcom,adreno-690.1".to_string(), "qcom,adreno".to_string()])
+            .is_some());
+        // first string not matching the pattern: no match
+        assert!(index
+            .lookup(&["qcom,not-adreno".to_string(), "qcom,adreno".to_string()])
+            .is_none());
+        // wrong arity: no match
+        assert!(index.lookup(&["qcom,adreno".to_string()]).is_none());
+    }
+
+    #[test]
+    fn real_kernel_gpu_binding_matches_the_adreno_node() {
+        // regression guard against the actual kernel binding file
+        let path = Path::new("/linux-7.2.2/Documentation/devicetree/bindings/display/msm/gpu.yaml");
+        if !path.is_file() {
+            return; // kernel tree not present on this machine
+        }
+        let bindings = parse_bindings(path);
+        let index = BindingIndex::default();
+        for binding in bindings {
+            index.insert(binding);
+        }
+        assert!(index
+            .lookup(&["qcom,adreno-43051401".to_string(), "qcom,adreno".to_string()])
             .is_some());
     }
 
@@ -1262,12 +1391,12 @@ properties:
                 uri: Url::parse(&format!("file:///{file}")).unwrap(),
                 singles: singles.into_iter().map(str::to_string).collect(),
                 compounds: Vec::new(),
-                properties: FxHashSet::default(),
+                properties: HashSet::default(),
                 required: Vec::new(),
                 required_any: Vec::new(),
                 strict: false,
                 refs_complete: true,
-                patterns: Vec::new(),
+                patterns: regex::RegexSet::empty(),
             });
         }
         let vendors = index.compatible_vendors();
@@ -1303,7 +1432,7 @@ properties:
         assert!(binding.properties.contains("dma-ranges"));
         assert!(binding.properties.contains("bootph-all"));
         assert!(binding.properties.contains("pinctrl-names"));
-        assert!(binding.patterns.iter().any(|re| re.is_match("pinctrl-0")));
+        assert!(binding.patterns.is_match("pinctrl-0"));
 
         let open_path = dir.join("open.yaml");
         std::fs::write(&open_path, format!("{head}additionalProperties: true\n")).unwrap();

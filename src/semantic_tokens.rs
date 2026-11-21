@@ -3,9 +3,8 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::Node;
 
-use crate::analysis::{self, Analysis};
+use crate::model::{self, Analysis};
 use crate::document::Document;
-use crate::util;
 
 pub const LEGEND_TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::COMMENT,
@@ -47,7 +46,7 @@ struct RawToken {
 }
 
 pub fn semantic_tokens(doc: &Document) -> SemanticTokens {
-    let analysis = analysis::analyze(doc);
+    let analysis = model::analyze(doc);
     let mut raw = Vec::new();
     walk(doc.tree.root_node(), doc, &analysis, &mut raw);
     raw.sort_by_key(|t| (t.line, t.character));
@@ -90,18 +89,18 @@ fn push_span(
 ) {
     let mut s = start;
     while s < end {
-        let byte = s.min(doc.rope.len_bytes());
-        let line = doc.rope.byte_to_line(byte);
-        let line_end_byte = if line + 1 < doc.rope.len_lines() {
-            doc.rope.line_to_byte(line + 1)
-        } else {
-            doc.rope.len_bytes()
-        };
+        let byte = s.min(doc.text.len());
+        let line = doc.line_starts.partition_point(|&line_start| line_start <= byte) - 1;
+        let line_end_byte = doc
+            .line_starts
+            .get(line + 1)
+            .copied()
+            .unwrap_or(doc.text.len());
         let piece_end = end.min(line_end_byte);
         let piece = doc.slice(s..piece_end).trim_end_matches(['\r', '\n']);
         let length: u32 = piece.chars().map(|c| c.len_utf16() as u32).sum();
         if length > 0 {
-            let character = util::byte_to_position(&doc.rope, s).character;
+            let character = model::byte_to_position(doc, s).character;
             out.push(RawToken {
                 line: line as u32,
                 character,
@@ -151,7 +150,7 @@ fn push_name_and_address(
     token_type: u32,
     token_modifiers: u32,
 ) {
-    let text = util::node_text(doc, name);
+    let text = model::node_text(doc, name);
     match text.find('@') {
         Some(at) => {
             let at_byte = name.start_byte() + at;
@@ -216,7 +215,7 @@ fn walk(node: Node, doc: &Document, analysis: &Analysis, out: &mut Vec<RawToken>
             push_span(out, doc, node.start_byte(), node.end_byte(), MACRO, 0)
         }
         "property" => {
-            if let Some(delete) = util::find_child(node, "delete_property") {
+            if let Some(delete) = model::find_child(node, "delete_property") {
                 directive(out, doc, delete, DECORATOR, DEPRECATED);
                 if let Some(name) = delete.child_by_field_name("name") {
                     push_span(out, doc, name.start_byte(), name.end_byte(), PROPERTY, DEPRECATED);
@@ -250,7 +249,7 @@ fn walk(node: Node, doc: &Document, analysis: &Analysis, out: &mut Vec<RawToken>
         "header" => directive(out, doc, node, DECORATOR, 0),
         "memreserve" => {
             // Labels may precede the directive, so locate it in the text.
-            let text = util::node_text(doc, node);
+            let text = model::node_text(doc, node);
             if let Some(offset) = text.find("/memreserve/") {
                 push_span(
                     out,
@@ -281,7 +280,7 @@ fn walk(node: Node, doc: &Document, analysis: &Analysis, out: &mut Vec<RawToken>
         }
         "delete_node_ref" => {
             directive(out, doc, node, DECORATOR, DEPRECATED);
-            if let Some(reference) = util::find_child(node, "reference") {
+            if let Some(reference) = model::find_child(node, "reference") {
                 push_span(
                     out,
                     doc,
