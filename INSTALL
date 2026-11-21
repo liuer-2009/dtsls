@@ -1,0 +1,77 @@
+dtsls — install notes
+=====================
+
+Requirements
+------------
+
+* Linux (the server is Linux-only)
+* A Rust toolchain: https://rustup.rs
+* Optional, for binding validation:
+    - a Linux kernel source tree, for
+      Documentation/devicetree/bindings and include/dt-bindings
+    - the dtschema python package: pip install dtschema
+      (or point DTSLS_SCHEMAS_DIR at a package directory)
+
+Build
+-----
+
+    cargo build --release
+
+The binary lands at target/release/dtsls.
+
+Install
+-------
+
+    install -Dm755 target/release/dtsls /usr/local/bin/dtsls
+
+or, without root:
+
+    install -Dm755 target/release/dtsls ~/.local/bin/dtsls
+
+Make sure the install directory is on your PATH.
+
+Verify
+------
+
+    dtsls --version
+
+Cross-compiling (x86_64 from an aarch64 host, or vice versa)
+------------------------------------------------------------
+
+    rustup target add x86_64-unknown-linux-gnu
+    cargo build --release --target x86_64-unknown-linux-gnu
+
+The binary lands at target/x86_64-unknown-linux-gnu/release/dtsls.
+
+Neovim
+------
+
+    vim.lsp.config('dtsls', {
+      cmd = { 'dtsls' },
+      filetypes = { 'dts', 'dtsi', 'dtso', 'overlay' },
+    })
+    vim.lsp.enable('dtsls')
+
+Open the editor's workspace at the kernel tree (or a board directory inside
+it) so includes resolve and bindings are found. If your layout needs explicit
+paths, pass initializationOptions:
+
+    initializationOptions = {
+      includePaths = { '/path/to/kernel/include' },
+      bindingsPath = '/path/to/kernel/Documentation/devicetree/bindings',
+    }
+
+Logs and troubleshooting
+------------------------
+
+Logs go to $DTSLS_LOG (default /tmp/dtsls.log); verbosity via RUST_LOG
+(e.g. RUST_LOG=debug). If binding validation or dt-bindings includes do not
+resolve, the reason is reported as a diagnostic at the top of every file —
+nothing degrades silently.
+
+License
+-------
+
+AGPL-3.0-only, see COPYING. Builds on the GPL-3.0
+tree-sitter-devicetree2 grammar; per AGPL-3.0 §13 the combined binary
+carries both licenses' obligations.
