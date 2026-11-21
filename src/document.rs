@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
 use tree_sitter::{InputEdit, Parser, Tree};
 

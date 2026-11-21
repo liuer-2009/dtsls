@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The one toolkit for walking DTS trees and raw text.
 //!
 //! Every module (diagnostics, completion, hints, phandle checks, unit

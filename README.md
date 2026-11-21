@@ -4,7 +4,8 @@ Fast LSP server for Device Tree Source (DTS), written in Rust. Linux only.
 
 Built on `tower-lsp` + `tree-sitter` with the `tree-sitter-devicetree2` grammar
 (whame's dtc-derived grammar, built to parse every DTS file in the Linux
-kernel tree — GPL-3.0, which makes this binary GPL-3.0 too).
+kernel tree — GPL-3.0). dtsls itself is AGPL-3.0-only; per AGPL §13 the
+combined binary carries both obligations (see License).
 
 ## Build
 
@@ -172,3 +173,11 @@ the tree through it. `unit.rs` builds a translation unit (preprocess + parse +
 one name-collection walk) and maps unit diagnostics back to their files.
 `workspace.rs` keeps the include graph and per-root snapshots. `backend.rs` is
 a thin LSP layer over that state.
+
+## License
+
+dtsls is licensed under the GNU Affero General Public License v3.0 only
+(`SPDX-License-Identifier: AGPL-3.0-only` in every source file; full text in
+[`COPYING`](COPYING)). It builds on the `tree-sitter-devicetree2` grammar,
+which is GPL-3.0; per AGPL-3.0 §13 the two may be combined, and the combined
+binary carries both licenses' obligations.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Translation units for diagnostics.
 //!
 //! Devicetree sources are compiled the way the kernel does it: the

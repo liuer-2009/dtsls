@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Workspace state built on top of translation units.
 //!
 //! A translation unit already provides the per-file tables (labels, macros,

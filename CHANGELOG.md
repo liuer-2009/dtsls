@@ -81,3 +81,6 @@ keystroke path.
 ### Added
 
 - `dtsls --version` / `--help`.
+- Licensing: AGPL-3.0-only — `COPYING` with the full license text and an
+  `SPDX-License-Identifier` header in every source file. Built on the
+  GPL-3.0 `tree-sitter-devicetree2` grammar (combined per AGPL-3.0 §13).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! In-process C preprocessor for devicetree sources.
 //!
 //! Devicetree builds run `cpp` before dtc, so anything that looks at the

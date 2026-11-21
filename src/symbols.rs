@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // DocumentSymbol::deprecated is required by lsp-types 0.94 but marked deprecated.
 #![allow(deprecated)]
 

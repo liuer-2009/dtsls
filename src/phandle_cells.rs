@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Phandle and interrupt checks, mirroring dtc's `checks.c`.
 //!
 //! Ported 1:1, including failure texts and severities:
